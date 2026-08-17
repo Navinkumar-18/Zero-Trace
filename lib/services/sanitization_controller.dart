@@ -25,7 +25,7 @@ class SanitizationController extends ChangeNotifier {
 
   List<DeviceProfile> _devices = [];
   DeviceProfile? _selectedDevice;
-  bool _isRealMode = false;
+  bool _isRealMode = true;
 
   // Form Inputs
   DataSensitivity _dataSensitivity = DataSensitivity.confidential;

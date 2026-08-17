@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:provider/provider.dart';
+
+import '../services/sanitization_controller.dart';
 import '../../widgets/theme.dart';
 
 /// Main application shell with responsive sidebar navigation.
@@ -52,12 +55,6 @@ class _AppShellState extends State<AppShell> {
       selectedIcon: Icons.psychology,
       label: 'AI Assistant',
       route: '/ai-assistant',
-    ),
-    _NavDestination(
-      icon: Icons.science_outlined,
-      selectedIcon: Icons.science,
-      label: 'Research',
-      route: '/research',
     ),
     _NavDestination(
       icon: Icons.settings_outlined,
@@ -127,8 +124,8 @@ class _AppShellState extends State<AppShell> {
                   ),
                 ),
 
-                // Demo mode banner
-                _buildDemoModeBanner(),
+                // Mode banner
+                _buildModeStatusBanner(context),
 
                 // Collapse toggle
                 const Divider(height: 1, color: AppTheme.surfaceBorder),
@@ -260,20 +257,30 @@ class _AppShellState extends State<AppShell> {
     );
   }
 
-  Widget _buildDemoModeBanner() {
+  Widget _buildModeStatusBanner(BuildContext context) {
+    final controller = context.watch<SanitizationController>();
+    final isRealMode = controller.isRealMode;
+
+    final badgeColor = isRealMode ? AppTheme.accentEmerald : AppTheme.accentGold;
+    final badgeIcon = isRealMode ? Icons.memory : Icons.science;
+    final badgeTitle = isRealMode ? 'REAL HARDWARE MODE' : 'DEMO MODE';
+    final badgeSubtitle = isRealMode
+        ? 'Live disk scanner active (lsblk)'
+        : 'No physical data will be destroyed';
+
     if (!_isSidebarExpanded) {
       return Padding(
         padding: const EdgeInsets.all(8.0),
         child: Tooltip(
-          message: 'DEMO MODE — No physical data will be destroyed',
+          message: '$badgeTitle — $badgeSubtitle',
           child: Container(
             padding: const EdgeInsets.all(8),
             decoration: BoxDecoration(
-              color: AppTheme.accentGold.withValues(alpha: 0.1),
+              color: badgeColor.withValues(alpha: 0.1),
               borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: AppTheme.accentGold.withValues(alpha: 0.3)),
+              border: Border.all(color: badgeColor.withValues(alpha: 0.3)),
             ),
-            child: const Icon(Icons.science, color: AppTheme.accentGold, size: 18),
+            child: Icon(badgeIcon, color: badgeColor, size: 18),
           ),
         ),
       );
@@ -284,19 +291,19 @@ class _AppShellState extends State<AppShell> {
       child: Container(
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
-          color: AppTheme.accentGold.withValues(alpha: 0.08),
+          color: badgeColor.withValues(alpha: 0.08),
           borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: AppTheme.accentGold.withValues(alpha: 0.25)),
+          border: Border.all(color: badgeColor.withValues(alpha: 0.25)),
         ),
         child: Row(
           children: [
-            const Icon(Icons.science, color: AppTheme.accentGold, size: 16),
+            Icon(badgeIcon, color: badgeColor, size: 16),
             const SizedBox(width: 8),
             Expanded(
               child: Text(
-                'DEMO MODE\nNo physical data will be destroyed',
+                '$badgeTitle\n$badgeSubtitle',
                 style: GoogleFonts.inter(
-                  color: AppTheme.accentGold,
+                  color: badgeColor,
                   fontSize: 10,
                   fontWeight: FontWeight.w600,
                   height: 1.3,

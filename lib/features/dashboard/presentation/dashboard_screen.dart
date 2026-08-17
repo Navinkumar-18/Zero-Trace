@@ -14,9 +14,13 @@ class DashboardScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final controller = context.watch<SanitizationController>();
+    final isRealMode = controller.isRealMode;
+
     final demoService = DemoDataService();
-    final stats = demoService.getStats(controller.devices);
-    final recentOps = demoService.getRecentOperations();
+    final stats = _getStats(controller);
+    final recentOps = isRealMode
+        ? _getRealRecentOps(controller)
+        : demoService.getRecentOperations();
 
     return Scaffold(
       backgroundColor: AppTheme.bgDark,
@@ -27,7 +31,7 @@ class DashboardScreen extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               // Page Header
-              _buildHeader(context),
+              _buildHeader(context, isRealMode),
               const SizedBox(height: 24),
 
               // Quick Stats Grid
@@ -43,7 +47,7 @@ class DashboardScreen extends StatelessWidget {
                       children: [
                         Expanded(
                           flex: 3,
-                          child: _buildRecentOperations(context, recentOps),
+                          child: _buildRecentOperations(context, recentOps, isRealMode),
                         ),
                         const SizedBox(width: 20),
                         Expanded(
@@ -61,7 +65,7 @@ class DashboardScreen extends StatelessWidget {
                   }
                   return Column(
                     children: [
-                      _buildRecentOperations(context, recentOps),
+                      _buildRecentOperations(context, recentOps, isRealMode),
                       const SizedBox(height: 20),
                       _buildSecurityStatus(stats),
                       const SizedBox(height: 20),
@@ -77,7 +81,64 @@ class DashboardScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildHeader(BuildContext context) {
+  DemoStats _getStats(SanitizationController controller) {
+    final devices = controller.devices;
+    final isRealMode = controller.isRealMode;
+
+    if (!isRealMode) {
+      return DemoDataService().getStats(devices);
+    }
+
+    final totalCapacityBytes = devices.fold<int>(0, (sum, d) => sum + d.capacityBytes);
+    final totalGb = (totalCapacityBytes / (1024 * 1024 * 1024)).round();
+    final attentionCount = devices.where((d) =>
+        d.isSystemDisk ||
+        d.hpaDcoPresent ||
+        (!d.supportsAtaSanitize &&
+            !d.supportsNvmeSanitize &&
+            !d.supportsEmmcSanitize &&
+            !d.supportsAtaSecureErase &&
+            !d.isHardwareEncrypted)).length;
+    final readyCount = devices.length - attentionCount;
+
+    final hasCert = controller.completedCertificate != null;
+    final completedCount = hasCert ? 1 : 0;
+    final verifiedCount = (hasCert && controller.completedCertificate!.result == 'SUCCESS') ? 1 : 0;
+    final certCount = hasCert ? 1 : 0;
+
+    return DemoStats(
+      totalDevices: devices.length,
+      readyDevices: readyCount,
+      attentionDevices: attentionCount,
+      completedSanitizations: completedCount,
+      verifiedCount: verifiedCount,
+      certificatesGenerated: certCount,
+      totalStorageGb: totalGb,
+    );
+  }
+
+  List<DemoOperation> _getRealRecentOps(SanitizationController controller) {
+    if (controller.completedCertificate != null) {
+      final cert = controller.completedCertificate!;
+      return [
+        DemoOperation(
+          deviceName: cert.deviceModel,
+          mediaType: cert.mediaType,
+          method: cert.method,
+          status: cert.result == 'SUCCESS' ? 'Verified' : 'Failed',
+          timestamp: cert.endTime,
+          certificateId: cert.certificateId,
+        ),
+      ];
+    }
+    return [];
+  }
+
+  Widget _buildHeader(BuildContext context, bool isRealMode) {
+    final badgeColor = isRealMode ? AppTheme.accentEmerald : AppTheme.accentGold;
+    final badgeIcon = isRealMode ? Icons.memory : Icons.science;
+    final badgeText = isRealMode ? 'REAL HARDWARE MODE' : 'DEMO MODE';
+
     return Row(
       children: [
         Expanded(
@@ -94,7 +155,9 @@ class DashboardScreen extends StatelessWidget {
               ),
               const SizedBox(height: 4),
               Text(
-                'Secure Media Sanitization — Overview',
+                isRealMode
+                    ? 'Real-Time Hardware Audit & Sanitization — Active'
+                    : 'Secure Media Sanitization — Overview',
                 style: GoogleFonts.inter(
                   color: AppTheme.textSecondary,
                   fontSize: 14,
@@ -106,19 +169,19 @@ class DashboardScreen extends StatelessWidget {
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
           decoration: BoxDecoration(
-            color: AppTheme.accentGold.withValues(alpha: 0.1),
+            color: badgeColor.withValues(alpha: 0.1),
             borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: AppTheme.accentGold.withValues(alpha: 0.3)),
+            border: Border.all(color: badgeColor.withValues(alpha: 0.3)),
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(Icons.science, color: AppTheme.accentGold, size: 16),
+              Icon(badgeIcon, color: badgeColor, size: 16),
               const SizedBox(width: 8),
               Text(
-                'DEMO MODE',
+                badgeText,
                 style: GoogleFonts.outfit(
-                  color: AppTheme.accentGold,
+                  color: badgeColor,
                   fontSize: 12,
                   fontWeight: FontWeight.w700,
                 ),
@@ -243,7 +306,9 @@ class DashboardScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildRecentOperations(BuildContext context, List<DemoOperation> ops) {
+  Widget _buildRecentOperations(BuildContext context, List<DemoOperation> ops, bool isRealMode) {
+    final accentColor = isRealMode ? AppTheme.accentEmerald : AppTheme.accentGold;
+
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
@@ -256,7 +321,7 @@ class DashboardScreen extends StatelessWidget {
         children: [
           Row(
             children: [
-              const Icon(Icons.history, color: AppTheme.accentGold, size: 20),
+              Icon(Icons.history, color: accentColor, size: 20),
               const SizedBox(width: 10),
               Text(
                 'Recent Operations',
@@ -279,7 +344,41 @@ class DashboardScreen extends StatelessWidget {
           const SizedBox(height: 16),
           const Divider(color: AppTheme.surfaceBorder, height: 1),
           const SizedBox(height: 8),
-          ...ops.map((op) => _buildOperationRow(op)),
+          if (ops.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 24),
+              child: Center(
+                child: Column(
+                  children: [
+                    Icon(
+                      Icons.storage_outlined,
+                      size: 40,
+                      color: AppTheme.textMuted.withValues(alpha: 0.5),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      'No Physical Disk Operations Recorded Yet',
+                      style: GoogleFonts.outfit(
+                        color: AppTheme.textSecondary,
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Connected drives are scanned in real-time via lsblk.\nAttach a USB pendrive or external disk to perform sanitization.',
+                      textAlign: TextAlign.center,
+                      style: GoogleFonts.inter(
+                        color: AppTheme.textMuted,
+                        fontSize: 11,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            )
+          else
+            ...ops.map((op) => _buildOperationRow(op)),
         ],
       ),
     );

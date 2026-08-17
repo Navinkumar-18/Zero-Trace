@@ -5,7 +5,6 @@ import '../app_shell.dart';
 import '../../features/dashboard/presentation/dashboard_screen.dart';
 import '../../features/devices/presentation/device_details_screen.dart';
 import '../../features/ai_assistant/presentation/ai_assistant_screen.dart';
-import '../../features/research/presentation/research_mode_screen.dart';
 import '../../features/settings/presentation/settings_screen.dart';
 import '../../features/certificate/presentation/certificate_verification_screen.dart';
 import '../../screens/device_inventory_screen.dart';
@@ -97,14 +96,6 @@ final GoRouter appRouter = GoRouter(
           path: '/ai-assistant',
           pageBuilder: (context, state) => const NoTransitionPage(
             child: AiAssistantScreen(),
-          ),
-        ),
-
-        // Research Mode
-        GoRoute(
-          path: '/research',
-          pageBuilder: (context, state) => const NoTransitionPage(
-            child: ResearchModeScreen(),
           ),
         ),
 
