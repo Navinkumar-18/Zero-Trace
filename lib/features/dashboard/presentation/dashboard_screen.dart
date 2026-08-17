@@ -34,11 +34,15 @@ class DashboardScreen extends StatelessWidget {
               _buildHeader(context, isRealMode),
               const SizedBox(height: 24),
 
+              // Featured Hero Banner Card (Figma Smart Cleanup Banner)
+              _buildSmartCleanupBanner(context),
+              const SizedBox(height: 24),
+
               // Quick Stats Grid
               _buildStatsGrid(stats),
               const SizedBox(height: 24),
 
-              // Main content row
+              // Main content grid
               LayoutBuilder(
                 builder: (context, constraints) {
                   if (constraints.maxWidth > 900) {
@@ -47,7 +51,13 @@ class DashboardScreen extends StatelessWidget {
                       children: [
                         Expanded(
                           flex: 3,
-                          child: _buildRecentOperations(context, recentOps, isRealMode),
+                          child: Column(
+                            children: [
+                              _buildStorageBreakdownCard(context),
+                              const SizedBox(height: 20),
+                              _buildRecentOperations(context, recentOps, isRealMode),
+                            ],
+                          ),
                         ),
                         const SizedBox(width: 20),
                         Expanded(
@@ -65,6 +75,8 @@ class DashboardScreen extends StatelessWidget {
                   }
                   return Column(
                     children: [
+                      _buildStorageBreakdownCard(context),
+                      const SizedBox(height: 20),
                       _buildRecentOperations(context, recentOps, isRealMode),
                       const SizedBox(height: 20),
                       _buildSecurityStatus(stats),
@@ -146,8 +158,8 @@ class DashboardScreen extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                'Dashboard',
-                style: GoogleFonts.outfit(
+                'Private Storage',
+                style: GoogleFonts.inter(
                   color: AppTheme.textPrimary,
                   fontSize: 28,
                   fontWeight: FontWeight.w800,
@@ -155,12 +167,11 @@ class DashboardScreen extends StatelessWidget {
               ),
               const SizedBox(height: 4),
               Text(
-                isRealMode
-                    ? 'Real-Time Hardware Audit & Sanitization — Active'
-                    : 'Secure Media Sanitization — Overview',
+                'Clean, secure and private device storage.',
                 style: GoogleFonts.inter(
-                  color: AppTheme.textSecondary,
-                  fontSize: 14,
+                  color: AppTheme.accentEmerald,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
                 ),
               ),
             ],
@@ -169,9 +180,9 @@ class DashboardScreen extends StatelessWidget {
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
           decoration: BoxDecoration(
-            color: badgeColor.withValues(alpha: 0.1),
+            color: AppTheme.accentEmeraldLight,
             borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: badgeColor.withValues(alpha: 0.3)),
+            border: Border.all(color: AppTheme.accentEmerald.withValues(alpha: 0.3)),
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
@@ -180,7 +191,7 @@ class DashboardScreen extends StatelessWidget {
               const SizedBox(width: 8),
               Text(
                 badgeText,
-                style: GoogleFonts.outfit(
+                style: GoogleFonts.inter(
                   color: badgeColor,
                   fontSize: 12,
                   fontWeight: FontWeight.w700,
@@ -190,6 +201,84 @@ class DashboardScreen extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+
+  Widget _buildSmartCleanupBanner(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        color: AppTheme.surfaceDark,
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: AppTheme.surfaceBorder),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              color: AppTheme.accentEmeraldLight,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              'SMART CLEANUP READY',
+              style: GoogleFonts.inter(
+                color: AppTheme.accentEmerald,
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.5,
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          Text(
+            'Reclaim up to 12.6 GB',
+            style: GoogleFonts.inter(
+              color: AppTheme.textPrimary,
+              fontSize: 32,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'Quick scan found safe-to-remove cache, duplicates and leftover files.',
+            style: GoogleFonts.inter(
+              color: AppTheme.textSecondary,
+              fontSize: 14,
+            ),
+          ),
+          const SizedBox(height: 20),
+          Row(
+            children: [
+              ElevatedButton.icon(
+                icon: const Icon(Icons.flash_on, size: 18),
+                label: const Text('Start Smart Scan'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: AppTheme.accentEmerald,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+                onPressed: () => context.go('/sanitize'),
+              ),
+              const SizedBox(width: 12),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.tune, size: 18),
+                label: const Text('Manage Scope'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: AppTheme.textPrimary,
+                  side: const BorderSide(color: AppTheme.surfaceBorder),
+                  padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                ),
+                onPressed: () => context.go('/sanitize'),
+              ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 
@@ -206,7 +295,7 @@ class DashboardScreen extends StatelessWidget {
             label: 'Detected Devices',
             value: '${stats.totalDevices}',
             icon: Icons.dns,
-            color: AppTheme.accentBlue,
+            color: AppTheme.accentEmerald,
             subtitle: '${stats.totalStorageGb} GB total',
           ),
           _StatItem(
@@ -220,16 +309,16 @@ class DashboardScreen extends StatelessWidget {
             label: 'Needs Attention',
             value: '${stats.attentionDevices}',
             icon: Icons.warning_amber,
-            color: stats.attentionDevices > 0 ? AppTheme.accentOrange : AppTheme.textMuted,
+            color: stats.attentionDevices > 0 ? AppTheme.accentGold : AppTheme.textMuted,
             subtitle: stats.attentionDevices > 0
-                ? 'Insufficient capability'
+                ? 'Protected disk'
                 : 'All devices clear',
           ),
           _StatItem(
             label: 'Certificates',
             value: '${stats.certificatesGenerated}',
-            icon: Icons.description,
-            color: AppTheme.accentGold,
+            icon: Icons.description_outlined,
+            color: AppTheme.accentEmerald,
             subtitle: '${stats.verifiedCount} verified',
           ),
         ];
@@ -240,7 +329,7 @@ class DashboardScreen extends StatelessWidget {
           physics: const NeverScrollableScrollPhysics(),
           crossAxisSpacing: 16,
           mainAxisSpacing: 16,
-          childAspectRatio: 2.8,
+          childAspectRatio: 2.6,
           children: items.map((item) => _buildStatCard(item)).toList(),
         );
       },
@@ -264,7 +353,7 @@ class DashboardScreen extends StatelessWidget {
               children: [
                 Text(
                   item.label,
-                  style: GoogleFonts.outfit(
+                  style: GoogleFonts.inter(
                     color: AppTheme.textPrimary,
                     fontSize: 13,
                     fontWeight: FontWeight.w600,
@@ -275,7 +364,7 @@ class DashboardScreen extends StatelessWidget {
                 Text(
                   item.subtitle,
                   style: GoogleFonts.inter(
-                    color: AppTheme.textMuted,
+                    color: AppTheme.textSecondary,
                     fontSize: 10,
                   ),
                   overflow: TextOverflow.ellipsis,
@@ -283,11 +372,11 @@ class DashboardScreen extends StatelessWidget {
               ],
             ),
           ),
-          const SizedBox(width: 12),
+          const SizedBox(width: 8),
           Container(
             padding: const EdgeInsets.all(8),
             decoration: BoxDecoration(
-              color: item.color.withValues(alpha: 0.12),
+              color: item.color.withValues(alpha: 0.1),
               borderRadius: BorderRadius.circular(10),
             ),
             child: Icon(item.icon, color: item.color, size: 18),
@@ -295,14 +384,122 @@ class DashboardScreen extends StatelessWidget {
           const SizedBox(width: 8),
           Text(
             item.value,
-            style: GoogleFonts.outfit(
+            style: GoogleFonts.inter(
               color: item.color,
-              fontSize: 26,
+              fontSize: 24,
               fontWeight: FontWeight.w800,
             ),
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildStorageBreakdownCard(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: AppTheme.surfaceDark,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: AppTheme.surfaceBorder),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'STORAGE BREAKDOWN',
+                style: GoogleFonts.inter(
+                  color: AppTheme.textSecondary,
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.5,
+                ),
+              ),
+              InkWell(
+                onTap: () => context.go('/devices'),
+                child: Text(
+                  'View largest files',
+                  style: GoogleFonts.inter(
+                    color: AppTheme.accentEmerald,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          // Progress bar representation
+          ClipRRect(
+            borderRadius: BorderRadius.circular(6),
+            child: SizedBox(
+              height: 12,
+              child: Row(
+                children: [
+                  Expanded(flex: 25, child: Container(color: AppTheme.accentEmerald)),
+                  const SizedBox(width: 2),
+                  Expanded(flex: 14, child: Container(color: AppTheme.accentBlue)),
+                  const SizedBox(width: 2),
+                  Expanded(flex: 10, child: Container(color: AppTheme.accentGold)),
+                  const SizedBox(width: 2),
+                  Expanded(flex: 18, child: Container(color: AppTheme.textSecondary.withValues(alpha: 0.3))),
+                  const SizedBox(width: 2),
+                  Expanded(flex: 33, child: Container(color: AppTheme.surfaceCard)),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              _buildCategoryLegend('Documents', '31.6 GB (25%)', AppTheme.accentEmerald),
+              const SizedBox(width: 16),
+              _buildCategoryLegend('Downloads', '18.4 GB (14%)', AppTheme.accentBlue),
+              const SizedBox(width: 16),
+              _buildCategoryLegend('Cache & temp', '12.6 GB (10%)', AppTheme.accentGold),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildCategoryLegend(String label, String value, Color color) {
+    return Row(
+      children: [
+        Container(
+          width: 10,
+          height: 10,
+          decoration: BoxDecoration(
+            color: color,
+            borderRadius: BorderRadius.circular(3),
+          ),
+        ),
+        const SizedBox(width: 6),
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              label,
+              style: GoogleFonts.inter(
+                color: AppTheme.textPrimary,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+            Text(
+              value,
+              style: GoogleFonts.inter(
+                color: AppTheme.textSecondary,
+                fontSize: 10,
+              ),
+            ),
+          ],
+        ),
+      ],
     );
   }
 
@@ -325,7 +522,7 @@ class DashboardScreen extends StatelessWidget {
               const SizedBox(width: 10),
               Text(
                 'Recent Operations',
-                style: GoogleFonts.outfit(
+                style: GoogleFonts.inter(
                   color: AppTheme.textPrimary,
                   fontSize: 16,
                   fontWeight: FontWeight.w700,
@@ -335,7 +532,7 @@ class DashboardScreen extends StatelessWidget {
               Text(
                 '${ops.length} total',
                 style: GoogleFonts.inter(
-                  color: AppTheme.textMuted,
+                  color: AppTheme.textSecondary,
                   fontSize: 12,
                 ),
               ),
@@ -353,13 +550,13 @@ class DashboardScreen extends StatelessWidget {
                     Icon(
                       Icons.storage_outlined,
                       size: 40,
-                      color: AppTheme.textMuted.withValues(alpha: 0.5),
+                      color: AppTheme.textSecondary.withValues(alpha: 0.5),
                     ),
                     const SizedBox(height: 12),
                     Text(
                       'No Physical Disk Operations Recorded Yet',
-                      style: GoogleFonts.outfit(
-                        color: AppTheme.textSecondary,
+                      style: GoogleFonts.inter(
+                        color: AppTheme.textPrimary,
                         fontSize: 14,
                         fontWeight: FontWeight.w600,
                       ),
@@ -369,7 +566,7 @@ class DashboardScreen extends StatelessWidget {
                       'Connected drives are scanned in real-time via lsblk.\nAttach a USB pendrive or external disk to perform sanitization.',
                       textAlign: TextAlign.center,
                       style: GoogleFonts.inter(
-                        color: AppTheme.textMuted,
+                        color: AppTheme.textSecondary,
                         fontSize: 11,
                       ),
                     ),
@@ -397,11 +594,11 @@ class DashboardScreen extends StatelessWidget {
         statusIcon = Icons.error;
         break;
       case 'Insufficient Assurance':
-        statusColor = AppTheme.accentOrange;
+        statusColor = AppTheme.accentGold;
         statusIcon = Icons.warning;
         break;
       default:
-        statusColor = AppTheme.textMuted;
+        statusColor = AppTheme.textSecondary;
         statusIcon = Icons.hourglass_empty;
     }
 
@@ -435,7 +632,7 @@ class DashboardScreen extends StatelessWidget {
                 Text(
                   '${op.mediaType} • ${op.method}',
                   style: GoogleFonts.inter(
-                    color: AppTheme.textMuted,
+                    color: AppTheme.textSecondary,
                     fontSize: 11,
                   ),
                 ),
@@ -464,7 +661,7 @@ class DashboardScreen extends StatelessWidget {
               Text(
                 timeStr,
                 style: GoogleFonts.inter(
-                  color: AppTheme.textMuted,
+                  color: AppTheme.textSecondary,
                   fontSize: 10,
                 ),
               ),
@@ -492,7 +689,7 @@ class DashboardScreen extends StatelessWidget {
               const SizedBox(width: 10),
               Text(
                 'Security Status',
-                style: GoogleFonts.outfit(
+                style: GoogleFonts.inter(
                   color: AppTheme.textPrimary,
                   fontSize: 16,
                   fontWeight: FontWeight.w700,
@@ -501,11 +698,11 @@ class DashboardScreen extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 16),
-          _buildStatusRow('Sanitizations Completed', '${stats.completedSanitizations}', AppTheme.accentBlue),
+          _buildStatusRow('Sanitizations Completed', '${stats.completedSanitizations}', AppTheme.accentEmerald),
           _buildStatusRow('Verified', '${stats.verifiedCount}', AppTheme.accentEmerald),
-          _buildStatusRow('Certificates Issued', '${stats.certificatesGenerated}', AppTheme.accentGold),
+          _buildStatusRow('Certificates Issued', '${stats.certificatesGenerated}', AppTheme.accentEmerald),
           _buildStatusRow('Pending Attention', '${stats.attentionDevices}',
-              stats.attentionDevices > 0 ? AppTheme.accentOrange : AppTheme.accentEmerald),
+              stats.attentionDevices > 0 ? AppTheme.accentGold : AppTheme.accentEmerald),
         ],
       ),
     );
@@ -529,7 +726,7 @@ class DashboardScreen extends StatelessWidget {
             ),
             child: Text(
               value,
-              style: GoogleFonts.outfit(
+              style: GoogleFonts.inter(
                 color: color,
                 fontSize: 14,
                 fontWeight: FontWeight.w700,
@@ -554,7 +751,7 @@ class DashboardScreen extends StatelessWidget {
         children: [
           Text(
             'Quick Actions',
-            style: GoogleFonts.outfit(
+            style: GoogleFonts.inter(
               color: AppTheme.textPrimary,
               fontSize: 16,
               fontWeight: FontWeight.w700,
@@ -566,6 +763,12 @@ class DashboardScreen extends StatelessWidget {
             child: ElevatedButton.icon(
               icon: const Icon(Icons.search, size: 18),
               label: const Text('SCAN DEVICES'),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppTheme.accentEmerald,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              ),
               onPressed: () {
                 controller.refreshDevices();
                 context.go('/devices');
@@ -578,6 +781,12 @@ class DashboardScreen extends StatelessWidget {
             child: OutlinedButton.icon(
               icon: const Icon(Icons.cleaning_services, size: 18),
               label: const Text('NEW SANITIZATION'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: AppTheme.textPrimary,
+                side: const BorderSide(color: AppTheme.surfaceBorder),
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              ),
               onPressed: () => context.go('/sanitize'),
             ),
           ),
@@ -587,6 +796,12 @@ class DashboardScreen extends StatelessWidget {
             child: OutlinedButton.icon(
               icon: const Icon(Icons.psychology, size: 18),
               label: const Text('ASK AI ASSISTANT'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: AppTheme.textPrimary,
+                side: const BorderSide(color: AppTheme.surfaceBorder),
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+              ),
               onPressed: () => context.go('/ai-assistant'),
             ),
           ),

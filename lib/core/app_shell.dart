@@ -153,12 +153,10 @@ class _AppShellState extends State<AppShell> {
           Container(
             padding: const EdgeInsets.all(8),
             decoration: BoxDecoration(
-              gradient: const LinearGradient(
-                colors: [AppTheme.accentGold, AppTheme.accentGoldLight],
-              ),
+              color: AppTheme.accentEmeraldLight,
               borderRadius: BorderRadius.circular(10),
             ),
-            child: const Icon(Icons.shield, color: Colors.white, size: 20),
+            child: const Icon(Icons.shield, color: AppTheme.accentEmerald, size: 20),
           ),
           if (_isSidebarExpanded) ...[
             const SizedBox(width: 12),
@@ -168,19 +166,20 @@ class _AppShellState extends State<AppShell> {
                 children: [
                   Text(
                     'ZERO TRACE',
-                    style: GoogleFonts.outfit(
+                    style: GoogleFonts.inter(
                       color: AppTheme.textPrimary,
                       fontSize: 16,
                       fontWeight: FontWeight.w800,
-                      letterSpacing: 1.5,
+                      letterSpacing: 0.5,
                     ),
                   ),
                   Text(
-                    'v2.0 — SIH25070',
+                    'PRIVATE STORAGE',
                     style: GoogleFonts.inter(
-                      color: AppTheme.textMuted,
+                      color: AppTheme.accentEmerald,
                       fontSize: 10,
-                      fontWeight: FontWeight.w500,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 0.8,
                     ),
                   ),
                 ],
@@ -203,24 +202,21 @@ class _AppShellState extends State<AppShell> {
       ),
       child: Material(
         color: Colors.transparent,
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(10),
         child: InkWell(
           onTap: () => _onDestinationSelected(index),
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(10),
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 150),
             padding: EdgeInsets.symmetric(
               horizontal: _isSidebarExpanded ? 14 : 0,
-              vertical: 12,
+              vertical: 10,
             ),
             decoration: BoxDecoration(
               color: isSelected
-                  ? AppTheme.accentGold.withValues(alpha: 0.12)
+                  ? AppTheme.surfaceCard
                   : Colors.transparent,
-              borderRadius: BorderRadius.circular(12),
-              border: isSelected
-                  ? Border.all(color: AppTheme.accentGold.withValues(alpha: 0.3))
-                  : null,
+              borderRadius: BorderRadius.circular(10),
             ),
             child: Row(
               mainAxisAlignment: _isSidebarExpanded
@@ -229,21 +225,21 @@ class _AppShellState extends State<AppShell> {
               children: [
                 Icon(
                   isSelected ? dest.selectedIcon : dest.icon,
-                  color: isSelected ? AppTheme.accentGold : AppTheme.textMuted,
-                  size: 22,
+                  color: isSelected ? AppTheme.accentEmerald : AppTheme.textSecondary,
+                  size: 20,
                 ),
                 if (_isSidebarExpanded) ...[
-                  const SizedBox(width: 14),
+                  const SizedBox(width: 12),
                   Flexible(
                     child: Text(
                       dest.label,
-                      style: GoogleFonts.outfit(
+                      style: GoogleFonts.inter(
                         color: isSelected
-                            ? AppTheme.accentGold
+                            ? AppTheme.textPrimary
                             : AppTheme.textSecondary,
-                        fontSize: 14,
+                        fontSize: 13,
                         fontWeight:
-                            isSelected ? FontWeight.w700 : FontWeight.w500,
+                            isSelected ? FontWeight.w600 : FontWeight.w500,
                       ),
                       overflow: TextOverflow.ellipsis,
                     ),

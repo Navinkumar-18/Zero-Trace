@@ -2,23 +2,24 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 class AppTheme {
-  // Brand Palette: Light Executive
-  // NOTE: These names are kept for compatibility with all existing screens.
-  // The values are light-mode colors.
-  static const Color bgDark = Color(0xFFF1F5F9);        // Page background
-  static const Color surfaceDark = Color(0xFFFFFFFF);    // Card/panel surface
-  static const Color surfaceCard = Color(0xFFF8FAFC);    // Nested card surface
-  static const Color surfaceBorder = Color(0xFFE2E8F0);  // Borders & dividers
+  // Figma Design System Palette: Zero Trace
+  static const Color bgDark = Color(0xFFF6F8FB);        // Page background (#f6f8fb)
+  static const Color surfaceDark = Color(0xFFFFFFFF);    // Card/panel surface (#ffffff)
+  static const Color surfaceCard = Color(0xFFEFF3F6);    // Inset container background (#eff3f6)
+  static const Color surfaceBorder = Color(0xFFDBE1E8);  // Borders & dividers (#dbe1e8)
 
-  static const Color accentGold = Color(0xFFD97706);     // Slightly deeper gold for light bg contrast
-  static const Color accentGoldLight = Color(0xFFF59E0B);
-  static const Color accentBlue = Color(0xFF0284C7);     // Deeper blue for readability
-  static const Color accentEmerald = Color(0xFF059669);   // Deeper emerald
-  static const Color accentRose = Color(0xFFE11D48);
+  static const Color accentEmerald = Color(0xFF0F9360);   // Primary brand green (#0f9360)
+  static const Color accentEmeraldLight = Color(0xFFE0F4ED); // Emerald badge fill (#e0f4ed)
+  static const Color accentEmeraldDark = Color(0xFF193F33);  // Dark green container (#193f33)
+  
+  static const Color accentGold = Color(0xFFDB8414);     // Warm amber warning/queued (#db8414)
+  static const Color accentGoldLight = Color(0xFFFEF3C7);
+  static const Color accentBlue = Color(0xFF2563EB);     
+  static const Color accentRose = Color(0xFFD11E28);     // Destructive red (#d11e28)
   static const Color accentOrange = Color(0xFFEA580C);
 
-  static const Color textPrimary = Color(0xFF0F172A);    // Near-black text
-  static const Color textSecondary = Color(0xFF475569);  // Medium gray
+  static const Color textPrimary = Color(0xFF131923);    // Primary dark charcoal (#131923)
+  static const Color textSecondary = Color(0xFF606D7F);  // Slate gray text (#606d7f)
   static const Color textMuted = Color(0xFF94A3B8);      // Muted gray
 
   // Code/log area colors (dark inset panels for contrast)
@@ -33,7 +34,7 @@ class AppTheme {
       brightness: Brightness.light,
       scaffoldBackgroundColor: bgDark,
       colorScheme: const ColorScheme.light(
-        primary: accentGold,
+        primary: accentEmerald,
         onPrimary: Colors.white,
         secondary: accentBlue,
         onSecondary: Colors.white,
@@ -55,7 +56,7 @@ class AppTheme {
         elevation: 0,
         scrolledUnderElevation: 0,
         centerTitle: false,
-        titleTextStyle: GoogleFonts.outfit(
+        titleTextStyle: GoogleFonts.inter(
           color: textPrimary,
           fontSize: 20,
           fontWeight: FontWeight.w700,
@@ -64,24 +65,24 @@ class AppTheme {
         iconTheme: const IconThemeData(color: textPrimary),
       ),
       textTheme: TextTheme(
-        displayLarge: GoogleFonts.outfit(color: textPrimary, fontSize: 32, fontWeight: FontWeight.bold),
-        titleLarge: GoogleFonts.outfit(color: textPrimary, fontSize: 22, fontWeight: FontWeight.w600),
-        titleMedium: GoogleFonts.outfit(color: textPrimary, fontSize: 16, fontWeight: FontWeight.w600),
+        displayLarge: GoogleFonts.inter(color: textPrimary, fontSize: 32, fontWeight: FontWeight.bold),
+        titleLarge: GoogleFonts.inter(color: textPrimary, fontSize: 22, fontWeight: FontWeight.w600),
+        titleMedium: GoogleFonts.inter(color: textPrimary, fontSize: 16, fontWeight: FontWeight.w600),
         bodyLarge: GoogleFonts.inter(color: textPrimary, fontSize: 16),
         bodyMedium: GoogleFonts.inter(color: textSecondary, fontSize: 14),
         bodySmall: GoogleFonts.inter(color: textMuted, fontSize: 12),
       ),
       elevatedButtonTheme: ElevatedButtonThemeData(
         style: ElevatedButton.styleFrom(
-          backgroundColor: accentGold,
+          backgroundColor: accentEmerald,
           foregroundColor: Colors.white,
           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(12),
+            borderRadius: BorderRadius.circular(10),
           ),
-          textStyle: GoogleFonts.outfit(
+          textStyle: GoogleFonts.inter(
             fontWeight: FontWeight.w700,
-            fontSize: 15,
+            fontSize: 14,
           ),
         ),
       ),

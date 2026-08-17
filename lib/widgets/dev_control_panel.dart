@@ -50,7 +50,7 @@ class DevControlPanel extends StatelessWidget {
           SwitchListTile(
             title: const Text('Real Hardware Detection Mode'),
             subtitle: const Text('Discovers actual physical disks connected to this PC using lsblk'),
-            activeColor: AppTheme.accentEmerald,
+            activeThumbColor: AppTheme.accentEmerald,
             value: controller.isRealMode,
             onChanged: (val) {
               controller.toggleRealMode(val);
@@ -60,7 +60,7 @@ class DevControlPanel extends StatelessWidget {
           SwitchListTile(
             title: const Text('Simulate Failure Mode'),
             subtitle: const Text('Injects controller timeout error during sanitization stage'),
-            activeColor: AppTheme.accentRose,
+            activeThumbColor: AppTheme.accentRose,
             value: controller.simulateFailureMode,
             onChanged: (val) {
               controller.toggleSimulateFailureMode(val);

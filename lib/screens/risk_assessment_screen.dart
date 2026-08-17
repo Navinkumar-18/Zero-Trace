@@ -112,7 +112,7 @@ class RiskAssessmentScreen extends StatelessWidget {
                 subtitle: 'Security sensitivity tier of residual data on media',
                 icon: Icons.shield_outlined,
                 child: DropdownButtonFormField<DataSensitivity>(
-                  value: controller.dataSensitivity,
+                  initialValue: controller.dataSensitivity,
                   decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 10)),
                   items: const [
                     DropdownMenuItem(value: DataSensitivity.public, child: Text('Public / Unclassified Data (0.0)')),
@@ -132,7 +132,7 @@ class RiskAssessmentScreen extends StatelessWidget {
                 subtitle: 'Physical condition and firmware SMART diagnostics',
                 icon: Icons.health_and_safety_outlined,
                 child: DropdownButtonFormField<DeviceCondition>(
-                  value: controller.deviceCondition,
+                  initialValue: controller.deviceCondition,
                   decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 10)),
                   items: const [
                     DropdownMenuItem(value: DeviceCondition.functional, child: Text('Functional — Fully Operational (0.0)')),
@@ -151,7 +151,7 @@ class RiskAssessmentScreen extends StatelessWidget {
                 subtitle: 'Intended lifecycle destination post-sanitization',
                 icon: Icons.alt_route_outlined,
                 child: DropdownButtonFormField<DisposalPath>(
-                  value: controller.disposalPath,
+                  initialValue: controller.disposalPath,
                   decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 10)),
                   items: const [
                     DropdownMenuItem(value: DisposalPath.internalReuse, child: Text('Internal Redeployment / Reuse (0.0)')),

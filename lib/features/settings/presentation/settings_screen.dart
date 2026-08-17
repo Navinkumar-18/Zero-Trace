@@ -24,18 +24,18 @@ class SettingsScreen extends StatelessWidget {
               // Header
               Text(
                 'Settings',
-                style: GoogleFonts.outfit(
+                style: GoogleFonts.inter(
                   color: AppTheme.textPrimary,
                   fontSize: 28,
-                  fontWeight: FontWeight.w800,
+                  fontWeight: FontWeight.w700,
                 ),
               ),
               const SizedBox(height: 4),
               Text(
-                'Application configuration and safety settings',
+                'Control scan behavior, privacy and secure erase options.',
                 style: GoogleFonts.inter(
                   color: AppTheme.textSecondary,
-                  fontSize: 14,
+                  fontSize: 13,
                 ),
               ),
               const SizedBox(height: 24),
@@ -302,7 +302,7 @@ class SettingsScreen extends StatelessWidget {
           ),
         ),
         value: value,
-        activeColor: activeColor,
+        activeThumbColor: activeColor,
         onChanged: onChanged,
       ),
     );
