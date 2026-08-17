@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 
 import '../services/sanitization_controller.dart';
+import '../widgets/step_indicator.dart';
 import '../widgets/theme.dart';
 
 class ResultsScreen extends StatelessWidget {
@@ -30,13 +32,17 @@ class ResultsScreen extends StatelessWidget {
       ),
       body: SafeArea(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.all(16.0),
+          padding: const EdgeInsets.all(20.0),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              // Step Progress Wizard Header
+              const StepIndicator(currentStep: 5),
+              const SizedBox(height: 16),
+
               // Status Header Banner
               Container(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(18),
                 decoration: BoxDecoration(
                   color: isPassed ? AppTheme.accentEmerald.withValues(alpha: 0.12) : AppTheme.accentRose.withValues(alpha: 0.12),
                   borderRadius: BorderRadius.circular(16),
@@ -49,7 +55,7 @@ class ResultsScreen extends StatelessWidget {
                     Icon(
                       isPassed ? Icons.check_circle : Icons.error,
                       color: isPassed ? AppTheme.accentEmerald : AppTheme.accentRose,
-                      size: 32,
+                      size: 36,
                     ),
                     const SizedBox(width: 14),
                     Expanded(
@@ -88,11 +94,26 @@ class ResultsScreen extends StatelessWidget {
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Text(
-                      'MASTER EVIDENCE SHA-256 HASH',
-                      style: TextStyle(color: AppTheme.textMuted, fontSize: 11, fontWeight: FontWeight.bold),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'MASTER EVIDENCE SHA-256 HASH',
+                          style: TextStyle(color: AppTheme.textMuted, fontSize: 11, fontWeight: FontWeight.bold),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.copy, size: 16, color: AppTheme.accentGold),
+                          tooltip: 'Copy Evidence Hash',
+                          onPressed: () {
+                            Clipboard.setData(ClipboardData(text: evidence.evidenceHash));
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Evidence SHA-256 hash copied to clipboard!')),
+                            );
+                          },
+                        ),
+                      ],
                     ),
-                    const SizedBox(height: 6),
+                    const SizedBox(height: 4),
                     SelectableText(
                       evidence.evidenceHash,
                       style: const TextStyle(

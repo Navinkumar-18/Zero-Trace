@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 import '../models/device_profile.dart';
 import '../models/sanitization_job.dart';
 import '../services/sanitization_controller.dart';
+import '../widgets/step_indicator.dart';
 import '../widgets/theme.dart';
 
 class RiskAssessmentScreen extends StatelessWidget {
@@ -30,17 +31,24 @@ class RiskAssessmentScreen extends StatelessWidget {
       ),
       body: SafeArea(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.all(16.0),
+          padding: const EdgeInsets.all(20.0),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Device Brief Header Card
+              // Step Progress Wizard Header
+              const StepIndicator(currentStep: 2),
+              const SizedBox(height: 16),
+
+              // Target Device Brief Banner
               Container(
                 padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
                   color: AppTheme.surfaceDark,
                   borderRadius: BorderRadius.circular(16),
-                  border: Border.all(color: AppTheme.surfaceBorder),
+                  border: Border.all(
+                    color: device.isSystemDisk ? AppTheme.accentRose : AppTheme.surfaceBorder,
+                    width: device.isSystemDisk ? 2 : 1,
+                  ),
                 ),
                 child: Row(
                   children: [
@@ -62,91 +70,104 @@ class RiskAssessmentScreen extends StatelessWidget {
                             style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
                           ),
                           Text(
-                            '${device.mediaType.displayName} • ${device.formattedCapacity}',
+                            'S/N: ${device.serialNumber} • ${device.mediaType.displayName} • ${device.formattedCapacity}',
                             style: const TextStyle(color: AppTheme.textSecondary, fontSize: 12),
                           ),
                         ],
                       ),
                     ),
+                    if (device.isSystemDisk)
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: AppTheme.accentRose.withValues(alpha: 0.2),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: AppTheme.accentRose),
+                        ),
+                        child: const Text(
+                          'SYSTEM DISK',
+                          style: TextStyle(color: AppTheme.accentRose, fontSize: 10, fontWeight: FontWeight.bold),
+                        ),
+                      ),
                   ],
                 ),
               ),
               const SizedBox(height: 20),
 
               const Text(
-                'RISK SCORE INPUT PARAMETERS',
+                'INPUT RISK PARAMETERS',
                 style: TextStyle(
                   color: AppTheme.textMuted,
-                  fontSize: 12,
+                  fontSize: 11,
                   fontWeight: FontWeight.bold,
                   letterSpacing: 1.0,
                 ),
               ),
               const SizedBox(height: 12),
 
-              // Sensitivity Dropdown Card
+              // Sensitivity Selector
               _buildDropdownCard(
                 context: context,
-                title: '1. Data Sensitivity Classification',
-                subtitle: 'Select security tier of data stored on asset',
-                icon: Icons.shield,
+                title: '1. Data Sensitivity Level (50% Weight)',
+                subtitle: 'Security sensitivity tier of residual data on media',
+                icon: Icons.shield_outlined,
                 child: DropdownButtonFormField<DataSensitivity>(
-                  initialValue: controller.dataSensitivity,
-                  decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8)),
+                  value: controller.dataSensitivity,
+                  decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 10)),
                   items: const [
-                    DropdownMenuItem(value: DataSensitivity.public, child: Text('Public / Non-Sensitive Data')),
-                    DropdownMenuItem(value: DataSensitivity.internal, child: Text('Internal Operational Data')),
-                    DropdownMenuItem(value: DataSensitivity.confidential, child: Text('Confidential / PII / Financial')),
-                    DropdownMenuItem(value: DataSensitivity.restricted, child: Text('Restricted / Critical Intellectual Property')),
+                    DropdownMenuItem(value: DataSensitivity.public, child: Text('Public / Unclassified Data (0.0)')),
+                    DropdownMenuItem(value: DataSensitivity.internal, child: Text('Internal Operational Records (0.33)')),
+                    DropdownMenuItem(value: DataSensitivity.confidential, child: Text('Confidential / PII / Financial (0.66)')),
+                    DropdownMenuItem(value: DataSensitivity.restricted, child: Text('Restricted / Intellectual Property (1.0)')),
                   ],
                   onChanged: (val) => controller.setRiskInputs(sensitivity: val),
                 ),
               ),
               const SizedBox(height: 14),
 
-              // Device Condition Dropdown Card
+              // Device Condition Selector
               _buildDropdownCard(
                 context: context,
-                title: '2. Asset Operational Condition',
-                subtitle: 'Assess physical & firmware integrity',
-                icon: Icons.health_and_safety,
+                title: '2. Device Integrity (20% Weight)',
+                subtitle: 'Physical condition and firmware SMART diagnostics',
+                icon: Icons.health_and_safety_outlined,
                 child: DropdownButtonFormField<DeviceCondition>(
-                  initialValue: controller.deviceCondition,
-                  decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8)),
+                  value: controller.deviceCondition,
+                  decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 10)),
                   items: const [
-                    DropdownMenuItem(value: DeviceCondition.functional, child: Text('Functional (No bad sectors)')),
-                    DropdownMenuItem(value: DeviceCondition.degraded, child: Text('Degraded (Intermittent SMART warnings)')),
-                    DropdownMenuItem(value: DeviceCondition.endOfLife, child: Text('End of Life / Non-Bootable Controller')),
+                    DropdownMenuItem(value: DeviceCondition.functional, child: Text('Functional — Fully Operational (0.0)')),
+                    DropdownMenuItem(value: DeviceCondition.degraded, child: Text('Degraded — Intermittent SMART Alerts (0.5)')),
+                    DropdownMenuItem(value: DeviceCondition.endOfLife, child: Text('End of Life — Non-Bootable / Dead Sector Pool (1.0)')),
                   ],
                   onChanged: (val) => controller.setRiskInputs(condition: val),
                 ),
               ),
               const SizedBox(height: 14),
 
-              // Disposal Path Dropdown Card
+              // Disposal Path Selector
               _buildDropdownCard(
                 context: context,
-                title: '3. Asset Disposal Channel',
-                subtitle: 'Intended destination post-sanitization',
-                icon: Icons.alt_route,
+                title: '3. Asset Disposal Channel (30% Weight)',
+                subtitle: 'Intended lifecycle destination post-sanitization',
+                icon: Icons.alt_route_outlined,
                 child: DropdownButtonFormField<DisposalPath>(
-                  initialValue: controller.disposalPath,
-                  decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8)),
+                  value: controller.disposalPath,
+                  decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 10)),
                   items: const [
-                    DropdownMenuItem(value: DisposalPath.internalReuse, child: Text('Internal Redeployment / Reuse')),
-                    DropdownMenuItem(value: DisposalPath.externalResale, child: Text('External Secondary Resale / Donation')),
-                    DropdownMenuItem(value: DisposalPath.recycling, child: Text('E-Waste Recycling Facility')),
-                    DropdownMenuItem(value: DisposalPath.physicalDestruction, child: Text('Mandatory Physical Destruction')),
+                    DropdownMenuItem(value: DisposalPath.internalReuse, child: Text('Internal Redeployment / Reuse (0.0)')),
+                    DropdownMenuItem(value: DisposalPath.externalResale, child: Text('External Resale / Secondary Market (0.4)')),
+                    DropdownMenuItem(value: DisposalPath.recycling, child: Text('E-Waste Recycling Partner (0.8)')),
+                    DropdownMenuItem(value: DisposalPath.physicalDestruction, child: Text('Mandatory Physical Destruction (1.0)')),
                   ],
                   onChanged: (val) => controller.setRiskInputs(path: val),
                 ),
               ),
               const SizedBox(height: 20),
 
-              // Dynamic Risk Score Result Panel
+              // Dynamic Risk Calculation Panel
               if (job != null) ...[
                 Container(
-                  padding: const EdgeInsets.all(16),
+                  padding: const EdgeInsets.all(18),
                   decoration: BoxDecoration(
                     color: AppTheme.surfaceDark,
                     borderRadius: BorderRadius.circular(16),
@@ -158,28 +179,38 @@ class RiskAssessmentScreen extends StatelessWidget {
                       Row(
                         children: [
                           Container(
-                            padding: const EdgeInsets.all(8),
+                            padding: const EdgeInsets.all(10),
                             decoration: BoxDecoration(
                               color: _getRiskColor(job.riskScore).withValues(alpha: 0.15),
                               shape: BoxShape.circle,
                             ),
-                            child: Icon(Icons.analytics, color: _getRiskColor(job.riskScore), size: 20),
+                            child: Icon(Icons.analytics, color: _getRiskColor(job.riskScore), size: 22),
                           ),
-                          const SizedBox(width: 10),
-                          Text(
-                            'Calculated Risk Score: ${(job.riskScore * 100).toStringAsFixed(1)}%',
-                            style: TextStyle(
-                              fontSize: 16,
-                              fontWeight: FontWeight.bold,
-                              color: _getRiskColor(job.riskScore),
-                            ),
+                          const SizedBox(width: 12),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Risk Score: ${(job.riskScore * 100).toStringAsFixed(1)}%',
+                                style: TextStyle(
+                                  fontSize: 18,
+                                  fontWeight: FontWeight.bold,
+                                  color: _getRiskColor(job.riskScore),
+                                ),
+                              ),
+                              const Text(
+                                'Evaluated via Algorithm 4 Formula',
+                                style: TextStyle(fontSize: 11, color: AppTheme.textMuted),
+                              ),
+                            ],
                           ),
                           const Spacer(),
                           Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                             decoration: BoxDecoration(
-                              color: _getRiskColor(job.riskScore).withValues(alpha: 0.15),
+                              color: _getRiskColor(job.riskScore).withValues(alpha: 0.2),
                               borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: _getRiskColor(job.riskScore)),
                             ),
                             child: Text(
                               job.targetCategory.displayName.split(' ')[0],
@@ -192,7 +223,17 @@ class RiskAssessmentScreen extends StatelessWidget {
                           ),
                         ],
                       ),
-                      const SizedBox(height: 10),
+                      const SizedBox(height: 14),
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(6),
+                        child: LinearProgressIndicator(
+                          value: job.riskScore,
+                          minHeight: 8,
+                          backgroundColor: AppTheme.surfaceCard,
+                          valueColor: AlwaysStoppedAnimation<Color>(_getRiskColor(job.riskScore)),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
                       Text(
                         job.explanationText,
                         style: const TextStyle(color: AppTheme.textSecondary, fontSize: 13, height: 1.4),
@@ -202,16 +243,28 @@ class RiskAssessmentScreen extends StatelessWidget {
                 ),
                 const SizedBox(height: 24),
 
-                // Action Button
-                SizedBox(
-                  width: double.infinity,
-                  child: ElevatedButton.icon(
-                    icon: const Icon(Icons.psychology, size: 20),
-                    label: const Text('COMPUTE METHOD RECOMMENDATION'),
-                    onPressed: () {
-                      context.push('/workflow');
-                    },
-                  ),
+                // Navigation Buttons Row
+                Row(
+                  children: [
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        icon: const Icon(Icons.arrow_back, size: 18),
+                        label: const Text('CHANGE ASSET'),
+                        onPressed: () => context.pop(),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      flex: 2,
+                      child: ElevatedButton.icon(
+                        icon: const Icon(Icons.arrow_forward, size: 18),
+                        label: const Text('SELECT SANITIZATION METHOD'),
+                        onPressed: () {
+                          context.push('/workflow');
+                        },
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ],

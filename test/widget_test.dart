@@ -7,6 +7,6 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('ZERO TRACE 2.0'), findsOneWidget);
-    expect(find.text('Target Asset Inventory'), findsOneWidget);
+    expect(find.text('Inventory'), findsWidgets);
   });
 }

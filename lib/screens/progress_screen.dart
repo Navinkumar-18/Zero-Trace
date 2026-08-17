@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 
 import '../models/sanitization_job.dart';
 import '../services/sanitization_controller.dart';
+import '../widgets/step_indicator.dart';
 import '../widgets/theme.dart';
 
 class ProgressScreen extends StatelessWidget {
@@ -26,16 +27,20 @@ class ProgressScreen extends StatelessWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Orchestration Engine Progress'),
+        title: const Text('Orchestration Pipeline Execution'),
         automaticallyImplyLeading: !isFinished,
       ),
       body: SafeArea(
         child: Padding(
-          padding: const EdgeInsets.all(16.0),
+          padding: const EdgeInsets.all(20.0),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // Target Device Card
+              // Step Progress Wizard Header
+              const StepIndicator(currentStep: 4),
+              const SizedBox(height: 16),
+
+              // Target Asset Brief Card
               Container(
                 padding: const EdgeInsets.all(14),
                 decoration: BoxDecoration(
@@ -51,6 +56,7 @@ class ProgressScreen extends StatelessWidget {
                       child: Text(
                         'Target: ${job.device.name} [${job.device.serialNumber}]',
                         style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                        overflow: TextOverflow.ellipsis,
                       ),
                     ),
                   ],
@@ -58,7 +64,7 @@ class ProgressScreen extends StatelessWidget {
               ),
               const SizedBox(height: 20),
 
-              // Progress Indicator Visual
+              // Progress Circular Indicator
               Center(
                 child: Column(
                   children: [
@@ -79,7 +85,7 @@ class ProgressScreen extends StatelessWidget {
                           Text(
                             '${(job.progress * 100).toInt()}%',
                             style: TextStyle(
-                              fontSize: 24,
+                              fontSize: 26,
                               fontWeight: FontWeight.bold,
                               color: isFailed ? AppTheme.accentRose : AppTheme.textPrimary,
                             ),
@@ -102,8 +108,8 @@ class ProgressScreen extends StatelessWidget {
               ),
               const SizedBox(height: 24),
 
-              Text(
-                'LIVE EXECUTION TELEMETRY LOGS',
+              const Text(
+                'LIVE PIPELINE LOGS & TELEMETRY STREAM',
                 style: TextStyle(
                   color: AppTheme.textMuted,
                   fontSize: 11,
@@ -113,11 +119,11 @@ class ProgressScreen extends StatelessWidget {
               ),
               const SizedBox(height: 8),
 
-              // Execution Console Stream Container
+              // Log Stream Box
               Expanded(
                 child: Container(
                   width: double.infinity,
-                  padding: const EdgeInsets.all(12),
+                  padding: const EdgeInsets.all(14),
                   decoration: BoxDecoration(
                     color: Colors.black,
                     borderRadius: BorderRadius.circular(12),
@@ -153,13 +159,12 @@ class ProgressScreen extends StatelessWidget {
               ),
               const SizedBox(height: 16),
 
-              // Action button when finished
               if (isFinished)
                 SizedBox(
                   width: double.infinity,
                   child: ElevatedButton.icon(
                     icon: const Icon(Icons.assessment, size: 20),
-                    label: const Text('VIEW VERIFICATION RESULTS'),
+                    label: const Text('PROCEED TO VERIFICATION & CERTIFICATE'),
                     onPressed: () {
                       context.push('/results');
                     },

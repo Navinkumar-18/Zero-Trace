@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 
 import '../models/sanitization_job.dart';
 import '../services/sanitization_controller.dart';
+import '../widgets/step_indicator.dart';
 import '../widgets/theme.dart';
 
 class SanitizationWorkflowScreen extends StatelessWidget {
@@ -30,22 +31,26 @@ class SanitizationWorkflowScreen extends StatelessWidget {
       ),
       body: SafeArea(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.all(16.0),
+          padding: const EdgeInsets.all(20.0),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              // Step Progress Wizard Header
+              const StepIndicator(currentStep: 3),
+              const SizedBox(height: 16),
+
               // Standard Compliance Banner
               Container(
-                padding: const EdgeInsets.all(14),
+                padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
                   color: AppTheme.accentGold.withValues(alpha: 0.12),
-                  borderRadius: BorderRadius.circular(14),
+                  borderRadius: BorderRadius.circular(16),
                   border: Border.all(color: AppTheme.accentGold.withValues(alpha: 0.4)),
                 ),
                 child: Row(
                   children: [
-                    const Icon(Icons.verified, color: AppTheme.accentGold, size: 24),
-                    const SizedBox(width: 12),
+                    const Icon(Icons.verified_user_outlined, color: AppTheme.accentGold, size: 26),
+                    const SizedBox(width: 14),
                     Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
@@ -57,7 +62,7 @@ class SanitizationWorkflowScreen extends StatelessWidget {
                           const SizedBox(height: 2),
                           Text(
                             job.standardReference,
-                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: AppTheme.textPrimary),
+                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14, color: AppTheme.textPrimary),
                           ),
                         ],
                       ),
@@ -81,14 +86,14 @@ class SanitizationWorkflowScreen extends StatelessWidget {
                     Row(
                       children: [
                         Container(
-                          padding: const EdgeInsets.all(10),
+                          padding: const EdgeInsets.all(12),
                           decoration: BoxDecoration(
                             color: AppTheme.accentBlue.withValues(alpha: 0.15),
                             borderRadius: BorderRadius.circular(12),
                           ),
-                          child: const Icon(Icons.cleaning_services, color: AppTheme.accentBlue, size: 24),
+                          child: const Icon(Icons.cleaning_services, color: AppTheme.accentBlue, size: 26),
                         ),
-                        const SizedBox(width: 12),
+                        const SizedBox(width: 14),
                         Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
@@ -114,7 +119,7 @@ class SanitizationWorkflowScreen extends StatelessWidget {
                     const Divider(color: AppTheme.surfaceBorder),
                     const SizedBox(height: 12),
                     const Text(
-                      'Technical Explanation & Mechanism:',
+                      'Technical Mechanism & Operational Scope:',
                       style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: AppTheme.textPrimary),
                     ),
                     const SizedBox(height: 6),
@@ -153,7 +158,7 @@ class SanitizationWorkflowScreen extends StatelessWidget {
                         ),
                         const SizedBox(width: 10),
                         Text(
-                          isAllowed ? 'POLICY LAYER PASSED' : 'POLICY LAYER REJECTED',
+                          isAllowed ? 'POLICY LAYER APPROVED' : 'POLICY LAYER REJECTED',
                           style: TextStyle(
                             fontSize: 14,
                             fontWeight: FontWeight.bold,
@@ -172,23 +177,35 @@ class SanitizationWorkflowScreen extends StatelessWidget {
               ),
               const SizedBox(height: 24),
 
-              // Action Button
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  icon: const Icon(Icons.play_arrow, size: 22),
-                  label: Text(isAllowed ? 'RUN SANITIZATION PIPELINE' : 'CANNOT EXECUTE (POLICY BLOCKED)'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: isAllowed ? AppTheme.accentGold : AppTheme.surfaceBorder,
-                    foregroundColor: isAllowed ? Colors.black : AppTheme.textMuted,
+              // Action Buttons Row
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      icon: const Icon(Icons.arrow_back, size: 18),
+                      label: const Text('BACK'),
+                      onPressed: () => context.pop(),
+                    ),
                   ),
-                  onPressed: isAllowed
-                      ? () {
-                          controller.runSanitizationPipeline();
-                          context.push('/progress');
-                        }
-                      : null,
-                ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    flex: 2,
+                    child: ElevatedButton.icon(
+                      icon: const Icon(Icons.play_arrow, size: 22),
+                      label: Text(isAllowed ? 'START PIPELINE' : 'BLOCKED BY POLICY'),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: isAllowed ? AppTheme.accentGold : AppTheme.surfaceBorder,
+                        foregroundColor: isAllowed ? Colors.black : AppTheme.textMuted,
+                      ),
+                      onPressed: isAllowed
+                          ? () {
+                              controller.runSanitizationPipeline();
+                              context.push('/progress');
+                            }
+                          : null,
+                    ),
+                  ),
+                ],
               ),
             ],
           ),
