@@ -144,7 +144,7 @@ class ResultsScreen extends StatelessWidget {
                 padding: const EdgeInsets.all(12),
                 height: 140,
                 decoration: BoxDecoration(
-                  color: Colors.black,
+                  color: AppTheme.codeBackground,
                   borderRadius: BorderRadius.circular(12),
                   border: Border.all(color: AppTheme.surfaceBorder),
                 ),
@@ -227,7 +227,7 @@ class ResultsScreen extends StatelessWidget {
                   icon: const Icon(Icons.picture_as_pdf, size: 20),
                   label: const Text('VIEW & EXPORT AUDIT CERTIFICATE'),
                   onPressed: () {
-                    context.push('/certificate');
+                    context.go('/certificates');
                   },
                 ),
               ),

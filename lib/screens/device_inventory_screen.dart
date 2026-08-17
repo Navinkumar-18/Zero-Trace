@@ -82,7 +82,7 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
                 ),
                 borderRadius: BorderRadius.circular(10),
               ),
-              child: const Icon(Icons.shield, color: Colors.black, size: 20),
+              child: const Icon(Icons.shield, color: Colors.white, size: 20),
             ),
             const SizedBox(width: 12),
             const Column(
@@ -342,7 +342,7 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
         child: InkWell(
           onTap: () {
             controller.selectDevice(device);
-            context.push('/risk-assessment');
+            context.go('/devices/details/${device.id}');
           },
           borderRadius: BorderRadius.circular(16),
           child: AnimatedContainer(
@@ -369,7 +369,7 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
-              mainAxisAlignment: MainAxisAlignment.center,
+              mainAxisSize: MainAxisSize.min,
               children: [
                 Row(
                   children: [
@@ -450,9 +450,9 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
                     ),
                   ],
                 ),
-                const SizedBox(height: 12),
-                const Divider(color: AppTheme.surfaceBorder, height: 1),
                 const SizedBox(height: 10),
+                const Divider(color: AppTheme.surfaceBorder, height: 1),
+                const SizedBox(height: 8),
 
                 // Capabilities Badges Row
                 Wrap(

@@ -2,31 +2,39 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 class AppTheme {
-  // Brand Palette: Midnight Executive
-  static const Color bgDark = Color(0xFF0A0E1A);
-  static const Color surfaceDark = Color(0xFF131C2E);
-  static const Color surfaceCard = Color(0xFF1E293B);
-  static const Color surfaceBorder = Color(0xFF334155);
+  // Brand Palette: Light Executive
+  // NOTE: These names are kept for compatibility with all existing screens.
+  // The values are light-mode colors.
+  static const Color bgDark = Color(0xFFF1F5F9);        // Page background
+  static const Color surfaceDark = Color(0xFFFFFFFF);    // Card/panel surface
+  static const Color surfaceCard = Color(0xFFF8FAFC);    // Nested card surface
+  static const Color surfaceBorder = Color(0xFFE2E8F0);  // Borders & dividers
 
-  static const Color accentGold = Color(0xFFF59E0B);
-  static const Color accentGoldLight = Color(0xFFFBBF24);
-  static const Color accentBlue = Color(0xFF0EA5E9);
-  static const Color accentEmerald = Color(0xFF10B981);
-  static const Color accentRose = Color(0xFFF43F5E);
-  static const Color accentOrange = Color(0xFFF97316);
+  static const Color accentGold = Color(0xFFD97706);     // Slightly deeper gold for light bg contrast
+  static const Color accentGoldLight = Color(0xFFF59E0B);
+  static const Color accentBlue = Color(0xFF0284C7);     // Deeper blue for readability
+  static const Color accentEmerald = Color(0xFF059669);   // Deeper emerald
+  static const Color accentRose = Color(0xFFE11D48);
+  static const Color accentOrange = Color(0xFFEA580C);
 
-  static const Color textPrimary = Color(0xFFF8FAFC);
-  static const Color textSecondary = Color(0xFF94A3B8);
-  static const Color textMuted = Color(0xFF64748B);
+  static const Color textPrimary = Color(0xFF0F172A);    // Near-black text
+  static const Color textSecondary = Color(0xFF475569);  // Medium gray
+  static const Color textMuted = Color(0xFF94A3B8);      // Muted gray
 
-  static ThemeData get darkTheme {
+  // Code/log area colors (dark inset panels for contrast)
+  static const Color codeBackground = Color(0xFF1E293B);
+  static const Color codeText = Color(0xFFE2E8F0);
+
+  static ThemeData get darkTheme => lightTheme; // Alias for backwards compat
+
+  static ThemeData get lightTheme {
     return ThemeData(
       useMaterial3: true,
-      brightness: Brightness.dark,
+      brightness: Brightness.light,
       scaffoldBackgroundColor: bgDark,
-      colorScheme: const ColorScheme.dark(
+      colorScheme: const ColorScheme.light(
         primary: accentGold,
-        onPrimary: Colors.black,
+        onPrimary: Colors.white,
         secondary: accentBlue,
         onSecondary: Colors.white,
         surface: surfaceDark,
@@ -35,7 +43,7 @@ class AppTheme {
         onError: Colors.white,
       ),
       cardTheme: CardThemeData(
-        color: surfaceCard,
+        color: surfaceDark,
         elevation: 0,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(16),
@@ -43,7 +51,7 @@ class AppTheme {
         ),
       ),
       appBarTheme: AppBarTheme(
-        backgroundColor: bgDark,
+        backgroundColor: surfaceDark,
         elevation: 0,
         scrolledUnderElevation: 0,
         centerTitle: false,
@@ -66,7 +74,7 @@ class AppTheme {
       elevatedButtonTheme: ElevatedButtonThemeData(
         style: ElevatedButton.styleFrom(
           backgroundColor: accentGold,
-          foregroundColor: Colors.black,
+          foregroundColor: Colors.white,
           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(12),
@@ -93,7 +101,7 @@ class AppTheme {
       ),
       inputDecorationTheme: InputDecorationTheme(
         filled: true,
-        fillColor: surfaceDark,
+        fillColor: surfaceCard,
         border: OutlineInputBorder(
           borderRadius: BorderRadius.circular(12),
           borderSide: const BorderSide(color: surfaceBorder),
@@ -108,6 +116,52 @@ class AppTheme {
         ),
         contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
         labelStyle: const TextStyle(color: textSecondary),
+      ),
+      navigationRailTheme: NavigationRailThemeData(
+        backgroundColor: surfaceDark,
+        selectedIconTheme: const IconThemeData(color: accentGold, size: 24),
+        unselectedIconTheme: const IconThemeData(color: textMuted, size: 22),
+        selectedLabelTextStyle: GoogleFonts.outfit(
+          color: accentGold,
+          fontSize: 12,
+          fontWeight: FontWeight.w700,
+        ),
+        unselectedLabelTextStyle: GoogleFonts.outfit(
+          color: textMuted,
+          fontSize: 11,
+          fontWeight: FontWeight.w500,
+        ),
+        indicatorColor: accentGold.withValues(alpha: 0.15),
+      ),
+      chipTheme: ChipThemeData(
+        backgroundColor: surfaceCard,
+        side: const BorderSide(color: surfaceBorder),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(8),
+        ),
+        labelStyle: GoogleFonts.inter(fontSize: 12, color: textSecondary),
+      ),
+      dividerTheme: const DividerThemeData(
+        color: surfaceBorder,
+        thickness: 1,
+      ),
+      tooltipTheme: TooltipThemeData(
+        decoration: BoxDecoration(
+          color: codeBackground,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: surfaceBorder),
+        ),
+        textStyle: GoogleFonts.inter(color: codeText, fontSize: 12),
+      ),
+      switchTheme: SwitchThemeData(
+        thumbColor: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.selected)) return accentGold;
+          return textMuted;
+        }),
+        trackColor: WidgetStateProperty.resolveWith((states) {
+          if (states.contains(WidgetState.selected)) return accentGold.withValues(alpha: 0.3);
+          return surfaceBorder;
+        }),
       ),
     );
   }

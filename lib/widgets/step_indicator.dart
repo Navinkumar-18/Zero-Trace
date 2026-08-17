@@ -76,10 +76,10 @@ class StepIndicator extends StatelessWidget {
 
               if (isDone) {
                 circleBg = AppTheme.accentEmerald;
-                circleText = Colors.black;
+                circleText = Colors.white;
               } else if (isActive) {
                 circleBg = AppTheme.accentGold;
-                circleText = Colors.black;
+                circleText = Colors.white;
               } else {
                 circleBg = AppTheme.surfaceCard;
                 circleText = AppTheme.textMuted;
@@ -99,7 +99,7 @@ class StepIndicator extends StatelessWidget {
                       ),
                       child: Center(
                         child: isDone
-                            ? const Icon(Icons.check, size: 16, color: Colors.black)
+                            ? const Icon(Icons.check, size: 16, color: Colors.white)
                             : Text(
                                 '$stepNum',
                                 style: TextStyle(

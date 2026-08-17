@@ -184,7 +184,7 @@ class SanitizationWorkflowScreen extends StatelessWidget {
                     child: OutlinedButton.icon(
                       icon: const Icon(Icons.arrow_back, size: 18),
                       label: const Text('BACK'),
-                      onPressed: () => context.pop(),
+                      onPressed: () => context.go('/sanitize'),
                     ),
                   ),
                   const SizedBox(width: 12),
@@ -195,12 +195,12 @@ class SanitizationWorkflowScreen extends StatelessWidget {
                       label: Text(isAllowed ? 'START PIPELINE' : 'BLOCKED BY POLICY'),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: isAllowed ? AppTheme.accentGold : AppTheme.surfaceBorder,
-                        foregroundColor: isAllowed ? Colors.black : AppTheme.textMuted,
+                        foregroundColor: isAllowed ? Colors.white : AppTheme.textMuted,
                       ),
                       onPressed: isAllowed
                           ? () {
                               controller.runSanitizationPipeline();
-                              context.push('/progress');
+                              context.go('/sanitize/progress');
                             }
                           : null,
                     ),

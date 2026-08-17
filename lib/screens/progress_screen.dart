@@ -125,7 +125,7 @@ class ProgressScreen extends StatelessWidget {
                   width: double.infinity,
                   padding: const EdgeInsets.all(14),
                   decoration: BoxDecoration(
-                    color: Colors.black,
+                    color: AppTheme.codeBackground,
                     borderRadius: BorderRadius.circular(12),
                     border: Border.all(color: AppTheme.surfaceBorder),
                   ),
@@ -166,7 +166,7 @@ class ProgressScreen extends StatelessWidget {
                     icon: const Icon(Icons.assessment, size: 20),
                     label: const Text('PROCEED TO VERIFICATION & CERTIFICATE'),
                     onPressed: () {
-                      context.push('/results');
+                      context.go('/verification');
                     },
                   ),
                 ),

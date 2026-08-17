@@ -115,7 +115,7 @@ class _CertificateViewerScreenState extends State<CertificateViewerScreen> with 
                   child: Container(
                     padding: const EdgeInsets.all(14),
                     decoration: BoxDecoration(
-                      color: Colors.black,
+                      color: AppTheme.codeBackground,
                       borderRadius: BorderRadius.circular(12),
                       border: Border.all(color: AppTheme.surfaceBorder),
                     ),
@@ -146,7 +146,7 @@ class _CertificateViewerScreenState extends State<CertificateViewerScreen> with 
           icon: const Icon(Icons.home),
           label: const Text('RETURN TO INVENTORY'),
           onPressed: () {
-            context.go('/');
+            context.go('/dashboard');
           },
         ),
       ),

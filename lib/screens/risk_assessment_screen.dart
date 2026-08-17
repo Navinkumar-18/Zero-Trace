@@ -250,7 +250,7 @@ class RiskAssessmentScreen extends StatelessWidget {
                       child: OutlinedButton.icon(
                         icon: const Icon(Icons.arrow_back, size: 18),
                         label: const Text('CHANGE ASSET'),
-                        onPressed: () => context.pop(),
+                        onPressed: () => context.go('/devices'),
                       ),
                     ),
                     const SizedBox(width: 12),
@@ -260,7 +260,7 @@ class RiskAssessmentScreen extends StatelessWidget {
                         icon: const Icon(Icons.arrow_forward, size: 18),
                         label: const Text('SELECT SANITIZATION METHOD'),
                         onPressed: () {
-                          context.push('/workflow');
+                          context.go('/sanitize/workflow');
                         },
                       ),
                     ),
