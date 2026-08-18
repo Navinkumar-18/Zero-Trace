@@ -26,6 +26,7 @@ class SanitizationController extends ChangeNotifier {
   List<DeviceProfile> _devices = [];
   DeviceProfile? _selectedDevice;
   bool _isRealMode = true;
+  Timer? _autoPollTimer;
 
   // Form Inputs
   DataSensitivity _dataSensitivity = DataSensitivity.confidential;
@@ -42,12 +43,15 @@ class SanitizationController extends ChangeNotifier {
 
   SanitizationController() {
     refreshDevices();
+    _startAutoPolling();
   }
 
   // Getters
   List<DeviceProfile> get devices => _devices;
   DeviceProfile? get selectedDevice => _selectedDevice;
   bool get isRealMode => _isRealMode;
+  bool get isAutoPollingActive => _autoPollTimer?.isActive ?? false;
+  ClassificationService get classificationService => _classificationService;
 
   DataSensitivity get dataSensitivity => _dataSensitivity;
   DeviceCondition get deviceCondition => _deviceCondition;
@@ -58,22 +62,64 @@ class SanitizationController extends ChangeNotifier {
   PolicyValidationResult? get lastPolicyResult => _lastPolicyResult;
   bool get simulateFailureMode => _simulateFailureMode;
 
+  void _startAutoPolling() {
+    _autoPollTimer?.cancel();
+    if (_isRealMode) {
+      _autoPollTimer = Timer.periodic(const Duration(milliseconds: 2500), (_) {
+        refreshDevices(silent: true);
+      });
+    }
+  }
+
+  void _stopAutoPolling() {
+    _autoPollTimer?.cancel();
+    _autoPollTimer = null;
+  }
+
   Future<void> toggleRealMode(bool value) async {
     _isRealMode = value;
+    if (_isRealMode) {
+      _startAutoPolling();
+    } else {
+      _stopAutoPolling();
+    }
     await refreshDevices();
   }
 
-  Future<void> refreshDevices() async {
-    _devices = await _intelligenceService.discoverDevices(realMode: _isRealMode);
-    if (_devices.isNotEmpty) {
-      if (_selectedDevice == null || !_devices.any((d) => d.id == _selectedDevice!.id)) {
-        _selectedDevice = _devices.first;
+  Future<void> refreshDevices({bool silent = false}) async {
+    final freshDevices = await _intelligenceService.discoverDevices(realMode: _isRealMode);
+
+    // Check if device list changed
+    bool hasChanged = freshDevices.length != _devices.length;
+    if (!hasChanged) {
+      for (int i = 0; i < freshDevices.length; i++) {
+        if (freshDevices[i].id != _devices[i].id ||
+            freshDevices[i].name != _devices[i].name ||
+            freshDevices[i].capacityBytes != _devices[i].capacityBytes) {
+          hasChanged = true;
+          break;
+        }
       }
-    } else {
-      _selectedDevice = null;
     }
-    _updateJobRecommendation();
-    notifyListeners();
+
+    if (hasChanged || _devices.isEmpty) {
+      _devices = freshDevices;
+      if (_devices.isNotEmpty) {
+        if (_selectedDevice == null || !_devices.any((d) => d.id == _selectedDevice!.id)) {
+          _selectedDevice = _devices.first;
+        }
+      } else {
+        _selectedDevice = null;
+      }
+      _updateJobRecommendation();
+      notifyListeners();
+    }
+  }
+
+  @override
+  void dispose() {
+    _stopAutoPolling();
+    super.dispose();
   }
 
   void selectDevice(DeviceProfile device) {
@@ -192,7 +238,7 @@ class SanitizationController extends ChangeNotifier {
     for (int p = 45; p <= 80; p += 10) {
       await Future.delayed(const Duration(milliseconds: 400));
       job.progress = p / 100.0;
-      _addLog('PROGRESS: ${job.recommendedMethod.displayName} - ${p}% complete');
+      _addLog('PROGRESS: ${job.recommendedMethod.displayName} - $p% complete');
       notifyListeners();
     }
 

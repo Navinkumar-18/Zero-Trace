@@ -223,14 +223,41 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
               ),
               const SizedBox(height: 16),
 
-              Text(
-                'DISCOVERED STORAGE TARGETS (${filteredDevices.length})',
-                style: const TextStyle(
-                  color: AppTheme.textMuted,
-                  fontSize: 11,
-                  fontWeight: FontWeight.bold,
-                  letterSpacing: 1.0,
-                ),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    'DISCOVERED STORAGE TARGETS (${filteredDevices.length})',
+                    style: const TextStyle(
+                      color: AppTheme.textMuted,
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                      letterSpacing: 1.0,
+                    ),
+                  ),
+                  if (controller.isRealMode)
+                    Row(
+                      children: [
+                        Container(
+                          width: 8,
+                          height: 8,
+                          decoration: const BoxDecoration(
+                            color: AppTheme.accentEmerald,
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                        const SizedBox(width: 6),
+                        const Text(
+                          'Hot-Plug Auto-Scan Active',
+                          style: TextStyle(
+                            color: AppTheme.accentEmerald,
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ],
+                    ),
+                ],
               ),
               const SizedBox(height: 10),
 
