@@ -261,6 +261,29 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
               ),
               const SizedBox(height: 10),
 
+              if (!controller.isRealMode)
+                Container(
+                  margin: const EdgeInsets.only(bottom: 12),
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: AppTheme.accentGold.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: AppTheme.accentGold.withValues(alpha: 0.3)),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.info_outline, color: AppTheme.accentGold, size: 20),
+                      SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'Practice Mode (Simulated Drives): The listed devices (Seagate, Samsung, WD, SanDisk) are demo samples for safe practice. Tap "SIMULATED MODE" at top right to switch to real connected disks.',
+                          style: TextStyle(color: AppTheme.textSecondary, fontSize: 12),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+
               // Responsive Device List Grid View
               Expanded(
                 child: filteredDevices.isEmpty
@@ -486,15 +509,35 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
                   spacing: 8,
                   runSpacing: 6,
                   children: [
-                    _buildBadge(device.mediaType.shortTag, _getMediaColor(device.mediaType)),
+                    _buildBadge(
+                      device.mediaType.shortTag,
+                      _getMediaColor(device.mediaType),
+                      tooltip: device.mediaType.displayName,
+                    ),
                     if (device.isHardwareEncrypted)
-                      _buildBadge('TCG OPAL Encrypted', AppTheme.accentEmerald),
+                      _buildBadge(
+                        'TCG OPAL Encrypted',
+                        AppTheme.accentEmerald,
+                        tooltip: 'Hardware Encrypted: Storage chip protects data with built-in encryption key.',
+                      ),
                     if (device.supportsAtaSanitize || device.supportsNvmeSanitize || device.supportsEmmcSanitize)
-                      _buildBadge('Sanitize Primitive', AppTheme.accentBlue),
+                      _buildBadge(
+                        'Sanitize Primitive',
+                        AppTheme.accentBlue,
+                        tooltip: 'Hardware Deep Clean (Sanitize): Firmware command directly erases chip memory.',
+                      ),
                     if (device.supportsAtaSecureErase)
-                      _buildBadge('ATA Secure Erase', AppTheme.accentBlue),
+                      _buildBadge(
+                        'ATA Secure Erase',
+                        AppTheme.accentBlue,
+                        tooltip: 'Hardware Wipe (Secure Erase): Drive supports built-in drive clearing command.',
+                      ),
                     if (device.hpaDcoPresent)
-                      _buildBadge('HPA/DCO Sectors', AppTheme.accentRose),
+                      _buildBadge(
+                        'HPA/DCO Sectors',
+                        AppTheme.accentRose,
+                        tooltip: 'Hidden Storage Areas: Disk contains hidden areas requiring special unlock.',
+                      ),
                   ],
                 ),
               ],
@@ -505,8 +548,8 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
     );
   }
 
-  Widget _buildBadge(String label, Color color) {
-    return Container(
+  Widget _buildBadge(String label, Color color, {String? tooltip}) {
+    final badge = Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       decoration: BoxDecoration(
         color: color.withValues(alpha: 0.12),
@@ -518,5 +561,20 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
         style: TextStyle(color: color, fontSize: 10, fontWeight: FontWeight.bold),
       ),
     );
+
+    if (tooltip != null) {
+      return Tooltip(
+        message: tooltip,
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        textStyle: const TextStyle(fontSize: 11, color: Colors.white),
+        decoration: BoxDecoration(
+          color: AppTheme.surfaceDark,
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: AppTheme.accentGold.withValues(alpha: 0.5)),
+        ),
+        child: badge,
+      );
+    }
+    return badge;
   }
 }

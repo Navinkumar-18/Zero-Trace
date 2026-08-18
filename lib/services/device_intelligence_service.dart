@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+
 import '../models/device_profile.dart';
 import 'device_simulator.dart';
 
@@ -16,7 +18,7 @@ class DeviceIntelligenceService {
     }
 
     // Real device detection path using Linux CLI (`lsblk`)
-    if (Platform.isLinux) {
+    if (!kIsWeb && Platform.isLinux) {
       try {
         final result = await Process.run('lsblk', [
           '-J',

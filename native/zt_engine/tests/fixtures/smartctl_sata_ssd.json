@@ -1,0 +1,63 @@
+{
+  "json_format_version": [1, 0],
+  "smartctl": {
+    "version": [7, 4],
+    "argv": ["smartctl", "-a", "/dev/sda", "--json"]
+  },
+  "device": {
+    "name": "/dev/sda",
+    "type": "sat",
+    "protocol": "ATA"
+  },
+  "model_name": "Samsung SSD 870 EVO 500GB",
+  "serial_number": "S5YFNG0R102934",
+  "firmware_version": "SVT01B6Q",
+  "rotation_rate": 0,
+  "smart_status": {
+    "passed": true
+  },
+  "ata_smart_attributes": {
+    "revision": 1,
+    "table": [
+      {
+        "id": 5,
+        "name": "Reallocated_Sector_Ct",
+        "value": 100,
+        "worst": 100,
+        "thresh": 10,
+        "raw": {
+          "value": 0,
+          "string": "0"
+        }
+      },
+      {
+        "id": 177,
+        "name": "Wear_Leveling_Count",
+        "value": 98,
+        "worst": 98,
+        "thresh": 0,
+        "raw": {
+          "value": 12,
+          "string": "12"
+        }
+      },
+      {
+        "id": 194,
+        "name": "Temperature_Celsius",
+        "value": 71,
+        "worst": 52,
+        "thresh": 0,
+        "raw": {
+          "value": 29,
+          "string": "29"
+        }
+      }
+    ]
+  },
+  "temperature": {
+    "current": 29
+  },
+  "power_on_time": {
+    "hours": 4521
+  }
+}

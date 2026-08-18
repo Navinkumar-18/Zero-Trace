@@ -43,3 +43,11 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# Rust / Cargo build artifacts
+**/target/
+**/*.rs.bk
+Cargo.lock
+
+# Zero Trace key files (sensitive)
+.zero_trace/keys/

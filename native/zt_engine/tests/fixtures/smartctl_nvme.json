@@ -1,0 +1,41 @@
+{
+  "json_format_version": [1, 0],
+  "smartctl": {
+    "version": [7, 4],
+    "argv": ["smartctl", "-a", "/dev/nvme0n1", "--json"]
+  },
+  "device": {
+    "name": "/dev/nvme0n1",
+    "type": "nvme",
+    "protocol": "NVMe"
+  },
+  "model_name": "WD Black SN850X 1TB",
+  "serial_number": "213829801942",
+  "firmware_version": "620311WD",
+  "smart_status": {
+    "passed": true
+  },
+  "nvme_smart_health_information_log": {
+    "critical_warning": 0,
+    "temperature": 38,
+    "available_spare": 100,
+    "available_spare_threshold": 10,
+    "percentage_used": 3,
+    "data_units_read": 15234567,
+    "data_units_written": 8345678,
+    "host_reads": 345678901,
+    "host_writes": 234567890,
+    "controller_busy_time": 1234,
+    "power_cycles": 567,
+    "power_on_hours": 2100,
+    "unsafe_shutdowns": 12,
+    "media_errors": 0,
+    "num_err_log_entries": 0
+  },
+  "temperature": {
+    "current": 38
+  },
+  "power_on_time": {
+    "hours": 2100
+  }
+}
