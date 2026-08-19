@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'theme.dart';
 
 class StepIndicator extends StatelessWidget {
-  final int currentStep; // 1 to 5
+  final int currentStep; // 0 = overview (all upcoming), 1 to 5 = active step
 
   const StepIndicator({super.key, required this.currentStep});
 
@@ -28,6 +28,41 @@ class StepIndicator extends StatelessWidget {
           final isCompact = constraints.maxWidth < 600;
 
           if (isCompact) {
+            // Step 0 = overview mode (dashboard)
+            if (currentStep == 0) {
+              return Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: AppTheme.surfaceCard,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: AppTheme.surfaceBorder),
+                    ),
+                    child: const Text(
+                      'WORKFLOW OVERVIEW',
+                      style: TextStyle(
+                        color: AppTheme.textSecondary,
+                        fontWeight: FontWeight.bold,
+                        fontSize: 11,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  const Expanded(
+                    child: Text(
+                      'Inventory → Risk → Method → Sanitize → Verify',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: AppTheme.textMuted,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                ],
+              );
+            }
+
             final activeStep = _steps.firstWhere((s) => s['number'] == currentStep, orElse: () => _steps[0]);
             return Row(
               children: [

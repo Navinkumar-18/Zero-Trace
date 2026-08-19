@@ -6,6 +6,8 @@ import 'package:intl/intl.dart';
 
 import '../../../services/sanitization_controller.dart';
 import '../../../services/demo_data_service.dart';
+import '../../../models/device_profile.dart';
+import '../../../widgets/step_indicator.dart';
 import '../../../widgets/theme.dart';
 
 class DashboardScreen extends StatelessWidget {
@@ -22,6 +24,11 @@ class DashboardScreen extends StatelessWidget {
         ? _getRealRecentOps(controller)
         : demoService.getRecentOperations();
 
+    // Compute attention devices list for smart routing
+    final attentionDevices = _getAttentionDevices(controller);
+    // Compute ready devices for "Start Sanitization" CTA
+    final readyDevices = _getReadyDevices(controller);
+
     return Scaffold(
       backgroundColor: AppTheme.bgDark,
       body: SafeArea(
@@ -34,12 +41,16 @@ class DashboardScreen extends StatelessWidget {
               _buildHeader(context, isRealMode),
               const SizedBox(height: 24),
 
-              // Featured Hero Banner Card (Figma Smart Cleanup Banner)
-              _buildSmartCleanupBanner(context),
+              // Sanitization Workflow Summary Banner
+              _buildSanitizationSummaryBanner(context, controller, stats, readyDevices),
+              const SizedBox(height: 16),
+
+              // 5-Step Workflow Progress Indicator (overview mode)
+              const StepIndicator(currentStep: 0),
               const SizedBox(height: 24),
 
               // Quick Stats Grid
-              _buildStatsGrid(stats),
+              _buildStatsGrid(context, controller, stats, attentionDevices),
               const SizedBox(height: 24),
 
               // Main content grid
@@ -51,13 +62,7 @@ class DashboardScreen extends StatelessWidget {
                       children: [
                         Expanded(
                           flex: 3,
-                          child: Column(
-                            children: [
-                              _buildStorageBreakdownCard(context),
-                              const SizedBox(height: 20),
-                              _buildRecentOperations(context, recentOps, isRealMode),
-                            ],
-                          ),
+                          child: _buildRecentOperations(context, recentOps, isRealMode),
                         ),
                         const SizedBox(width: 20),
                         Expanded(
@@ -75,8 +80,6 @@ class DashboardScreen extends StatelessWidget {
                   }
                   return Column(
                     children: [
-                      _buildStorageBreakdownCard(context),
-                      const SizedBox(height: 20),
                       _buildRecentOperations(context, recentOps, isRealMode),
                       const SizedBox(height: 20),
                       _buildSecurityStatus(stats),
@@ -129,6 +132,30 @@ class DashboardScreen extends StatelessWidget {
     );
   }
 
+  /// Returns the list of devices that need attention (flagged).
+  List<DeviceProfile> _getAttentionDevices(SanitizationController controller) {
+    return controller.devices.where((d) =>
+        d.isSystemDisk ||
+        d.hpaDcoPresent ||
+        (!d.supportsAtaSanitize &&
+            !d.supportsNvmeSanitize &&
+            !d.supportsEmmcSanitize &&
+            !d.supportsAtaSecureErase &&
+            !d.isHardwareEncrypted)).toList();
+  }
+
+  /// Returns the list of devices that are ready for sanitization.
+  List<DeviceProfile> _getReadyDevices(SanitizationController controller) {
+    return controller.devices.where((d) =>
+        !d.isSystemDisk &&
+        !d.hpaDcoPresent &&
+        (d.supportsAtaSanitize ||
+            d.supportsNvmeSanitize ||
+            d.supportsEmmcSanitize ||
+            d.supportsAtaSecureErase ||
+            d.isHardwareEncrypted)).toList();
+  }
+
   List<DemoOperation> _getRealRecentOps(SanitizationController controller) {
     if (controller.completedCertificate != null) {
       final cert = controller.completedCertificate!;
@@ -158,7 +185,7 @@ class DashboardScreen extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                'Private Storage',
+                'Dashboard',
                 style: GoogleFonts.inter(
                   color: AppTheme.textPrimary,
                   fontSize: 28,
@@ -167,7 +194,7 @@ class DashboardScreen extends StatelessWidget {
               ),
               const SizedBox(height: 4),
               Text(
-                'Clean, secure and private device storage.',
+                'Secure Data Sanitization & IT Asset Lifecycle',
                 style: GoogleFonts.inter(
                   color: AppTheme.accentEmerald,
                   fontSize: 13,
@@ -204,7 +231,14 @@ class DashboardScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildSmartCleanupBanner(BuildContext context) {
+  Widget _buildSanitizationSummaryBanner(
+    BuildContext context,
+    SanitizationController controller,
+    DemoStats stats,
+    List<DeviceProfile> readyDevices,
+  ) {
+    final hasReadyDevices = readyDevices.isNotEmpty;
+
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(24),
@@ -223,7 +257,7 @@ class DashboardScreen extends StatelessWidget {
               borderRadius: BorderRadius.circular(8),
             ),
             child: Text(
-              'SMART CLEANUP READY',
+              'SANITIZATION WORKFLOW',
               style: GoogleFonts.inter(
                 color: AppTheme.accentEmerald,
                 fontSize: 11,
@@ -234,16 +268,18 @@ class DashboardScreen extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           Text(
-            'Reclaim up to 12.6 GB',
+            '${stats.totalDevices} devices detected · ${stats.readyDevices} ready for sanitization',
             style: GoogleFonts.inter(
               color: AppTheme.textPrimary,
-              fontSize: 32,
+              fontSize: 28,
               fontWeight: FontWeight.w800,
             ),
           ),
           const SizedBox(height: 6),
           Text(
-            'Quick scan found safe-to-remove cache, duplicates and leftover files.',
+            stats.attentionDevices > 0
+                ? '${stats.attentionDevices} device(s) need review before sanitization can proceed.'
+                : 'All detected devices are ready for compliance-grade sanitization.',
             style: GoogleFonts.inter(
               color: AppTheme.textSecondary,
               fontSize: 14,
@@ -253,27 +289,33 @@ class DashboardScreen extends StatelessWidget {
           Row(
             children: [
               ElevatedButton.icon(
-                icon: const Icon(Icons.flash_on, size: 18),
-                label: const Text('Start Smart Scan'),
+                icon: const Icon(Icons.cleaning_services, size: 18),
+                label: const Text('Start Sanitization'),
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: AppTheme.accentEmerald,
+                  backgroundColor: hasReadyDevices ? AppTheme.accentEmerald : AppTheme.textMuted,
                   foregroundColor: Colors.white,
                   padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                 ),
-                onPressed: () => context.go('/sanitize'),
+                onPressed: hasReadyDevices
+                    ? () {
+                        // Select the first ready device and jump to Risk Assessment
+                        controller.selectDevice(readyDevices.first);
+                        context.go('/sanitize');
+                      }
+                    : null,
               ),
               const SizedBox(width: 12),
               OutlinedButton.icon(
-                icon: const Icon(Icons.tune, size: 18),
-                label: const Text('Manage Scope'),
+                icon: const Icon(Icons.dns, size: 18),
+                label: const Text('View Devices'),
                 style: OutlinedButton.styleFrom(
                   foregroundColor: AppTheme.textPrimary,
                   side: const BorderSide(color: AppTheme.surfaceBorder),
                   padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                 ),
-                onPressed: () => context.go('/sanitize'),
+                onPressed: () => context.go('/devices'),
               ),
             ],
           ),
@@ -282,7 +324,12 @@ class DashboardScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildStatsGrid(DemoStats stats) {
+  Widget _buildStatsGrid(
+    BuildContext context,
+    SanitizationController controller,
+    DemoStats stats,
+    List<DeviceProfile> attentionDevices,
+  ) {
     return LayoutBuilder(
       builder: (context, constraints) {
         final crossCount = constraints.maxWidth > 900
@@ -311,8 +358,9 @@ class DashboardScreen extends StatelessWidget {
             icon: Icons.warning_amber,
             color: stats.attentionDevices > 0 ? AppTheme.accentGold : AppTheme.textMuted,
             subtitle: stats.attentionDevices > 0
-                ? 'Protected disk'
+                ? '${stats.attentionDevices} disk(s) need review →'
                 : 'All devices clear',
+            isClickable: stats.attentionDevices > 0,
           ),
           _StatItem(
             label: 'Certificates',
@@ -330,7 +378,13 @@ class DashboardScreen extends StatelessWidget {
           crossAxisSpacing: 16,
           mainAxisSpacing: 16,
           childAspectRatio: 2.6,
-          children: items.map((item) => _buildStatCard(item)).toList(),
+          children: items.map((item) {
+            // Special handling for "Needs Attention" card
+            if (item.isClickable) {
+              return _buildClickableStatCard(context, controller, item, attentionDevices);
+            }
+            return _buildStatCard(item);
+          }).toList(),
         );
       },
     );
@@ -395,111 +449,86 @@ class DashboardScreen extends StatelessWidget {
     );
   }
 
-  Widget _buildStorageBreakdownCard(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        color: AppTheme.surfaceDark,
+  /// Clickable stat card for "Needs Attention" — smart routing based on
+  /// how many devices are flagged.
+  Widget _buildClickableStatCard(
+    BuildContext context,
+    SanitizationController controller,
+    _StatItem item,
+    List<DeviceProfile> attentionDevices,
+  ) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: AppTheme.surfaceBorder),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(
-                'STORAGE BREAKDOWN',
-                style: GoogleFonts.inter(
-                  color: AppTheme.textSecondary,
-                  fontSize: 11,
-                  fontWeight: FontWeight.w700,
-                  letterSpacing: 0.5,
-                ),
-              ),
-              InkWell(
-                onTap: () => context.go('/devices'),
-                child: Text(
-                  'View largest files',
-                  style: GoogleFonts.inter(
-                    color: AppTheme.accentEmerald,
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          // Progress bar representation
-          ClipRRect(
-            borderRadius: BorderRadius.circular(6),
-            child: SizedBox(
-              height: 12,
-              child: Row(
-                children: [
-                  Expanded(flex: 25, child: Container(color: AppTheme.accentEmerald)),
-                  const SizedBox(width: 2),
-                  Expanded(flex: 14, child: Container(color: AppTheme.accentBlue)),
-                  const SizedBox(width: 2),
-                  Expanded(flex: 10, child: Container(color: AppTheme.accentGold)),
-                  const SizedBox(width: 2),
-                  Expanded(flex: 18, child: Container(color: AppTheme.textSecondary.withValues(alpha: 0.3))),
-                  const SizedBox(width: 2),
-                  Expanded(flex: 33, child: Container(color: AppTheme.surfaceCard)),
-                ],
-              ),
-            ),
-          ),
-          const SizedBox(height: 16),
-          Row(
-            children: [
-              _buildCategoryLegend('Documents', '31.6 GB (25%)', AppTheme.accentEmerald),
-              const SizedBox(width: 16),
-              _buildCategoryLegend('Downloads', '18.4 GB (14%)', AppTheme.accentBlue),
-              const SizedBox(width: 16),
-              _buildCategoryLegend('Cache & temp', '12.6 GB (10%)', AppTheme.accentGold),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildCategoryLegend(String label, String value, Color color) {
-    return Row(
-      children: [
-        Container(
-          width: 10,
-          height: 10,
+        onTap: () {
+          if (attentionDevices.length == 1) {
+            // Exactly 1 flagged device → go straight to its Risk Assessment
+            controller.selectDevice(attentionDevices.first);
+            context.go('/sanitize');
+          } else {
+            // Multiple flagged devices → go to inventory list
+            context.go('/devices');
+          }
+        },
+        child: Container(
+          padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
-            color: color,
-            borderRadius: BorderRadius.circular(3),
+            color: AppTheme.surfaceDark,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: AppTheme.accentGold.withValues(alpha: 0.4)),
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(
+                      item.label,
+                      style: GoogleFonts.inter(
+                        color: AppTheme.textPrimary,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      item.subtitle,
+                      style: GoogleFonts.inter(
+                        color: AppTheme.accentGold,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w600,
+                      ),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: item.color.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Icon(item.icon, color: item.color, size: 18),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                item.value,
+                style: GoogleFonts.inter(
+                  color: item.color,
+                  fontSize: 24,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ],
           ),
         ),
-        const SizedBox(width: 6),
-        Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              label,
-              style: GoogleFonts.inter(
-                color: AppTheme.textPrimary,
-                fontSize: 11,
-                fontWeight: FontWeight.w600,
-              ),
-            ),
-            Text(
-              value,
-              style: GoogleFonts.inter(
-                color: AppTheme.textSecondary,
-                fontSize: 10,
-              ),
-            ),
-          ],
-        ),
-      ],
+      ),
     );
   }
 
@@ -817,6 +846,7 @@ class _StatItem {
   final IconData icon;
   final Color color;
   final String subtitle;
+  final bool isClickable;
 
   const _StatItem({
     required this.label,
@@ -824,5 +854,6 @@ class _StatItem {
     required this.icon,
     required this.color,
     required this.subtitle,
+    this.isClickable = false,
   });
 }

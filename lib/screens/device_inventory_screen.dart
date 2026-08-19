@@ -540,12 +540,60 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
                       ),
                   ],
                 ),
+
+                // Inline attention reason — visible without clicking through
+                if (_getAttentionReason(device) != null) ...[
+                  const SizedBox(height: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: AppTheme.accentOrange.withValues(alpha: 0.08),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: AppTheme.accentOrange.withValues(alpha: 0.25)),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.warning_amber, color: AppTheme.accentOrange, size: 16),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            _getAttentionReason(device)!,
+                            style: const TextStyle(
+                              color: AppTheme.accentOrange,
+                              fontSize: 11,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
         ),
       ),
     );
+  }
+
+  /// Returns a human-readable attention reason for flagged devices, or null if the device is ready.
+  String? _getAttentionReason(DeviceProfile device) {
+    if (device.isSystemDisk) {
+      return 'Needs attention: OS boot disk — sanitization blocked';
+    }
+    if (device.hpaDcoPresent) {
+      return 'Needs attention: Hidden HPA/DCO sectors detected';
+    }
+    final hasAnySanitize = device.supportsAtaSanitize ||
+        device.supportsNvmeSanitize ||
+        device.supportsEmmcSanitize ||
+        device.supportsAtaSecureErase ||
+        device.isHardwareEncrypted;
+    if (!hasAnySanitize) {
+      return 'Needs attention: No hardware sanitize support';
+    }
+    return null;
   }
 
   Widget _buildBadge(String label, Color color, {String? tooltip}) {

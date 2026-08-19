@@ -27,7 +27,7 @@ class RiskAssessmentScreen extends StatelessWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Algorithm 4 — Risk Assessment'),
+        title: const Text('Risk Assessment'),
       ),
       body: SafeArea(
         child: SingleChildScrollView(
@@ -108,17 +108,17 @@ class RiskAssessmentScreen extends StatelessWidget {
               // Sensitivity Selector
               _buildDropdownCard(
                 context: context,
-                title: '1. Data Sensitivity Level (50% Weight)',
-                subtitle: 'Security sensitivity tier of residual data on media',
+                title: '1. Data Sensitivity Level',
+                subtitle: 'Weighted 50% of risk score · Security sensitivity tier of residual data on media',
                 icon: Icons.shield_outlined,
                 child: DropdownButtonFormField<DataSensitivity>(
                   initialValue: controller.dataSensitivity,
                   decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 10)),
-                  items: const [
-                    DropdownMenuItem(value: DataSensitivity.public, child: Text('Public / Unclassified Data (0.0)')),
-                    DropdownMenuItem(value: DataSensitivity.internal, child: Text('Internal Operational Records (0.33)')),
-                    DropdownMenuItem(value: DataSensitivity.confidential, child: Text('Confidential / PII / Financial (0.66)')),
-                    DropdownMenuItem(value: DataSensitivity.restricted, child: Text('Restricted / Intellectual Property (1.0)')),
+                  items: [
+                    DropdownMenuItem(value: DataSensitivity.public, child: _buildDropdownLabel('Public / Unclassified Data', 'Weight: 0.0')),
+                    DropdownMenuItem(value: DataSensitivity.internal, child: _buildDropdownLabel('Internal Operational Records', 'Weight: 0.33')),
+                    DropdownMenuItem(value: DataSensitivity.confidential, child: _buildDropdownLabel('Confidential / PII / Financial', 'Weight: 0.66')),
+                    DropdownMenuItem(value: DataSensitivity.restricted, child: _buildDropdownLabel('Restricted / Intellectual Property', 'Weight: 1.0')),
                   ],
                   onChanged: (val) => controller.setRiskInputs(sensitivity: val),
                 ),
@@ -128,16 +128,16 @@ class RiskAssessmentScreen extends StatelessWidget {
               // Device Condition Selector
               _buildDropdownCard(
                 context: context,
-                title: '2. Device Integrity (20% Weight)',
-                subtitle: 'Physical condition and firmware SMART diagnostics',
+                title: '2. Device Integrity',
+                subtitle: 'Weighted 20% of risk score · Physical condition and firmware SMART diagnostics',
                 icon: Icons.health_and_safety_outlined,
                 child: DropdownButtonFormField<DeviceCondition>(
                   initialValue: controller.deviceCondition,
                   decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 10)),
-                  items: const [
-                    DropdownMenuItem(value: DeviceCondition.functional, child: Text('Functional — Fully Operational (0.0)')),
-                    DropdownMenuItem(value: DeviceCondition.degraded, child: Text('Degraded — Intermittent SMART Alerts (0.5)')),
-                    DropdownMenuItem(value: DeviceCondition.endOfLife, child: Text('End of Life — Non-Bootable / Dead Sector Pool (1.0)')),
+                  items: [
+                    DropdownMenuItem(value: DeviceCondition.functional, child: _buildDropdownLabel('Functional — Fully Operational', 'Weight: 0.0')),
+                    DropdownMenuItem(value: DeviceCondition.degraded, child: _buildDropdownLabel('Degraded — Intermittent SMART Alerts', 'Weight: 0.5')),
+                    DropdownMenuItem(value: DeviceCondition.endOfLife, child: _buildDropdownLabel('End of Life — Non-Bootable / Dead Sector Pool', 'Weight: 1.0')),
                   ],
                   onChanged: (val) => controller.setRiskInputs(condition: val),
                 ),
@@ -147,17 +147,17 @@ class RiskAssessmentScreen extends StatelessWidget {
               // Disposal Path Selector
               _buildDropdownCard(
                 context: context,
-                title: '3. Asset Disposal Channel (30% Weight)',
-                subtitle: 'Intended lifecycle destination post-sanitization',
+                title: '3. Asset Disposal Channel',
+                subtitle: 'Weighted 30% of risk score · Intended lifecycle destination post-sanitization',
                 icon: Icons.alt_route_outlined,
                 child: DropdownButtonFormField<DisposalPath>(
                   initialValue: controller.disposalPath,
                   decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 10)),
-                  items: const [
-                    DropdownMenuItem(value: DisposalPath.internalReuse, child: Text('Internal Redeployment / Reuse (0.0)')),
-                    DropdownMenuItem(value: DisposalPath.externalResale, child: Text('External Resale / Secondary Market (0.4)')),
-                    DropdownMenuItem(value: DisposalPath.recycling, child: Text('E-Waste Recycling Partner (0.8)')),
-                    DropdownMenuItem(value: DisposalPath.physicalDestruction, child: Text('Mandatory Physical Destruction (1.0)')),
+                  items: [
+                    DropdownMenuItem(value: DisposalPath.internalReuse, child: _buildDropdownLabel('Internal Redeployment / Reuse', 'Weight: 0.0')),
+                    DropdownMenuItem(value: DisposalPath.externalResale, child: _buildDropdownLabel('External Resale / Secondary Market', 'Weight: 0.4')),
+                    DropdownMenuItem(value: DisposalPath.recycling, child: _buildDropdownLabel('E-Waste Recycling Partner', 'Weight: 0.8')),
+                    DropdownMenuItem(value: DisposalPath.physicalDestruction, child: _buildDropdownLabel('Mandatory Physical Destruction', 'Weight: 1.0')),
                   ],
                   onChanged: (val) => controller.setRiskInputs(path: val),
                 ),
@@ -199,7 +199,7 @@ class RiskAssessmentScreen extends StatelessWidget {
                                 ),
                               ),
                               const Text(
-                                'Evaluated via Algorithm 4 Formula',
+                                'Evaluated via weighted risk formula',
                                 style: TextStyle(fontSize: 11, color: AppTheme.textMuted),
                               ),
                             ],
@@ -313,6 +313,32 @@ class RiskAssessmentScreen extends StatelessWidget {
           child,
         ],
       ),
+    );
+  }
+
+  /// Builds a dropdown menu item with primary plain-language label and
+  /// secondary smaller muted weight text.
+  Widget _buildDropdownLabel(String primary, String secondary) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          primary,
+          style: const TextStyle(
+            fontSize: 14,
+            fontWeight: FontWeight.w500,
+            color: AppTheme.textPrimary,
+          ),
+        ),
+        Text(
+          secondary,
+          style: const TextStyle(
+            fontSize: 10,
+            color: AppTheme.textMuted,
+          ),
+        ),
+      ],
     );
   }
 }

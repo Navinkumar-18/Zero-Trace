@@ -174,7 +174,7 @@ class _AppShellState extends State<AppShell> {
                     ),
                   ),
                   Text(
-                    'PRIVATE STORAGE',
+                    'SECURE SANITIZATION',
                     style: GoogleFonts.inter(
                       color: AppTheme.accentEmerald,
                       fontSize: 10,
