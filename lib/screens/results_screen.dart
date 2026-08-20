@@ -28,7 +28,7 @@ class ResultsScreen extends StatelessWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Algorithm 3 — Verification Evidence'),
+        title: const Text('Verification Evidence'),
       ),
       body: SafeArea(
         child: SingleChildScrollView(

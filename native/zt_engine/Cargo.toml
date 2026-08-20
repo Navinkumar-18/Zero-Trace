@@ -7,6 +7,10 @@ description = "Zero Trace 2.0 — Rust execution engine for NIST SP 800-88 secur
 [lib]
 crate-type = ["cdylib", "staticlib", "lib"]
 
+[[bin]]
+name = "zt_engine"
+path = "src/main.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

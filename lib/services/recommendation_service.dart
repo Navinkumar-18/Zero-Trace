@@ -60,8 +60,8 @@ class RecommendationService implements IRecommendationService {
           } else {
             return RecommendationResult(
               method: SanitizationMethod.multiPassOverwrite,
-              standardReference: 'NIST SP 800-88r2 Purge / IEEE 2883:2022 Overwrite Pattern',
-              explanation: 'Multi-pass pattern overwrite across full storage capacity.',
+              standardReference: 'NIST SP 800-88r2 Clear (3-pass legacy HDD fallback, exceeds minimum)',
+              explanation: 'Multi-pass pattern overwrite across full storage capacity. Exceeds minimum NIST Clear requirement for magnetic media.',
             );
           }
         }
@@ -124,9 +124,9 @@ class RecommendationService implements IRecommendationService {
           );
         } else {
           return RecommendationResult(
-            method: SanitizationMethod.unsupportedFlagForDestroy,
-            standardReference: 'NIST SP 800-88r2 Destroy / IEEE 2883:2022 Unsupported Removable Media',
-            explanation: 'Flash media lacks firmware sanitize primitives. Flagged for physical destruction under Purge requirements.',
+            method: SanitizationMethod.singlePassOverwrite,
+            standardReference: 'NIST SP 800-88r2 Clear / IEEE 2883:2022 Logical Overwrite',
+            explanation: 'No hardware sanitize primitive available. Single-pass zero overwrite achieves NIST Clear category. Note: wear-leveled flash may retain data in unmapped blocks — Clear is the maximum achievable assurance for this media type.',
           );
         }
 

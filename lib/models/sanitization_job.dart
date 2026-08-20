@@ -47,7 +47,7 @@ extension SanitizationMethodExtension on SanitizationMethod {
       case SanitizationMethod.singlePassOverwrite:
         return 'Single-Pass Zero Overwrite';
       case SanitizationMethod.multiPassOverwrite:
-        return 'Multi-Pass Pattern Overwrite (NIST 800-88)';
+        return '3-Pass Overwrite (legacy HDD fallback, exceeds NIST Clear)';
       case SanitizationMethod.physicalDestructionRecommended:
         return 'Physical Destruction Recommended';
       case SanitizationMethod.unsupportedFlagForDestroy:

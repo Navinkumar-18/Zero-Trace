@@ -48,7 +48,7 @@ class VerificationService {
 
     final String evidenceHash = sha256.convert(utf8.encode(rawEvidenceData)).toString();
 
-    final String limitations = _getTailoredLimitations(job.recommendedMethod);
+    final String limitations = getTailoredLimitations(job.recommendedMethod);
 
     return VerificationEvidence(
       statusCode: statusCode,
@@ -61,7 +61,7 @@ class VerificationService {
     );
   }
 
-  String _getTailoredLimitations(SanitizationMethod method) {
+  String getTailoredLimitations(SanitizationMethod method) {
     switch (method) {
       case SanitizationMethod.cryptographicErase:
         return 'Verifies cryptographic key zeroization & block sample un-readability. Does not verify physical erasure of underlying encrypted NAND flash cells.';

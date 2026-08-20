@@ -17,17 +17,22 @@ class ProgressScreen extends StatelessWidget {
 
     if (job == null) {
       return Scaffold(
-        appBar: AppBar(title: const Text('Pipeline Execution')),
+        appBar: AppBar(title: const Text('Sanitization Progress')),
         body: const Center(child: Text('No active execution found.')),
       );
     }
 
     final isFinished = job.status == JobStatus.completed || job.status == JobStatus.failed;
     final isFailed = job.status == JobStatus.failed;
+    final isSucceeded = job.status == JobStatus.completed;
+
+    final devicePath = job.device.id.startsWith('real_')
+        ? '/dev/${job.device.id.substring(5)}'
+        : '/dev/sdb (Simulated)';
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Orchestration Pipeline Execution'),
+        title: const Text('Sanitization Progress'),
         automaticallyImplyLeading: !isFinished,
       ),
       body: SafeArea(
@@ -40,59 +45,146 @@ class ProgressScreen extends StatelessWidget {
               const StepIndicator(currentStep: 4),
               const SizedBox(height: 16),
 
-              // Target Asset Brief Card
+              // Target Asset Complete Summary Card
               Container(
-                padding: const EdgeInsets.all(14),
+                padding: const EdgeInsets.all(16),
                 decoration: BoxDecoration(
-                  color: AppTheme.surfaceDark,
-                  borderRadius: BorderRadius.circular(14),
+                  color: AppTheme.surfaceCard,
+                  borderRadius: BorderRadius.circular(16),
                   border: Border.all(color: AppTheme.surfaceBorder),
                 ),
-                child: Row(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const Icon(Icons.dns, color: AppTheme.accentGold, size: 22),
-                    const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        'Target: ${job.device.name} [${job.device.serialNumber}]',
-                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
-                        overflow: TextOverflow.ellipsis,
-                      ),
+                    Row(
+                      children: [
+                        const Icon(Icons.dns, color: AppTheme.accentGold, size: 24),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            job.device.name,
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 15,
+                              color: AppTheme.textPrimary,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: AppTheme.codeBackground,
+                            borderRadius: BorderRadius.circular(6),
+                            border: Border.all(color: AppTheme.surfaceBorder),
+                          ),
+                          child: Text(
+                            devicePath,
+                            style: const TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                              color: AppTheme.accentBlue,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
+                    const SizedBox(height: 12),
+                    const Divider(color: AppTheme.surfaceBorder),
+                    const SizedBox(height: 8),
+                    _buildMetaRow('Capacity:', job.device.formattedCapacity),
+                    const SizedBox(height: 4),
+                    _buildMetaRow('Sanitization Method:', job.recommendedMethod.displayName),
+                    const SizedBox(height: 4),
+                    _buildMetaRow('NIST Category:', job.targetCategory.displayName),
                   ],
                 ),
               ),
-              const SizedBox(height: 20),
+              const SizedBox(height: 24),
 
-              // Progress Circular Indicator
+              // Progress Circular Indicator / Status Badge
               Center(
                 child: Column(
                   children: [
-                    SizedBox(
-                      width: 120,
-                      height: 120,
-                      child: Stack(
-                        alignment: Alignment.center,
-                        children: [
-                          CircularProgressIndicator(
-                            value: job.progress,
-                            strokeWidth: 10,
-                            backgroundColor: AppTheme.surfaceDark,
-                            valueColor: AlwaysStoppedAnimation<Color>(
-                              isFailed ? AppTheme.accentRose : AppTheme.accentGold,
+                    if (isSucceeded)
+                      Container(
+                        margin: const EdgeInsets.only(bottom: 16),
+                        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                        decoration: BoxDecoration(
+                          color: AppTheme.accentEmerald.withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(30),
+                          border: Border.all(color: AppTheme.accentEmerald, width: 2),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.verified, color: AppTheme.accentEmerald, size: 24),
+                            SizedBox(width: 8),
+                            Text(
+                              'SECURELY WIPED',
+                              style: TextStyle(
+                                color: AppTheme.accentEmerald,
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 1.0,
+                              ),
                             ),
-                          ),
-                          Text(
-                            '${(job.progress * 100).toInt()}%',
-                            style: TextStyle(
-                              fontSize: 26,
-                              fontWeight: FontWeight.bold,
-                              color: isFailed ? AppTheme.accentRose : AppTheme.textPrimary,
+                          ],
+                        ),
+                      )
+                    else if (isFailed)
+                      Container(
+                        margin: const EdgeInsets.only(bottom: 16),
+                        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                        decoration: BoxDecoration(
+                          color: AppTheme.accentRose.withValues(alpha: 0.15),
+                          borderRadius: BorderRadius.circular(30),
+                          border: Border.all(color: AppTheme.accentRose, width: 2),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.gpp_bad, color: AppTheme.accentRose, size: 24),
+                            SizedBox(width: 8),
+                            Text(
+                              'SANITIZATION FAILED',
+                              style: TextStyle(
+                                color: AppTheme.accentRose,
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 1.0,
+                              ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
+                      )
+                    else
+                      SizedBox(
+                        width: 120,
+                        height: 120,
+                        child: Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            CircularProgressIndicator(
+                              value: job.progress,
+                              strokeWidth: 10,
+                              backgroundColor: AppTheme.surfaceDark,
+                              valueColor: AlwaysStoppedAnimation<Color>(
+                                isFailed ? AppTheme.accentRose : AppTheme.accentGold,
+                              ),
+                            ),
+                            Text(
+                              '${(job.progress * 100).toInt()}%',
+                              style: TextStyle(
+                                fontSize: 26,
+                                fontWeight: FontWeight.bold,
+                                color: isFailed ? AppTheme.accentRose : AppTheme.textPrimary,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
-                    ),
                     const SizedBox(height: 16),
                     Text(
                       job.currentStageDescription,
@@ -174,6 +266,31 @@ class ProgressScreen extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+
+  Widget _buildMetaRow(String label, String value) {
+    return Row(
+      children: [
+        Text(
+          label + ' ',
+          style: const TextStyle(
+            fontSize: 12,
+            color: AppTheme.textMuted,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        Expanded(
+          child: Text(
+            value,
+            style: const TextStyle(
+              fontSize: 12,
+              color: AppTheme.textSecondary,
+            ),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+      ],
     );
   }
 }

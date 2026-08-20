@@ -6,6 +6,7 @@ import '../models/sanitization_job.dart';
 import '../services/sanitization_controller.dart';
 import '../widgets/step_indicator.dart';
 import '../widgets/theme.dart';
+import '../widgets/confirmation_dialog.dart';
 
 class SanitizationWorkflowScreen extends StatelessWidget {
   const SanitizationWorkflowScreen({super.key});
@@ -27,7 +28,7 @@ class SanitizationWorkflowScreen extends StatelessWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Algorithm 2 — Method Selection'),
+        title: const Text('Method Selection'),
       ),
       body: SafeArea(
         child: SingleChildScrollView(
@@ -198,9 +199,19 @@ class SanitizationWorkflowScreen extends StatelessWidget {
                         foregroundColor: isAllowed ? Colors.white : AppTheme.textMuted,
                       ),
                       onPressed: isAllowed
-                          ? () {
-                              controller.runSanitizationPipeline();
-                              context.go('/sanitize/progress');
+                          ? () async {
+                              final confirmed = await ConfirmationDialog.show(
+                                context,
+                                device: job.device,
+                                method: job.recommendedMethod,
+                                nistCategory: job.targetCategory.displayName,
+                              );
+                              if (confirmed) {
+                                controller.runSanitizationPipeline();
+                                if (context.mounted) {
+                                  context.go('/sanitize/progress');
+                                }
+                              }
                             }
                           : null,
                     ),

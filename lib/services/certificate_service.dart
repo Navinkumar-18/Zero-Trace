@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:typed_data';
-import 'package:crypto/crypto.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:pointycastle/export.dart' as pc;
@@ -189,7 +188,9 @@ class CertificateService {
                   ['Media Type', cert.mediaType],
                   ['Total Capacity', cert.capacity],
                   ['Applied Method', cert.method],
-                  ['Standard Compliance', cert.standardReference],
+                  ['NIST SP 800-88 Category', _extractNistCategory(cert.standardReference)],
+                  ['IEEE 2883:2022 Classification', _extractIeeeClassification(cert.standardReference)],
+                  ['Standard Reference', cert.standardReference],
                   ['Execution Time', '${cert.startTime.toString().substring(0, 19)} to ${cert.endTime.toString().substring(11, 19)}'],
                 ],
               ),
@@ -256,5 +257,28 @@ class CertificateService {
     );
 
     return pdf.save();
+  }
+
+  /// Extract NIST SP 800-88 category (Clear/Purge/Destroy) from the standardReference string.
+  String _extractNistCategory(String standardReference) {
+    final lower = standardReference.toLowerCase();
+    if (lower.contains('destroy')) return 'Destroy';
+    if (lower.contains('purge')) return 'Purge';
+    if (lower.contains('clear')) return 'Clear';
+    return 'Not Classified';
+  }
+
+  /// Extract IEEE 2883:2022 classification from the standardReference string.
+  String _extractIeeeClassification(String standardReference) {
+    // Extract everything after "IEEE 2883:2022" if present
+    final ieeeIdx = standardReference.indexOf('IEEE 2883:2022');
+    if (ieeeIdx >= 0) {
+      final afterIeee = standardReference.substring(ieeeIdx + 'IEEE 2883:2022'.length).trim();
+      if (afterIeee.isNotEmpty) {
+        // Remove leading separators
+        return afterIeee.replaceFirst(RegExp(r'^[/\s]+'), '').trim();
+      }
+    }
+    return 'See Standard Reference';
   }
 }

@@ -221,15 +221,15 @@ async fn test_software_overwrite_zeros_dry_run() {
 }
 
 #[tokio::test]
-async fn test_software_overwrite_dod3pass_dry_run() {
+async fn test_software_overwrite_nist_legacy_3pass_dry_run() {
     let (tx, _rx) = mpsc::channel::<ProgressEvent>(64);
 
     let result = software_overwrite(
         "/dev/sdb",
-        1,                     // ignored for DoD3Pass
-        OverwritePattern::DoD3Pass,
-        "DOD_SER",
-        "DOD_SER",
+        1,                     // ignored for NistLegacy3Pass
+        OverwritePattern::NistLegacy3Pass,
+        "NIST_SER",
+        "NIST_SER",
         true,
         tx,
     ).await;
@@ -238,7 +238,7 @@ async fn test_software_overwrite_dod3pass_dry_run() {
     assert!(report.success);
     // Should have dd commands for 3 passes
     let dd_count = report.command_log.iter().filter(|c| c.starts_with("dd")).count();
-    assert_eq!(dd_count, 3, "DoD 3-pass should issue exactly 3 dd commands");
+    assert_eq!(dd_count, 3, "NIST legacy 3-pass should issue exactly 3 dd commands");
 }
 
 // =========================================================================

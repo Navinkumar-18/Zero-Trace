@@ -83,7 +83,7 @@ pub enum OverwritePattern {
     Zeros,
     Ones,
     Random,
-    DoD3Pass,
+    NistLegacy3Pass,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -623,7 +623,7 @@ pub async fn software_overwrite(
     verify_confirmation(confirmation_token, device_serial)?;
 
     let total_passes = match pattern {
-        OverwritePattern::DoD3Pass => 3u8,
+        OverwritePattern::NistLegacy3Pass => 3u8,
         _ => passes.max(1),
     };
 
@@ -645,7 +645,7 @@ pub async fn software_overwrite(
             OverwritePattern::Zeros => "/dev/zero",
             OverwritePattern::Ones => "/dev/zero", // We'd use tr to flip bits, simplified here
             OverwritePattern::Random => "/dev/urandom",
-            OverwritePattern::DoD3Pass => {
+            OverwritePattern::NistLegacy3Pass => {
                 match pass_num {
                     0 => "/dev/zero",       // Pass 1: zeros
                     1 => "/dev/urandom",    // Pass 2: random
