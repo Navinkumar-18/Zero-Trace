@@ -363,7 +363,7 @@ class SanitizationController extends ChangeNotifier {
           devicePath: devName.isNotEmpty ? '/dev/$devName' : '/dev/null',
           method: job.recommendedMethod.displayName,
           standardReference: job.standardReference,
-          nistCategory: job.targetCategory.displayName,
+          nistCategory: job.effectiveNistCategoryDisplayName,
           success: verifyReport.pass,
           fingerprintHash: verifyReport.fingerprintHash,
           entropyScore: verifyReport.entropyScore,

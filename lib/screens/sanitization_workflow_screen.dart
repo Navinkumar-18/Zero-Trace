@@ -204,7 +204,7 @@ class SanitizationWorkflowScreen extends StatelessWidget {
                                 context,
                                 device: job.device,
                                 method: job.recommendedMethod,
-                                nistCategory: job.targetCategory.displayName,
+                                nistCategory: job.effectiveNistCategoryDisplayName,
                               );
                               if (confirmed) {
                                 controller.runSanitizationPipeline();

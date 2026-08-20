@@ -1,6 +1,7 @@
 /// Demo data service for Zero Trace 2.0
 /// Provides mock recent operations, certificates, and stats for the Dashboard.
 /// Used only in demo mode — no real device operations.
+library;
 
 import '../models/device_profile.dart';
 

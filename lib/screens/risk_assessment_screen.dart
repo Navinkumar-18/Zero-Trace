@@ -304,18 +304,18 @@ class RiskAssessmentScreen extends StatelessWidget {
   }
 
   String _getEffectiveNistCategory(SanitizationJob job) {
-    final ref = job.standardReference.toLowerCase();
-    if (ref.contains('destroy')) return 'DESTROY';
-    if (ref.contains('purge')) return 'PURGE';
-    if (ref.contains('clear')) return 'CLEAR';
-    return job.targetCategory.displayName.split(' ')[0].toUpperCase();
+    return job.effectiveNistCategoryShort;
   }
 
   Color _getNistBadgeColor(SanitizationJob job) {
-    final cat = _getEffectiveNistCategory(job);
-    if (cat == 'CLEAR') return AppTheme.accentEmerald;
-    if (cat == 'PURGE') return AppTheme.accentGold;
-    return AppTheme.accentRose;
+    switch (job.effectiveNistCategory) {
+      case NistCategory.clear:
+        return AppTheme.accentEmerald;
+      case NistCategory.purge:
+        return AppTheme.accentGold;
+      case NistCategory.destroy:
+        return AppTheme.accentRose;
+    }
   }
 
   Color _getRiskColor(double score) {

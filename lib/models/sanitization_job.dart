@@ -70,6 +70,23 @@ extension SanitizationMethodExtension on SanitizationMethod {
         return false;
     }
   }
+
+  NistCategory get nistCategory {
+    switch (this) {
+      case SanitizationMethod.cryptographicErase:
+      case SanitizationMethod.ataSecureErase:
+      case SanitizationMethod.ataSanitizeBlockErase:
+      case SanitizationMethod.nvmeSanitize:
+      case SanitizationMethod.emmcSanitize:
+        return NistCategory.purge;
+      case SanitizationMethod.singlePassOverwrite:
+      case SanitizationMethod.multiPassOverwrite:
+        return NistCategory.clear;
+      case SanitizationMethod.physicalDestructionRecommended:
+      case SanitizationMethod.unsupportedFlagForDestroy:
+        return NistCategory.destroy;
+    }
+  }
 }
 
 enum JobStatus {
@@ -121,4 +138,19 @@ class SanitizationJob {
     List<String>? logs,
     this.shouldSimulateFailure = false,
   }) : logs = logs ?? [];
+
+  /// The effective NIST category achieved by the recommended sanitization method.
+  NistCategory get effectiveNistCategory {
+    final ref = standardReference.toLowerCase();
+    if (ref.contains('destroy')) return NistCategory.destroy;
+    if (ref.contains('purge')) return NistCategory.purge;
+    if (ref.contains('clear')) return NistCategory.clear;
+    return recommendedMethod.nistCategory;
+  }
+
+  /// Display name of the effective NIST category (e.g. "CLEAR (Logical Protection)").
+  String get effectiveNistCategoryDisplayName => effectiveNistCategory.displayName;
+
+  /// Short badge string of the effective NIST category (e.g. "CLEAR", "PURGE", "DESTROY").
+  String get effectiveNistCategoryShort => effectiveNistCategory.name.toUpperCase();
 }

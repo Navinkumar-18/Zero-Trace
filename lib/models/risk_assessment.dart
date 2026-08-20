@@ -1,5 +1,6 @@
 /// Risk assessment model for Zero Trace 2.0
 /// Provides structured risk evaluation for storage sanitization decisions.
+library;
 
 enum RiskLevel {
   low,

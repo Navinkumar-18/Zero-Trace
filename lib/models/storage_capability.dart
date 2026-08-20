@@ -1,5 +1,6 @@
 /// Storage capability detection model for Zero Trace 2.0
 /// Tracks which sanitization mechanisms are available for a device.
+library;
 
 enum CapabilityStatus {
   available,

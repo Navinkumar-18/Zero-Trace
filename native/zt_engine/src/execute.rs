@@ -196,6 +196,60 @@ fn run_cmd(
     Ok((stdout, stderr, code))
 }
 
+/// Safely unmount active filesystems on the target device or its partitions.
+/// Resolves mounted partition paths from /proc/mounts rather than passing shell globs.
+/// If no active mounts are found (e.g., Dart layer already unmounted them), skips `umount`.
+fn unmount_device_if_mounted(
+    device: &str,
+    dry_run: bool,
+    command_log: &mut Vec<String>,
+) -> (String, String) {
+    let mut stdout_accum = String::new();
+    let mut stderr_accum = String::new();
+
+    if dry_run {
+        command_log.push(format!("[DRY RUN] Would check mounts and unmount active partitions on {}", device));
+        return (stdout_accum, stderr_accum);
+    }
+
+    let mounts = match std::fs::read_to_string("/proc/mounts") {
+        Ok(content) => content,
+        Err(_) => return (stdout_accum, stderr_accum),
+    };
+
+    let mut mounted_targets = Vec::new();
+    for line in mounts.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if !parts.is_empty() {
+            let mount_src = parts[0];
+            if mount_src == device
+                || (mount_src.starts_with(device)
+                    && mount_src[device.len()..]
+                        .chars()
+                        .next()
+                        .map_or(false, |c| c.is_ascii_digit() || c == 'p'))
+            {
+                mounted_targets.push(mount_src.to_string());
+            }
+        }
+    }
+
+    if mounted_targets.is_empty() {
+        command_log.push(format!("[UNMOUNT] No active mounts found for {}, skipping redundant unmount.", device));
+        return (stdout_accum, stderr_accum);
+    }
+
+    for target in mounted_targets {
+        command_log.push(format!("[UNMOUNT] Unmounting active target: {}", target));
+        if let Ok((stdout, stderr, _)) = run_cmd("umount", &["-f", &target], dry_run, command_log) {
+            stdout_accum.push_str(&stdout);
+            stderr_accum.push_str(&stderr);
+        }
+    }
+
+    (stdout_accum, stderr_accum)
+}
+
 // ---------------------------------------------------------------------------
 // Execution functions
 // ---------------------------------------------------------------------------
@@ -635,8 +689,8 @@ pub async fn software_overwrite(
     send_progress(&tx, ExecutionPhase::SecurityUnlock, 0.03,
         "Unmounting filesystems on target device...", Some(5)).await;
 
-    // Unmount any partitions
-    let (stdout, stderr, _) = run_cmd("umount", &["-f", &format!("{}*", device)], dry_run, &mut command_log)?;
+    // Unmount any active partitions
+    let (stdout, stderr) = unmount_device_if_mounted(device, dry_run, &mut command_log);
     all_stdout.push_str(&stdout);
     all_stderr.push_str(&stderr);
 

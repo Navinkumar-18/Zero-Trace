@@ -97,7 +97,7 @@ class ProgressScreen extends StatelessWidget {
                     const SizedBox(height: 4),
                     _buildMetaRow('Sanitization Method:', job.recommendedMethod.displayName),
                     const SizedBox(height: 4),
-                    _buildMetaRow('NIST Category:', job.targetCategory.displayName),
+                    _buildMetaRow('NIST Category:', job.effectiveNistCategoryDisplayName),
                   ],
                 ),
               ),
@@ -273,7 +273,7 @@ class ProgressScreen extends StatelessWidget {
     return Row(
       children: [
         Text(
-          label + ' ',
+          '$label ',
           style: const TextStyle(
             fontSize: 12,
             color: AppTheme.textMuted,

@@ -52,7 +52,7 @@ void main() {
       expect(rec.method, SanitizationMethod.nvmeSanitize);
     });
 
-    test('Unsupported USB flash under PURGE falls through to UNSUPPORTED_FLAG_FOR_DESTROY', () {
+    test('USB flash under PURGE without hardware sanitize falls back to singlePassOverwrite (NIST Clear)', () {
       const dev = DeviceProfile(
         id: '4',
         name: 'Legacy USB',
@@ -64,7 +64,7 @@ void main() {
       );
 
       final rec = service.selectMethod(dev, 0.65, NistCategory.purge);
-      expect(rec.method, SanitizationMethod.unsupportedFlagForDestroy);
+      expect(rec.method, SanitizationMethod.singlePassOverwrite);
     });
   });
 }

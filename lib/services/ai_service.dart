@@ -4,6 +4,7 @@
 /// SAFETY: This service NEVER generates shell commands, NEVER executes
 /// arbitrary operations, and NEVER bypasses user confirmation or policy validation.
 /// All output is advisory and must pass through the policy layer before any action.
+library;
 
 import '../models/device_profile.dart';
 

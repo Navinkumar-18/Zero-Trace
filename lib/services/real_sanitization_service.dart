@@ -243,7 +243,7 @@ class RealSanitizationService {
     return RealExecutionReport(
       success: exitCode == 0,
       methodUsed: cliMethod,
-      commandLog: [binary + ' ' + args.join(' ')],
+      commandLog: ['$binary ${args.join(' ')}'],
       stdout: '',
       stderr: rawStderr.isNotEmpty ? rawStderr : 'Process exited prematurely with code $exitCode',
       exitCode: exitCode,
