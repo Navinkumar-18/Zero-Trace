@@ -172,7 +172,7 @@ class _ConfirmationDialogState extends State<ConfirmationDialog> {
                   fontWeight: FontWeight.normal,
                 ),
                 filled: true,
-                fillColor: AppTheme.codeBackground,
+                fillColor: Colors.white,
                 contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
                 enabledBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(10),
