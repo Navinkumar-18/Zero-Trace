@@ -242,16 +242,9 @@ class SanitizationController extends ChangeNotifier {
         // Stage 1: Detecting & unmounting filesystems
         job.status = JobStatus.unmounting;
         job.progress = 0.10;
-        job.currentStageDescription = 'Preparing device: Unmounting partitions...';
-        _addLog('SYSTEM: Unmounting any active partitions on device...');
+        job.currentStageDescription = 'Preparing device: zt_engine handling partition unmounts...';
+        _addLog('SYSTEM: Initializing device preparation (zt_engine managing unmount)...');
         notifyListeners();
-
-        // Run unmount command on device partitions
-        String devName = job.device.id.startsWith('real_') ? job.device.id.substring(5) : '';
-        if (devName.isNotEmpty) {
-          final unmountResult = await Process.run('sh', ['-c', 'umount /dev/$devName* || true']);
-          _addLog('SYSTEM: Partition unmount completed (exit code: ${unmountResult.exitCode})');
-        }
 
         // Stage 2: Sanitization execution
         job.status = JobStatus.sanitizing;
@@ -360,7 +353,9 @@ class SanitizationController extends ChangeNotifier {
           timestamp: DateTime.now().toIso8601String(),
           jobId: job.jobId,
           deviceSerial: job.device.serialNumber,
-          devicePath: devName.isNotEmpty ? '/dev/$devName' : '/dev/null',
+          devicePath: job.device.id.startsWith('real_')
+              ? '/dev/${job.device.id.substring(5)}'
+              : '/dev/null',
           method: job.recommendedMethod.displayName,
           standardReference: job.standardReference,
           nistCategory: job.effectiveNistCategoryDisplayName,

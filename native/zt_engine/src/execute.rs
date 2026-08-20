@@ -197,8 +197,7 @@ fn run_cmd(
 }
 
 /// Safely unmount active filesystems on the target device or its partitions.
-/// Resolves mounted partition paths from /proc/mounts rather than passing shell globs.
-/// If no active mounts are found (e.g., Dart layer already unmounted them), skips `umount`.
+/// Resolves mounted partition paths from /proc/mounts and shells out via `sh -c` for glob expansion.
 fn unmount_device_if_mounted(
     device: &str,
     dry_run: bool,
@@ -212,39 +211,39 @@ fn unmount_device_if_mounted(
         return (stdout_accum, stderr_accum);
     }
 
-    let mounts = match std::fs::read_to_string("/proc/mounts") {
-        Ok(content) => content,
-        Err(_) => return (stdout_accum, stderr_accum),
-    };
+    // 1. Resolve exact mounted partition paths from /proc/mounts
+    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+        let mut mounted_targets = Vec::new();
+        for line in mounts.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if !parts.is_empty() {
+                let mount_src = parts[0];
+                if mount_src == device
+                    || (mount_src.starts_with(device)
+                        && mount_src[device.len()..]
+                            .chars()
+                            .next()
+                            .map_or(false, |c| c.is_ascii_digit() || c == 'p'))
+                {
+                    mounted_targets.push(mount_src.to_string());
+                }
+            }
+        }
 
-    let mut mounted_targets = Vec::new();
-    for line in mounts.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if !parts.is_empty() {
-            let mount_src = parts[0];
-            if mount_src == device
-                || (mount_src.starts_with(device)
-                    && mount_src[device.len()..]
-                        .chars()
-                        .next()
-                        .map_or(false, |c| c.is_ascii_digit() || c == 'p'))
-            {
-                mounted_targets.push(mount_src.to_string());
+        for target in mounted_targets {
+            command_log.push(format!("[UNMOUNT] Unmounting active filesystem target: {}", target));
+            if let Ok((stdout, stderr, _)) = run_cmd("umount", &["-f", &target], dry_run, command_log) {
+                stdout_accum.push_str(&stdout);
+                stderr_accum.push_str(&stderr);
             }
         }
     }
 
-    if mounted_targets.is_empty() {
-        command_log.push(format!("[UNMOUNT] No active mounts found for {}, skipping redundant unmount.", device));
-        return (stdout_accum, stderr_accum);
-    }
-
-    for target in mounted_targets {
-        command_log.push(format!("[UNMOUNT] Unmounting active target: {}", target));
-        if let Ok((stdout, stderr, _)) = run_cmd("umount", &["-f", &target], dry_run, command_log) {
-            stdout_accum.push_str(&stdout);
-            stderr_accum.push_str(&stderr);
-        }
+    // 2. Explicit shell expansion pass via sh -c for any remaining partition globs
+    let glob_cmd = format!("umount -f {}* 2>/dev/null || true", device);
+    if let Ok((stdout, stderr, _)) = run_cmd("sh", &["-c", &glob_cmd], dry_run, command_log) {
+        stdout_accum.push_str(&stdout);
+        stderr_accum.push_str(&stderr);
     }
 
     (stdout_accum, stderr_accum)
@@ -271,6 +270,11 @@ pub async fn nvme_sanitize(
     // Safety checks
     check_boot_disk_protection(device)?;
     verify_confirmation(confirmation_token, device_serial)?;
+
+    // Unmount any active partitions on device
+    let (u_out, u_err) = unmount_device_if_mounted(device, dry_run, &mut command_log);
+    all_stdout.push_str(&u_out);
+    all_stderr.push_str(&u_err);
 
     let action_arg = match action {
         SanitizeAction::BlockErase => "start-block-erase",
@@ -366,6 +370,11 @@ pub async fn ata_secure_erase(
     // Safety checks
     check_boot_disk_protection(device)?;
     verify_confirmation(confirmation_token, device_serial)?;
+
+    // Unmount any active partitions on device
+    let (u_out, u_err) = unmount_device_if_mounted(device, dry_run, &mut command_log);
+    all_stdout.push_str(&u_out);
+    all_stderr.push_str(&u_err);
 
     // Phase 1: Check frozen state
     send_progress(&tx, ExecutionPhase::SecurityUnlock, 0.05,
@@ -490,6 +499,11 @@ pub async fn ata_sanitize(
     check_boot_disk_protection(device)?;
     verify_confirmation(confirmation_token, device_serial)?;
 
+    // Unmount any active partitions on device
+    let (u_out, u_err) = unmount_device_if_mounted(device, dry_run, &mut command_log);
+    all_stdout.push_str(&u_out);
+    all_stderr.push_str(&u_err);
+
     let (action_arg, method_name) = match action {
         AtaSanitizeAction::BlockErase => ("block-erase", "ATA Sanitize Block Erase"),
         AtaSanitizeAction::CryptoScramble => ("crypto-scramble", "ATA Sanitize Crypto Scramble"),
@@ -556,6 +570,11 @@ pub async fn opal_revert(
     check_boot_disk_protection(device)?;
     verify_confirmation(confirmation_token, device_serial)?;
 
+    // Unmount any active partitions on device
+    let (u_out, u_err) = unmount_device_if_mounted(device, dry_run, &mut command_log);
+    all_stdout.push_str(&u_out);
+    all_stderr.push_str(&u_err);
+
     send_progress(&tx, ExecutionPhase::SecurityUnlock, 0.05,
         "Querying TCG OPAL SED state...", Some(3)).await;
 
@@ -620,6 +639,11 @@ pub async fn emmc_sanitize(
 
     check_boot_disk_protection(device)?;
     verify_confirmation(confirmation_token, device_serial)?;
+
+    // Unmount any active partitions on device
+    let (u_out, u_err) = unmount_device_if_mounted(device, dry_run, &mut command_log);
+    all_stdout.push_str(&u_out);
+    all_stderr.push_str(&u_err);
 
     send_progress(&tx, ExecutionPhase::SecurityUnlock, 0.05,
         "Reading eMMC extcsd sanitize capability...", Some(3)).await;
