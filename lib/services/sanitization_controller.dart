@@ -55,6 +55,7 @@ class SanitizationController extends ChangeNotifier {
   List<DeviceProfile> get devices => _devices;
   DeviceProfile? get selectedDevice => _selectedDevice;
   bool get isRealMode => _isRealMode;
+  String? get lastScanError => _intelligenceService.lastScanError;
   bool get isAutoPollingActive => _autoPollTimer?.isActive ?? false;
   ClassificationService get classificationService => _classificationService;
 

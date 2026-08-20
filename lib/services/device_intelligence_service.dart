@@ -25,18 +25,21 @@ class DeviceIntelligenceService {
     // Real device detection path using Linux CLI (`lsblk`)
     // Only available on native Linux — not on web or other platforms.
     if (kIsWeb) {
-      lastScanError = 'Real hardware detection requires native Linux mode. '
-          'Run with "flutter run -d linux" or boot from the Zero Trace live USB.';
+      lastScanError = 'Real hardware detection requires native Linux mode (flutter run -d linux).\n'
+          'Currently running in Web browser mode where raw block-device access is unavailable.';
+      debugPrint('[DISCOVERY] $lastScanError');
       return [];
     }
 
     if (!Platform.isLinux) {
-      lastScanError = 'Real hardware detection requires Linux. '
-          'Current platform: ${Platform.operatingSystem}';
+      lastScanError = 'Real hardware detection requires Linux.\n'
+          'Current OS platform: ${Platform.operatingSystem}';
+      debugPrint('[DISCOVERY] $lastScanError');
       return [];
     }
 
     try {
+      debugPrint('[DISCOVERY] Running: lsblk -J -b -o NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG');
       final result = await Process.run('lsblk', [
         '-J',
         '-b',
@@ -46,11 +49,16 @@ class DeviceIntelligenceService {
 
       if (result.exitCode != 0) {
         lastScanError = 'lsblk exited with code ${result.exitCode}: ${result.stderr}';
+        debugPrint('[DISCOVERY ERROR] $lastScanError');
         return [];
       }
 
-      if (result.stdout == null || (result.stdout as String).trim().isEmpty) {
+      final stdoutStr = result.stdout as String? ?? '';
+      debugPrint('[DISCOVERY RAW STDOUT] $stdoutStr');
+
+      if (stdoutStr.trim().isEmpty) {
         lastScanError = 'lsblk returned empty output';
+        debugPrint('[DISCOVERY ERROR] $lastScanError');
         return [];
       }
 

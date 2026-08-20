@@ -113,7 +113,17 @@ class RiskAssessmentScreen extends StatelessWidget {
                 icon: Icons.shield_outlined,
                 child: DropdownButtonFormField<DataSensitivity>(
                   initialValue: controller.dataSensitivity,
-                  decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 10)),
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  ),
+                  selectedItemBuilder: (context) => [
+                    _buildSelectedItemLabel('Public / Unclassified Data', 'Weight: 0.0'),
+                    _buildSelectedItemLabel('Internal Operational Records', 'Weight: 0.33'),
+                    _buildSelectedItemLabel('Confidential / PII / Financial', 'Weight: 0.66'),
+                    _buildSelectedItemLabel('Restricted / Intellectual Property', 'Weight: 1.0'),
+                  ],
                   items: [
                     DropdownMenuItem(value: DataSensitivity.public, child: _buildDropdownLabel('Public / Unclassified Data', 'Weight: 0.0')),
                     DropdownMenuItem(value: DataSensitivity.internal, child: _buildDropdownLabel('Internal Operational Records', 'Weight: 0.33')),
@@ -133,7 +143,16 @@ class RiskAssessmentScreen extends StatelessWidget {
                 icon: Icons.health_and_safety_outlined,
                 child: DropdownButtonFormField<DeviceCondition>(
                   initialValue: controller.deviceCondition,
-                  decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 10)),
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  ),
+                  selectedItemBuilder: (context) => [
+                    _buildSelectedItemLabel('Functional — Fully Operational', 'Weight: 0.0'),
+                    _buildSelectedItemLabel('Degraded — Intermittent SMART Alerts', 'Weight: 0.5'),
+                    _buildSelectedItemLabel('End of Life — Non-Bootable / Dead Sector Pool', 'Weight: 1.0'),
+                  ],
                   items: [
                     DropdownMenuItem(value: DeviceCondition.functional, child: _buildDropdownLabel('Functional — Fully Operational', 'Weight: 0.0')),
                     DropdownMenuItem(value: DeviceCondition.degraded, child: _buildDropdownLabel('Degraded — Intermittent SMART Alerts', 'Weight: 0.5')),
@@ -152,7 +171,17 @@ class RiskAssessmentScreen extends StatelessWidget {
                 icon: Icons.alt_route_outlined,
                 child: DropdownButtonFormField<DisposalPath>(
                   initialValue: controller.disposalPath,
-                  decoration: const InputDecoration(contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 10)),
+                  isExpanded: true,
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    contentPadding: EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                  ),
+                  selectedItemBuilder: (context) => [
+                    _buildSelectedItemLabel('Internal Redeployment / Reuse', 'Weight: 0.0'),
+                    _buildSelectedItemLabel('External Resale / Secondary Market', 'Weight: 0.4'),
+                    _buildSelectedItemLabel('E-Waste Recycling Partner', 'Weight: 0.8'),
+                    _buildSelectedItemLabel('Mandatory Physical Destruction', 'Weight: 1.0'),
+                  ],
                   items: [
                     DropdownMenuItem(value: DisposalPath.internalReuse, child: _buildDropdownLabel('Internal Redeployment / Reuse', 'Weight: 0.0')),
                     DropdownMenuItem(value: DisposalPath.externalResale, child: _buildDropdownLabel('External Resale / Secondary Market', 'Weight: 0.4')),
@@ -208,14 +237,14 @@ class RiskAssessmentScreen extends StatelessWidget {
                           Container(
                             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                             decoration: BoxDecoration(
-                              color: _getRiskColor(job.riskScore).withValues(alpha: 0.2),
+                              color: _getNistBadgeColor(job).withValues(alpha: 0.2),
                               borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: _getRiskColor(job.riskScore)),
+                              border: Border.all(color: _getNistBadgeColor(job)),
                             ),
                             child: Text(
-                              job.targetCategory.displayName.split(' ')[0],
+                              _getEffectiveNistCategory(job),
                               style: TextStyle(
-                                color: _getRiskColor(job.riskScore),
+                                color: _getNistBadgeColor(job),
                                 fontWeight: FontWeight.bold,
                                 fontSize: 12,
                               ),
@@ -274,6 +303,21 @@ class RiskAssessmentScreen extends StatelessWidget {
     );
   }
 
+  String _getEffectiveNistCategory(SanitizationJob job) {
+    final ref = job.standardReference.toLowerCase();
+    if (ref.contains('destroy')) return 'DESTROY';
+    if (ref.contains('purge')) return 'PURGE';
+    if (ref.contains('clear')) return 'CLEAR';
+    return job.targetCategory.displayName.split(' ')[0].toUpperCase();
+  }
+
+  Color _getNistBadgeColor(SanitizationJob job) {
+    final cat = _getEffectiveNistCategory(job);
+    if (cat == 'CLEAR') return AppTheme.accentEmerald;
+    if (cat == 'PURGE') return AppTheme.accentGold;
+    return AppTheme.accentRose;
+  }
+
   Color _getRiskColor(double score) {
     if (score < 0.34) return AppTheme.accentEmerald;
     if (score < 0.70) return AppTheme.accentGold;
@@ -295,6 +339,7 @@ class RiskAssessmentScreen extends StatelessWidget {
         border: Border.all(color: AppTheme.surfaceBorder),
       ),
       child: Column(
+        mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
@@ -316,8 +361,36 @@ class RiskAssessmentScreen extends StatelessWidget {
     );
   }
 
+  /// Builds a clean single-line label for the closed dropdown button container.
+  Widget _buildSelectedItemLabel(String primary, String secondary) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Text.rich(
+        TextSpan(
+          text: primary,
+          style: const TextStyle(
+            fontSize: 13,
+            fontWeight: FontWeight.w500,
+            color: AppTheme.textPrimary,
+          ),
+          children: [
+            TextSpan(
+              text: ' ($secondary)',
+              style: const TextStyle(
+                fontSize: 11,
+                color: AppTheme.textMuted,
+              ),
+            ),
+          ],
+        ),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+    );
+  }
+
   /// Builds a dropdown menu item with primary plain-language label and
-  /// secondary smaller muted weight text.
+  /// secondary smaller muted weight text for the open popup menu.
   Widget _buildDropdownLabel(String primary, String secondary) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,

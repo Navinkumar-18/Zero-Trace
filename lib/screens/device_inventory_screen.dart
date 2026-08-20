@@ -288,16 +288,56 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
               Expanded(
                 child: filteredDevices.isEmpty
                     ? Center(
-                        child: Column(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            const Icon(Icons.search_off, size: 48, color: AppTheme.textMuted),
-                            const SizedBox(height: 12),
-                            Text(
-                              'No storage devices found matching "$_searchQuery"',
-                              style: const TextStyle(color: AppTheme.textSecondary),
-                            ),
-                          ],
+                        child: Padding(
+                          padding: const EdgeInsets.all(24.0),
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              Icon(
+                                _searchQuery.isNotEmpty ? Icons.search_off : Icons.storage_outlined,
+                                size: 48,
+                                color: AppTheme.accentGold,
+                              ),
+                              const SizedBox(height: 14),
+                              Text(
+                                _searchQuery.isNotEmpty
+                                    ? 'No storage devices found matching "$_searchQuery"'
+                                    : 'No Storage Devices Discovered',
+                                style: const TextStyle(
+                                  color: AppTheme.textPrimary,
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                                textAlign: TextAlign.center,
+                              ),
+                              if (_searchQuery.isEmpty && controller.lastScanError != null) ...[
+                                const SizedBox(height: 10),
+                                Container(
+                                  padding: const EdgeInsets.all(14),
+                                  decoration: BoxDecoration(
+                                    color: AppTheme.accentRose.withValues(alpha: 0.1),
+                                    borderRadius: BorderRadius.circular(12),
+                                    border: Border.all(color: AppTheme.accentRose.withValues(alpha: 0.3)),
+                                  ),
+                                  child: Text(
+                                    controller.lastScanError!,
+                                    style: const TextStyle(color: AppTheme.accentRose, fontSize: 12),
+                                    textAlign: TextAlign.center,
+                                  ),
+                                ),
+                                const SizedBox(height: 16),
+                                ElevatedButton.icon(
+                                  icon: const Icon(Icons.tune, size: 18),
+                                  label: const Text('SWITCH TO DEMO / PRACTICE MODE'),
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: AppTheme.accentGold,
+                                    foregroundColor: Colors.white,
+                                  ),
+                                  onPressed: () => controller.toggleRealMode(false),
+                                ),
+                              ],
+                            ],
+                          ),
                         ),
                       )
                     : LayoutBuilder(
