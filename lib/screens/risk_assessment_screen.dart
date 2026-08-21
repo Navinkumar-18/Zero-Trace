@@ -279,7 +279,7 @@ class RiskAssessmentScreen extends StatelessWidget {
                       child: OutlinedButton.icon(
                         icon: const Icon(Icons.arrow_back, size: 18),
                         label: const Text('CHANGE ASSET'),
-                        onPressed: () => context.go('/devices'),
+                        onPressed: controller.isJobRunning ? null : () => context.go('/devices'),
                       ),
                     ),
                     const SizedBox(width: 12),
@@ -287,10 +287,18 @@ class RiskAssessmentScreen extends StatelessWidget {
                       flex: 2,
                       child: ElevatedButton.icon(
                         icon: const Icon(Icons.arrow_forward, size: 18),
-                        label: const Text('SELECT SANITIZATION METHOD'),
-                        onPressed: () {
-                          context.go('/sanitize/workflow');
-                        },
+                        label: Text(controller.isJobRunning ? 'SANITIZATION IN PROGRESS' : 'SELECT SANITIZATION METHOD'),
+                        style: controller.isJobRunning
+                            ? ElevatedButton.styleFrom(
+                                backgroundColor: AppTheme.surfaceBorder,
+                                foregroundColor: AppTheme.textMuted,
+                              )
+                            : null,
+                        onPressed: controller.isJobRunning
+                            ? null
+                            : () {
+                                context.go('/sanitize/workflow');
+                              },
                       ),
                     ),
                   ],

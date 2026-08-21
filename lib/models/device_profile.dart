@@ -60,6 +60,9 @@ class DeviceProfile {
   final bool hpaDcoPresent;
   final String? mountPoint;
   final bool isSystemDisk;
+  final bool hasFilesystem;
+  final String? fsType;
+  final bool isWipedNoFilesystem;
   final String notes;
 
   const DeviceProfile({
@@ -79,6 +82,9 @@ class DeviceProfile {
     this.hpaDcoPresent = false,
     this.mountPoint,
     this.isSystemDisk = false,
+    this.hasFilesystem = true,
+    this.fsType,
+    this.isWipedNoFilesystem = false,
     this.notes = '',
   });
 
@@ -108,6 +114,9 @@ class DeviceProfile {
         'hpaDcoPresent': hpaDcoPresent,
         'mountPoint': mountPoint,
         'isSystemDisk': isSystemDisk,
+        'hasFilesystem': hasFilesystem,
+        'fsType': fsType,
+        'isWipedNoFilesystem': isWipedNoFilesystem,
         'notes': notes,
       };
 
@@ -132,6 +141,9 @@ class DeviceProfile {
       hpaDcoPresent: (json['hpaDcoPresent'] as bool?) ?? false,
       mountPoint: json['mountPoint'] as String?,
       isSystemDisk: (json['isSystemDisk'] as bool?) ?? false,
+      hasFilesystem: (json['hasFilesystem'] as bool?) ?? true,
+      fsType: json['fsType'] as String?,
+      isWipedNoFilesystem: (json['isWipedNoFilesystem'] as bool?) ?? false,
       notes: (json['notes'] as String?) ?? '',
     );
   }

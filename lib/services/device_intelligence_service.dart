@@ -39,12 +39,12 @@ class DeviceIntelligenceService {
     }
 
     try {
-      debugPrint('[DISCOVERY] Running: lsblk -J -b -o NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG');
+      debugPrint('[DISCOVERY] Running: lsblk -J -b -o NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG,FSTYPE');
       final result = await Process.run('lsblk', [
         '-J',
         '-b',
         '-o',
-        'NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG'
+        'NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG,FSTYPE'
       ]);
 
       if (result.exitCode != 0) {
@@ -68,35 +68,50 @@ class DeviceIntelligenceService {
 
       for (final dev in devicesJson) {
         final type = dev['type'] as String?;
-        if (type == 'disk') {
+        if (type == 'disk' || type == null || type.isEmpty) {
           final rawName = dev['name'] as String? ?? 'unknown';
+          final size = (dev['size'] as num?)?.toInt() ?? 0;
+          if (size <= 0 && rawName == 'unknown') continue;
+
           final modelStr = (dev['model'] as String?)?.trim();
           final name = (modelStr != null && modelStr.isNotEmpty) ? modelStr : 'Storage Device ($rawName)';
           final serial = (dev['serial'] as String?)?.trim() ?? 'S/N-$rawName';
           
-          // Safe size parsing (num cast to int)
-          final size = (dev['size'] as num?)?.toInt() ?? 0;
           final isRotational = (dev['rota'] as bool?) ?? false;
           final tran = (dev['tran'] as String?)?.toUpperCase() ?? '';
           
           final isRm = dev['rm'] == true || dev['rm'] == 1 || dev['rm'] == '1';
           final isHotplug = dev['hotplug'] == true || dev['hotplug'] == 1 || dev['hotplug'] == '1';
           
-          // Check if any partition matches system root / boot
+          // Filesystem and Partition detection
+          final mainFsType = (dev['fstype'] as String?)?.trim();
+          final mainMountPoint = (dev['mountpoint'] as String?)?.trim();
+          final children = dev['children'] as List<dynamic>?;
+
           bool isSys = false;
           String? systemMountPoint;
+          bool hasFilesystem = (mainFsType != null && mainFsType.isNotEmpty) ||
+              (mainMountPoint != null && mainMountPoint.isNotEmpty);
+          String? detectedFsType = mainFsType;
 
-          final children = dev['children'] as List<dynamic>?;
-          if (children != null) {
+          if (children != null && children.isNotEmpty) {
             for (final child in children) {
-              final mp = child['mountpoint'] as String?;
+              final mp = (child['mountpoint'] as String?)?.trim();
+              final childFs = (child['fstype'] as String?)?.trim();
               if (mp == '/' || mp == '/boot' || mp == '/boot/efi') {
                 isSys = true;
                 systemMountPoint = mp;
-                break;
+              }
+              if ((childFs != null && childFs.isNotEmpty) || (mp != null && mp.isNotEmpty)) {
+                hasFilesystem = true;
+                if (childFs != null && childFs.isNotEmpty && (detectedFsType == null || detectedFsType.isEmpty)) {
+                  detectedFsType = childFs;
+                }
               }
             }
           }
+
+          final bool isWipedNoFilesystem = !hasFilesystem && (children == null || children.isEmpty);
 
           MediaType mediaType = MediaType.unknown;
           if (tran.contains('USB') || isRm || isHotplug) {
@@ -131,13 +146,18 @@ class DeviceIntelligenceService {
               supportsEmmcSanitize: mediaType == MediaType.emmc,
               supportsTrim: mediaType != MediaType.hdd,
               hpaDcoPresent: false,
-              mountPoint: systemMountPoint,
+              mountPoint: systemMountPoint ?? mainMountPoint,
               isSystemDisk: isSys,
-              notes: isSys
-                  ? 'REAL SYSTEM DISK (Protected against destruction)'
-                  : (isRm || mediaType == MediaType.usbFlash
-                      ? 'REAL REMOVABLE STORAGE DEVICE'
-                      : 'REAL CONNECTED STORAGE DEVICE'),
+              hasFilesystem: hasFilesystem,
+              fsType: detectedFsType,
+              isWipedNoFilesystem: isWipedNoFilesystem,
+              notes: isWipedNoFilesystem
+                  ? 'SANITIZED / NO FILESYSTEM (Raw Block Device)'
+                  : (isSys
+                      ? 'REAL SYSTEM DISK (Protected against destruction)'
+                      : (isRm || mediaType == MediaType.usbFlash
+                          ? 'REAL REMOVABLE STORAGE DEVICE'
+                          : 'REAL CONNECTED STORAGE DEVICE')),
             ),
           );
         }

@@ -430,10 +430,21 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
       child: Material(
         color: Colors.transparent,
         child: InkWell(
-          onTap: () {
-            controller.selectDevice(device);
-            context.go('/devices/details/${device.id}');
-          },
+          onTap: controller.isJobRunning
+              ? () {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        'Sanitization is active on ${controller.currentJob?.device.name ?? "target"}. Target device selection is locked.',
+                      ),
+                      backgroundColor: AppTheme.accentOrange,
+                    ),
+                  );
+                }
+              : () {
+                  controller.selectDevice(device);
+                  context.go('/devices/details/${device.id}');
+                },
           borderRadius: BorderRadius.circular(16),
           child: AnimatedContainer(
             duration: const Duration(milliseconds: 200),
@@ -493,6 +504,35 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
                                   overflow: TextOverflow.ellipsis,
                                 ),
                               ),
+                              if (device.isWipedNoFilesystem) ...[
+                                const SizedBox(width: 6),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color: AppTheme.accentEmerald.withValues(alpha: 0.2),
+                                    borderRadius: BorderRadius.circular(6),
+                                    border: Border.all(color: AppTheme.accentEmerald),
+                                  ),
+                                  child: const Text(
+                                    'WIPED / NO FILESYSTEM',
+                                    style: TextStyle(color: AppTheme.accentEmerald, fontSize: 9, fontWeight: FontWeight.bold),
+                                  ),
+                                ),
+                              ] else if (controller.orphanResult?.activeJobState?.deviceSerial == device.serialNumber) ...[
+                                const SizedBox(width: 6),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                  decoration: BoxDecoration(
+                                    color: AppTheme.accentOrange.withValues(alpha: 0.2),
+                                    borderRadius: BorderRadius.circular(6),
+                                    border: Border.all(color: AppTheme.accentOrange),
+                                  ),
+                                  child: const Text(
+                                    '⚠ UNVERIFIED',
+                                    style: TextStyle(color: AppTheme.accentOrange, fontSize: 9, fontWeight: FontWeight.bold),
+                                  ),
+                                ),
+                              ],
                               if (device.isSystemDisk) ...[
                                 const SizedBox(width: 6),
                                 Container(

@@ -15,6 +15,8 @@ import 'risk_scoring_service.dart';
 import 'verification_service.dart';
 import 'real_sanitization_service.dart';
 import 'audit_log_service.dart';
+import 'job_state_file.dart';
+import 'orphaned_process_checker.dart';
 
 class SanitizationController extends ChangeNotifier {
   final DeviceSimulator _simulator = DeviceSimulator();
@@ -42,6 +44,7 @@ class SanitizationController extends ChangeNotifier {
   SanitizationJob? _currentJob;
   SanitizationCertificate? _completedCertificate;
   PolicyValidationResult? _lastPolicyResult;
+  OrphanCheckResult? _orphanResult;
 
   // Global dev simulator controls
   bool _simulateFailureMode = false;
@@ -49,6 +52,29 @@ class SanitizationController extends ChangeNotifier {
   SanitizationController() {
     refreshDevices();
     _startAutoPolling();
+    _checkForOrphansOnStartup();
+  }
+
+  Future<void> _checkForOrphansOnStartup() async {
+    final result = await OrphanedProcessChecker.checkForOrphan();
+    if (result.status != OrphanCheckStatus.none) {
+      _orphanResult = result;
+      notifyListeners();
+    }
+  }
+
+  void acknowledgeOrphan() {
+    _orphanResult = null;
+    JobStateFile.clearActiveJob();
+    notifyListeners();
+  }
+
+  void clearCompletedJob() {
+    if (isJobRunning) return;
+    _currentJob = null;
+    _completedCertificate = null;
+    _updateJobRecommendation();
+    notifyListeners();
   }
 
   // Getters
@@ -67,6 +93,15 @@ class SanitizationController extends ChangeNotifier {
   SanitizationCertificate? get completedCertificate => _completedCertificate;
   PolicyValidationResult? get lastPolicyResult => _lastPolicyResult;
   bool get simulateFailureMode => _simulateFailureMode;
+  OrphanCheckResult? get orphanResult => _orphanResult;
+
+  bool get isJobRunning {
+    if (_currentJob == null) return false;
+    return _currentJob!.status == JobStatus.detecting ||
+        _currentJob!.status == JobStatus.unmounting ||
+        _currentJob!.status == JobStatus.sanitizing ||
+        _currentJob!.status == JobStatus.verifying;
+  }
 
   void _startAutoPolling() {
     _autoPollTimer?.cancel();
@@ -101,7 +136,9 @@ class SanitizationController extends ChangeNotifier {
       for (int i = 0; i < freshDevices.length; i++) {
         if (freshDevices[i].id != _devices[i].id ||
             freshDevices[i].name != _devices[i].name ||
-            freshDevices[i].capacityBytes != _devices[i].capacityBytes) {
+            freshDevices[i].capacityBytes != _devices[i].capacityBytes ||
+            freshDevices[i].isWipedNoFilesystem != _devices[i].isWipedNoFilesystem ||
+            freshDevices[i].hasFilesystem != _devices[i].hasFilesystem) {
           hasChanged = true;
           break;
         }
@@ -110,14 +147,19 @@ class SanitizationController extends ChangeNotifier {
 
     if (hasChanged || _devices.isEmpty) {
       _devices = freshDevices;
-      if (_devices.isNotEmpty) {
-        if (_selectedDevice == null || !_devices.any((d) => d.id == _selectedDevice!.id)) {
-          _selectedDevice = _devices.first;
+      if (!isJobRunning) {
+        if (_devices.isNotEmpty) {
+          if (_selectedDevice == null || !_devices.any((d) => d.id == _selectedDevice!.id)) {
+            _selectedDevice = _devices.first;
+          } else {
+            // Refresh selected device reference with new profile
+            _selectedDevice = _devices.firstWhere((d) => d.id == _selectedDevice!.id);
+          }
+        } else {
+          _selectedDevice = null;
         }
-      } else {
-        _selectedDevice = null;
+        _updateJobRecommendation();
       }
-      _updateJobRecommendation();
       notifyListeners();
     }
   }
@@ -129,6 +171,7 @@ class SanitizationController extends ChangeNotifier {
   }
 
   void selectDevice(DeviceProfile device) {
+    if (isJobRunning) return;
     _selectedDevice = device;
     _updateJobRecommendation();
     notifyListeners();
@@ -139,6 +182,7 @@ class SanitizationController extends ChangeNotifier {
     DeviceCondition? condition,
     DisposalPath? path,
   }) {
+    if (isJobRunning) return;
     if (sensitivity != null) _dataSensitivity = sensitivity;
     if (condition != null) _deviceCondition = condition;
     if (path != null) _disposalPath = path;
@@ -156,6 +200,7 @@ class SanitizationController extends ChangeNotifier {
   }
 
   void resetSimulator() {
+    if (isJobRunning) return;
     _simulator.resetProfiles();
     refreshDevices();
     _currentJob = null;
@@ -165,6 +210,7 @@ class SanitizationController extends ChangeNotifier {
   }
 
   void _updateJobRecommendation() {
+    if (isJobRunning) return;
     if (_selectedDevice == null) return;
 
     final device = _selectedDevice!;
@@ -252,6 +298,15 @@ class SanitizationController extends ChangeNotifier {
         job.currentStageDescription = 'Executing real-hardware sanitization...';
         notifyListeners();
 
+        await JobStateFile.saveActiveJob(ActiveJobState(
+          jobId: job.jobId,
+          deviceSerial: job.device.serialNumber,
+          devicePath: job.device.id.startsWith('real_') ? '/dev/${job.device.id.substring(5)}' : '/dev/sdb',
+          deviceName: job.device.name,
+          method: job.recommendedMethod.displayName,
+          startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
+        ));
+
         final report = await _realSanitizeService.executeSanitization(
           device: job.device,
           method: job.recommendedMethod,
@@ -276,9 +331,15 @@ class SanitizationController extends ChangeNotifier {
           job.currentStageDescription = 'Sanitization Failed: ${report.stderr}';
           _addLog('ERROR: Sanitization command failed with code ${report.exitCode}');
           _addLog('ERROR Details: ${report.stderr}');
+          await JobStateFile.clearActiveJob();
           notifyListeners();
           return;
         }
+
+        // ── Disk operation succeeded. Record this fact BEFORE post-processing ──
+        // From this point forward, any exception is a post-processing failure
+        // (certificate signing, audit log), NOT a disk operation failure.
+        final bool diskWipeSucceeded = true;
 
         // Stage 3: Verification LBA sampling
         job.status = JobStatus.verifying;
@@ -290,27 +351,37 @@ class SanitizationController extends ChangeNotifier {
         final cliMethod = _realSanitizeService.mapMethodToCliArg(job.recommendedMethod, job.device);
         final expectZeros = job.recommendedMethod != SanitizationMethod.cryptographicErase;
 
-        final verifyReport = await _realSanitizeService.executeVerification(
-          device: job.device,
-          method: cliMethod,
-          deviceSerial: job.device.serialNumber,
-          sampleCount: 50,
-          expectZeros: expectZeros,
-        );
+        RealVerificationReport? verifyReport;
+        try {
+          verifyReport = await _realSanitizeService.executeVerification(
+            device: job.device,
+            method: cliMethod,
+            deviceSerial: job.device.serialNumber,
+            sampleCount: 50,
+            expectZeros: expectZeros,
+          );
+        } catch (verifyErr) {
+          _addLog('WARNING: Verification sampling failed: $verifyErr');
+          _addLog('NOTE: Disk write operation itself completed successfully.');
+        }
 
         job.progress = 0.95;
         notifyListeners();
 
+        final bool verificationPassed = verifyReport?.pass ?? false;
+
         // Construct VerificationEvidence from real report
         final List<int> sampleOffsets = [];
         final Map<int, String> sampleHashes = {};
-        for (final sample in verifyReport.samples) {
-          try {
-            final offset = sample['offset'] as int;
-            final hash = sample['sector_hash'] as String;
-            sampleOffsets.add(offset);
-            sampleHashes[offset] = hash;
-          } catch (_) {}
+        if (verifyReport != null) {
+          for (final sample in verifyReport.samples) {
+            try {
+              final offset = sample['offset'] as int;
+              final hash = sample['sector_hash'] as String;
+              sampleOffsets.add(offset);
+              sampleHashes[offset] = hash;
+            } catch (_) {}
+          }
         }
 
         if (sampleOffsets.isEmpty) {
@@ -321,8 +392,10 @@ class SanitizationController extends ChangeNotifier {
           }
         }
 
-        final statusCode = verifyReport.pass ? 0 : 1;
-        final controllerConfirmation = 'VERIFICATION: Pass: ${verifyReport.pass} | Samples: ${verifyReport.sampleCount} | Entropy: ${verifyReport.entropyScore}';
+        final statusCode = verificationPassed ? 0 : 1;
+        final controllerConfirmation = verifyReport != null
+            ? 'VERIFICATION: Pass: ${verifyReport.pass} | Samples: ${verifyReport.sampleCount} | Entropy: ${verifyReport.entropyScore}'
+            : 'VERIFICATION: Sampling unavailable (disk wipe command succeeded)';
 
         final limitations = _verificationService.getTailoredLimitations(job.recommendedMethod);
 
@@ -331,48 +404,77 @@ class SanitizationController extends ChangeNotifier {
           controllerConfirmation: controllerConfirmation,
           sampleOffsets: sampleOffsets,
           sampleHashes: sampleHashes,
-          evidenceHash: verifyReport.fingerprintHash,
+          evidenceHash: verifyReport?.fingerprintHash ?? 'VERIFY_UNAVAILABLE',
           limitations: limitations,
-          verifiedPassed: verifyReport.pass,
+          verifiedPassed: verificationPassed,
         );
 
-        // Stage 4: Completion & Certificate Signing
-        job.status = verifyReport.pass ? JobStatus.completed : JobStatus.failed;
+        bool isJobSuccessful = false;
+        if (verifyReport != null) {
+          isJobSuccessful = verifyReport.pass;
+        } else {
+          isJobSuccessful = diskWipeSucceeded;
+        }
+
+        // Stage 4: Completion — set status based on DISK OPERATION & VERIFICATION
+        job.status = isJobSuccessful ? JobStatus.completed : JobStatus.failed;
         job.progress = 1.0;
         job.endTime = DateTime.now();
-        job.currentStageDescription = verifyReport.pass
-            ? 'Sanitization & Audit Verification Complete.'
+        job.currentStageDescription = isJobSuccessful
+            ? (verificationPassed
+                ? 'Sanitization & Audit Verification Complete.'
+                : 'Disk wipe succeeded. Verification sampling unavailable — review logs.')
             : 'Verification Failed: Non-zero or dirty sectors detected.';
-        
-        _completedCertificate = _certificateService.generateCertificate(job: job, evidence: evidence);
-        _addLog('VERIFICATION: Entropy score: ${verifyReport.entropyScore}. Fingerprint: ${verifyReport.fingerprintHash}');
-        _addLog('CERTIFICATE: Issued ${completedCertificate!.certificateId} signed with ECDSA P-256 key.');
+        notifyListeners();
 
-        // Append to append-only Audit Log
-        final auditEntry = AuditLogEntry(
-          timestamp: DateTime.now().toIso8601String(),
-          jobId: job.jobId,
-          deviceSerial: job.device.serialNumber,
-          devicePath: job.device.id.startsWith('real_')
-              ? '/dev/${job.device.id.substring(5)}'
-              : '/dev/null',
-          method: job.recommendedMethod.displayName,
-          standardReference: job.standardReference,
-          nistCategory: job.effectiveNistCategoryDisplayName,
-          success: verifyReport.pass,
-          fingerprintHash: verifyReport.fingerprintHash,
-          entropyScore: verifyReport.entropyScore,
-          sampleCount: verifyReport.sampleCount,
-          commandLog: report.commandLog,
-        );
-        await _auditLogService.appendEntry(auditEntry);
+        // ── Post-processing: certificate & audit log ──
+        // Failures here must NOT change job.status from completed→failed.
+        try {
+          _completedCertificate = _certificateService.generateCertificate(job: job, evidence: evidence);
+          _addLog('CERTIFICATE: Issued ${completedCertificate!.certificateId} signed with ECDSA P-256 key.');
+        } catch (certErr) {
+          _addLog('WARNING: Certificate generation failed: $certErr');
+          _addLog('NOTE: The disk sanitization itself completed successfully.');
+          job.currentStageDescription = 'Sanitization succeeded. Certificate generation failed — see logs.';
+        }
 
+        if (verifyReport != null) {
+          _addLog('VERIFICATION: Entropy score: ${verifyReport.entropyScore}. Fingerprint: ${verifyReport.fingerprintHash}');
+        }
+
+        try {
+          final auditEntry = AuditLogEntry(
+            timestamp: DateTime.now().toIso8601String(),
+            jobId: job.jobId,
+            deviceSerial: job.device.serialNumber,
+            devicePath: job.device.id.startsWith('real_')
+                ? '/dev/${job.device.id.substring(5)}'
+                : '/dev/null',
+            method: job.recommendedMethod.displayName,
+            standardReference: job.standardReference,
+            nistCategory: job.effectiveNistCategoryDisplayName,
+            success: diskWipeSucceeded && verificationPassed,
+            fingerprintHash: verifyReport?.fingerprintHash ?? 'UNAVAILABLE',
+            entropyScore: verifyReport?.entropyScore ?? 0.0,
+            sampleCount: verifyReport?.sampleCount ?? 0,
+            commandLog: report.commandLog,
+          );
+          await _auditLogService.appendEntry(auditEntry);
+        } catch (auditErr) {
+          _addLog('WARNING: Audit log write failed: $auditErr');
+        }
+
+        await JobStateFile.clearActiveJob();
         notifyListeners();
       } catch (e) {
+        // This catch is ONLY for failures during the actual disk operation
+        // (unmounting, sanitization command launch, process spawning).
+        // Post-processing failures are caught separately above.
         job.status = JobStatus.failed;
         job.endTime = DateTime.now();
         job.currentStageDescription = 'Execution Error: $e';
         _addLog('ERROR: $e');
+        await JobStateFile.clearActiveJob();
         notifyListeners();
       }
       return;
@@ -396,6 +498,15 @@ class SanitizationController extends ChangeNotifier {
     job.currentStageDescription = 'Executing ${job.recommendedMethod.displayName}...';
     _addLog('EXECUTION: Invoking controller command payload [Simulated Engine]...');
 
+    await JobStateFile.saveActiveJob(ActiveJobState(
+      jobId: job.jobId,
+      deviceSerial: job.device.serialNumber,
+      devicePath: '/dev/sdb',
+      deviceName: job.device.name,
+      method: job.recommendedMethod.displayName,
+      startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
+    ));
+
     // Progress updates during sanitization
     for (int p = 45; p <= 80; p += 10) {
       await Future.delayed(const Duration(milliseconds: 400));
@@ -414,6 +525,7 @@ class SanitizationController extends ChangeNotifier {
       
       final evidence = _verificationService.verify(job, isSuccess: false);
       _completedCertificate = _certificateService.generateCertificate(job: job, evidence: evidence);
+      await JobStateFile.clearActiveJob();
       notifyListeners();
       return;
     }
@@ -437,6 +549,7 @@ class SanitizationController extends ChangeNotifier {
     final evidence = _verificationService.verify(job, isSuccess: true);
     _completedCertificate = _certificateService.generateCertificate(job: job, evidence: evidence);
     _addLog('CERTIFICATE: Issued ${completedCertificate!.certificateId} signed with ECDSA P-256 key.');
+    await JobStateFile.clearActiveJob();
 
     notifyListeners();
   }

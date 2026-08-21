@@ -193,12 +193,18 @@ class SanitizationWorkflowScreen extends StatelessWidget {
                     flex: 2,
                     child: ElevatedButton.icon(
                       icon: const Icon(Icons.play_arrow, size: 22),
-                      label: Text(isAllowed ? 'START PIPELINE' : 'BLOCKED BY POLICY'),
+                      label: Text(controller.isJobRunning
+                          ? 'JOB ALREADY IN PROGRESS'
+                          : (isAllowed ? 'START PIPELINE' : 'BLOCKED BY POLICY')),
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: isAllowed ? AppTheme.accentGold : AppTheme.surfaceBorder,
-                        foregroundColor: isAllowed ? Colors.white : AppTheme.textMuted,
+                        backgroundColor: (isAllowed && !controller.isJobRunning)
+                            ? AppTheme.accentGold
+                            : AppTheme.surfaceBorder,
+                        foregroundColor: (isAllowed && !controller.isJobRunning)
+                            ? Colors.white
+                            : AppTheme.textMuted,
                       ),
-                      onPressed: isAllowed
+                      onPressed: (isAllowed && !controller.isJobRunning)
                           ? () async {
                               final confirmed = await ConfirmationDialog.show(
                                 context,

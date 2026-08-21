@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math';
 import 'dart:typed_data';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
@@ -11,29 +12,40 @@ import '../models/sanitization_job.dart';
 class CertificateService {
   late pc.ECPrivateKey _privateKey;
   late pc.ECPublicKey _publicKey;
+  late pc.FortunaRandom _secureRandom;
 
   CertificateService() {
+    _initSecureRandom();
     _initDemoKeypair();
+  }
+
+  void _initSecureRandom() {
+    _secureRandom = pc.FortunaRandom();
+    final secureRng = Random.secure();
+    final seed = List<int>.generate(32, (_) => secureRng.nextInt(256));
+    _secureRandom.seed(pc.KeyParameter(Uint8List.fromList(seed)));
   }
 
   void _initDemoKeypair() {
     final keyParams = pc.ECKeyGeneratorParameters(pc.ECCurve_secp256r1());
     final generator = pc.ECKeyGenerator();
-    final secureRandom = pc.FortunaRandom();
-    
-    // Seed random generator
-    final seed = List<int>.generate(32, (i) => i * 7 + 13);
-    secureRandom.seed(pc.KeyParameter(Uint8List.fromList(seed)));
-    
-    generator.init(pc.ParametersWithRandom(keyParams, secureRandom));
+    generator.init(pc.ParametersWithRandom(keyParams, _secureRandom));
     final pair = generator.generateKeyPair();
     _privateKey = pair.privateKey as pc.ECPrivateKey;
     _publicKey = pair.publicKey as pc.ECPublicKey;
   }
 
   String _signData(String data) {
-    final signer = pc.Signer('SHA-256/ECDSA');
-    signer.init(true, pc.PrivateKeyParameter(_privateKey));
+    // Construct signer using concrete classes to avoid PointyCastle registry
+    // lookup failures for SecureRandom on Linux native builds.
+    final signer = pc.ECDSASigner(pc.SHA256Digest(), null);
+    signer.init(
+      true,
+      pc.ParametersWithRandom(
+        pc.PrivateKeyParameter<pc.ECPrivateKey>(_privateKey),
+        _secureRandom,
+      ),
+    );
     final signature = signer.generateSignature(Uint8List.fromList(utf8.encode(data))) as pc.ECSignature;
     return '${signature.r.toRadixString(16)}:${signature.s.toRadixString(16)}';
   }

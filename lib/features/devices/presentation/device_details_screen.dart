@@ -161,7 +161,24 @@ class DeviceDetailsScreen extends StatelessWidget {
                             ),
                           ),
                         ),
-                        if (device.isSystemDisk)
+                        if (device.isWipedNoFilesystem)
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: AppTheme.accentEmerald.withValues(alpha: 0.2),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: AppTheme.accentEmerald),
+                            ),
+                            child: Text(
+                              'WIPED / NO FILESYSTEM',
+                              style: GoogleFonts.inter(
+                                color: AppTheme.accentEmerald,
+                                fontSize: 10,
+                                fontWeight: FontWeight.w700,
+                              ),
+                            ),
+                          )
+                        else if (device.isSystemDisk)
                           Container(
                             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                             decoration: BoxDecoration(
@@ -463,11 +480,19 @@ class DeviceDetailsScreen extends StatelessWidget {
               width: double.infinity,
               child: ElevatedButton.icon(
                 icon: const Icon(Icons.cleaning_services, size: 18),
-                label: const Text('BEGIN SANITIZATION'),
-                onPressed: () {
-                  controller.selectDevice(device);
-                  context.go('/sanitize');
-                },
+                label: Text(controller.isJobRunning ? 'SANITIZATION IN PROGRESS' : 'BEGIN SANITIZATION'),
+                style: controller.isJobRunning
+                    ? ElevatedButton.styleFrom(
+                        backgroundColor: AppTheme.surfaceBorder,
+                        foregroundColor: AppTheme.textMuted,
+                      )
+                    : null,
+                onPressed: controller.isJobRunning
+                    ? null
+                    : () {
+                        controller.selectDevice(device);
+                        context.go('/sanitize');
+                      },
               ),
             ),
             const SizedBox(height: 10),

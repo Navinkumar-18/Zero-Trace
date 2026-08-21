@@ -6,6 +6,8 @@ import 'package:provider/provider.dart';
 import '../services/sanitization_controller.dart';
 import '../../widgets/theme.dart';
 
+import '../widgets/sanitization_active_banner.dart';
+
 /// Main application shell with responsive sidebar navigation.
 /// Provides the primary navigation structure for Zero Trace 2.0.
 class AppShell extends StatefulWidget {
@@ -73,7 +75,50 @@ class _AppShellState extends State<AppShell> {
   }
 
   void _onDestinationSelected(int index) {
-    context.go(_destinations[index].route);
+    final route = _destinations[index].route;
+    final controller = context.read<SanitizationController>();
+
+    if (controller.isJobRunning && (route == '/devices' || route == '/sanitize')) {
+      final deviceName = controller.currentJob?.device.name ?? 'Target Device';
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          backgroundColor: AppTheme.surfaceCard,
+          title: const Row(
+            children: [
+              Icon(Icons.lock, color: AppTheme.accentOrange, size: 22),
+              SizedBox(width: 8),
+              Text('Sanitization Active', style: TextStyle(color: AppTheme.textPrimary)),
+            ],
+          ),
+          content: Text(
+            'Sanitization is currently executing on $deviceName.\n\nSelecting a new device or configuring another workflow is restricted while a job is running.',
+            style: const TextStyle(color: AppTheme.textSecondary, fontSize: 13),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text('DISMISS', style: TextStyle(color: AppTheme.textMuted)),
+            ),
+            ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppTheme.accentOrange,
+                foregroundColor: Colors.white,
+              ),
+              icon: const Icon(Icons.show_chart, size: 16),
+              label: const Text('VIEW PROGRESS'),
+              onPressed: () {
+                Navigator.of(ctx).pop();
+                context.go('/sanitize/progress');
+              },
+            ),
+          ],
+        ),
+      );
+      return;
+    }
+
+    context.go(route);
   }
 
   @override
@@ -85,57 +130,69 @@ class _AppShellState extends State<AppShell> {
     if (isCompact) {
       // Mobile/narrow: use bottom navigation
       return Scaffold(
-        body: widget.child,
+        body: Column(
+          children: [
+            const SanitizationActiveBanner(),
+            Expanded(child: widget.child),
+          ],
+        ),
         bottomNavigationBar: _buildBottomNav(selectedIndex),
       );
     }
 
     // Desktop: use sidebar
     return Scaffold(
-      body: Row(
+      body: Column(
         children: [
-          // Sidebar
-          AnimatedContainer(
-            duration: const Duration(milliseconds: 200),
-            curve: Curves.easeInOut,
-            width: _isSidebarExpanded ? 240 : 72,
-            decoration: BoxDecoration(
-              color: AppTheme.surfaceDark,
-              border: Border(
-                right: BorderSide(
-                  color: AppTheme.surfaceBorder.withValues(alpha: 0.5),
-                ),
-              ),
-            ),
-            child: Column(
+          const SanitizationActiveBanner(),
+          Expanded(
+            child: Row(
               children: [
-                // Header
-                _buildSidebarHeader(),
-                const Divider(height: 1, color: AppTheme.surfaceBorder),
-
-                // Navigation items
-                Expanded(
-                  child: ListView(
-                    padding: const EdgeInsets.symmetric(vertical: 8),
+                // Sidebar
+                AnimatedContainer(
+                  duration: const Duration(milliseconds: 200),
+                  curve: Curves.easeInOut,
+                  width: _isSidebarExpanded ? 240 : 72,
+                  decoration: BoxDecoration(
+                    color: AppTheme.surfaceDark,
+                    border: Border(
+                      right: BorderSide(
+                        color: AppTheme.surfaceBorder.withValues(alpha: 0.5),
+                      ),
+                    ),
+                  ),
+                  child: Column(
                     children: [
-                      for (int i = 0; i < _destinations.length; i++)
-                        _buildNavItem(i, selectedIndex),
+                      // Header
+                      _buildSidebarHeader(),
+                      const Divider(height: 1, color: AppTheme.surfaceBorder),
+
+                      // Navigation items
+                      Expanded(
+                        child: ListView(
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          children: [
+                            for (int i = 0; i < _destinations.length; i++)
+                              _buildNavItem(i, selectedIndex),
+                          ],
+                        ),
+                      ),
+
+                      // Mode banner
+                      _buildModeStatusBanner(context),
+
+                      // Collapse toggle
+                      const Divider(height: 1, color: AppTheme.surfaceBorder),
+                      _buildCollapseToggle(),
                     ],
                   ),
                 ),
 
-                // Mode banner
-                _buildModeStatusBanner(context),
-
-                // Collapse toggle
-                const Divider(height: 1, color: AppTheme.surfaceBorder),
-                _buildCollapseToggle(),
+                // Main content
+                Expanded(child: widget.child),
               ],
             ),
           ),
-
-          // Main content
-          Expanded(child: widget.child),
         ],
       ),
     );
