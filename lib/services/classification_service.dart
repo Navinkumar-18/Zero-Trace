@@ -28,7 +28,7 @@ class ClassificationService {
     MediaType mappedType = profile.mediaType;
     
     // Validate mapping based on rotational & bus criteria
-    if (profile.rotationalRpm > 0) {
+    if (profile.rotationalRpm != null && profile.rotationalRpm! > 0) {
       mappedType = MediaType.hdd;
     } else if (profile.busType.toUpperCase().contains('NVME')) {
       mappedType = MediaType.nvmeSsd;
@@ -36,7 +36,7 @@ class ClassificationService {
       mappedType = MediaType.emmc;
     } else if (profile.busType.toUpperCase().contains('USB')) {
       mappedType = MediaType.usbFlash;
-    } else if (profile.busType.toUpperCase().contains('SATA') && profile.rotationalRpm == 0) {
+    } else if (profile.busType.toUpperCase().contains('SATA') && (profile.rotationalRpm == null || profile.rotationalRpm == 0)) {
       mappedType = MediaType.sataSsd;
     }
 

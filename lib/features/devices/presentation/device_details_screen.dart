@@ -224,7 +224,7 @@ class DeviceDetailsScreen extends StatelessWidget {
               _infoChip('Capacity', device.formattedCapacity),
               _infoChip('Interface', device.busType),
               _infoChip('Mount', device.mountPoint ?? 'Not mounted'),
-              if (device.rotationalRpm > 0)
+              if (device.mediaType == MediaType.hdd && device.rotationalRpm != null && device.rotationalRpm! > 0)
                 _infoChip('RPM', '${device.rotationalRpm}'),
               _infoChip('Encrypted', device.isHardwareEncrypted ? 'Yes (TCG OPAL)' : 'No'),
             ],

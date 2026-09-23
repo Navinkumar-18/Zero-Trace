@@ -64,14 +64,24 @@ class DeviceIntelligenceService {
 
       final Map<String, dynamic> parsed = jsonDecode(result.stdout as String);
       final List<dynamic> devicesJson = parsed['blockdevices'] ?? [];
-      final List<DeviceProfile> detectedProfiles = [];
+      return parseBlockDevices(devicesJson);
+    } catch (e) {
+      lastScanError = e.toString();
+      debugPrint('[DISCOVERY ERROR EXCEPTION] $e');
+      return [];
+    }
+  }
 
-      for (final dev in devicesJson) {
-        final type = dev['type'] as String?;
-        if (type == 'disk' || type == null || type.isEmpty) {
-          final rawName = dev['name'] as String? ?? 'unknown';
-          final size = (dev['size'] as num?)?.toInt() ?? 0;
-          if (size <= 0 && rawName == 'unknown') continue;
+  /// Parses block devices list from lsblk JSON into DeviceProfile models.
+  List<DeviceProfile> parseBlockDevices(List<dynamic> devicesJson) {
+    final List<DeviceProfile> detectedProfiles = [];
+
+    for (final dev in devicesJson) {
+      final type = dev['type'] as String?;
+      if (type == 'disk' || type == null || type.isEmpty) {
+        final rawName = dev['name'] as String? ?? 'unknown';
+        final size = (dev['size'] as num?)?.toInt() ?? 0;
+        if (size <= 0 && rawName == 'unknown') continue;
 
           final modelStr = (dev['model'] as String?)?.trim();
           final name = (modelStr != null && modelStr.isNotEmpty) ? modelStr : 'Storage Device ($rawName)';
@@ -138,7 +148,7 @@ class DeviceIntelligenceService {
               mediaType: mediaType,
               busType: busDisplay,
               capacityBytes: size,
-              rotationalRpm: isRotational ? 5400 : 0,
+              rotationalRpm: null, // lsblk does not provide rotational speed (RPM)
               isHardwareEncrypted: mediaType == MediaType.nvmeSsd || mediaType == MediaType.sataSsd,
               supportsAtaSecureErase: mediaType == MediaType.sataSsd || mediaType == MediaType.hdd,
               supportsAtaSanitize: mediaType == MediaType.sataSsd,
@@ -163,11 +173,6 @@ class DeviceIntelligenceService {
         }
       }
 
-      lastScanError = null;
       return detectedProfiles;
-    } catch (e) {
-      lastScanError = 'Device scan failed: $e';
-      return [];
     }
   }
-}

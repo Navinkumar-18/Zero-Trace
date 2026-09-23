@@ -50,7 +50,7 @@ class DeviceProfile {
   final MediaType mediaType;
   final String busType;
   final int capacityBytes;
-  final int rotationalRpm; // 0 for solid state
+  final int? rotationalRpm; // null or unknown for solid state / non-rotational
   final bool isHardwareEncrypted;
   final bool supportsAtaSecureErase;
   final bool supportsAtaSanitize;
@@ -72,7 +72,7 @@ class DeviceProfile {
     required this.mediaType,
     required this.busType,
     required this.capacityBytes,
-    this.rotationalRpm = 0,
+    this.rotationalRpm,
     this.isHardwareEncrypted = false,
     this.supportsAtaSecureErase = false,
     this.supportsAtaSanitize = false,
@@ -131,7 +131,7 @@ class DeviceProfile {
       ),
       busType: json['busType'] as String,
       capacityBytes: json['capacityBytes'] as int,
-      rotationalRpm: (json['rotationalRpm'] as int?) ?? 0,
+      rotationalRpm: json['rotationalRpm'] as int?,
       isHardwareEncrypted: (json['isHardwareEncrypted'] as bool?) ?? false,
       supportsAtaSecureErase: (json['supportsAtaSecureErase'] as bool?) ?? false,
       supportsAtaSanitize: (json['supportsAtaSanitize'] as bool?) ?? false,
