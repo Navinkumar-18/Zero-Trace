@@ -25,6 +25,14 @@ class SanitizationWorkflowScreen extends StatelessWidget {
     }
 
     final isAllowed = policy?.isAllowed ?? false;
+    final isDestroyRecommended = job.targetCategory == NistCategory.destroy ||
+        job.recommendedMethod == SanitizationMethod.physicalDestructionRecommended ||
+        job.recommendedMethod == SanitizationMethod.unsupportedFlagForDestroy;
+    final hasOverriddenToSoftware = job.effectiveMethod != SanitizationMethod.physicalDestructionRecommended &&
+        job.effectiveMethod != SanitizationMethod.unsupportedFlagForDestroy;
+    final requiresAcknowledgment = isDestroyRecommended && hasOverriddenToSoftware;
+    final isAcknowledged = job.destroyAcknowledged;
+    final canStart = isAllowed && !controller.isJobRunning && (!requiresAcknowledgment || isAcknowledged);
 
     return Scaffold(
       appBar: AppBar(
@@ -128,10 +136,118 @@ class SanitizationWorkflowScreen extends StatelessWidget {
                       job.explanationText,
                       style: const TextStyle(color: AppTheme.textSecondary, fontSize: 13, height: 1.5),
                     ),
+
+                    // If physical destruction was recommended, offer manual override to overwrite
+                    if (isDestroyRecommended) ...[
+                      const SizedBox(height: 16),
+                      const Divider(color: AppTheme.surfaceBorder),
+                      const SizedBox(height: 12),
+                      const Text(
+                        'Method Override / Alternative:',
+                        style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: AppTheme.textPrimary),
+                      ),
+                      const SizedBox(height: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: AppTheme.surfaceDark,
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(color: AppTheme.surfaceBorder),
+                        ),
+                        child: DropdownButton<SanitizationMethod>(
+                          value: job.effectiveMethod,
+                          isExpanded: true,
+                          underline: const SizedBox.shrink(),
+                          dropdownColor: AppTheme.surfaceDark,
+                          items: [
+                            DropdownMenuItem(
+                              value: job.recommendedMethod,
+                              child: const Text(
+                                'Physical Destruction (Recommended)',
+                                style: TextStyle(color: AppTheme.accentRose, fontWeight: FontWeight.w600),
+                              ),
+                            ),
+                            const DropdownMenuItem(
+                              value: SanitizationMethod.singlePassOverwrite,
+                              child: Text('Single-Pass Zero Overwrite (Clear only)'),
+                            ),
+                            const DropdownMenuItem(
+                              value: SanitizationMethod.multiPassOverwrite,
+                              child: Text('Multi-Pass Overwrite (Clear only)'),
+                            ),
+                          ],
+                          onChanged: controller.isJobRunning
+                              ? null
+                              : (method) {
+                                  controller.setOverriddenMethod(method);
+                                },
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),
               const SizedBox(height: 20),
+
+              // Destroy Acknowledgment Checkbox (when user selects overwrite despite Destroy recommendation)
+              if (requiresAcknowledgment) ...[
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: AppTheme.accentOrange.withValues(alpha: 0.12),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: AppTheme.accentOrange.withValues(alpha: 0.5)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Row(
+                        children: [
+                          Icon(Icons.warning_amber_rounded, color: AppTheme.accentOrange, size: 22),
+                          SizedBox(width: 8),
+                          Text(
+                            'OPERATOR ACKNOWLEDGMENT REQUIRED',
+                            style: TextStyle(
+                              color: AppTheme.accentOrange,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'NIST SP 800-88 specifies Physical Destruction for this media and sensitivity tier. Logical overwrite cannot reach wear-remapped or over-provisioned NAND blocks. Residual confidential data may remain on the device.',
+                        style: TextStyle(fontSize: 12, color: AppTheme.textSecondary, height: 1.4),
+                      ),
+                      const SizedBox(height: 12),
+                      Theme(
+                        data: ThemeData(unselectedWidgetColor: AppTheme.accentOrange),
+                        child: CheckboxListTile(
+                          contentPadding: EdgeInsets.zero,
+                          activeColor: AppTheme.accentOrange,
+                          checkColor: Colors.black,
+                          value: isAcknowledged,
+                          title: const Text(
+                            'I acknowledge this device may retain data',
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.bold,
+                              color: AppTheme.textPrimary,
+                            ),
+                          ),
+                          onChanged: controller.isJobRunning
+                              ? null
+                              : (val) {
+                                  controller.setDestroyAcknowledged(val ?? false);
+                                },
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 20),
+              ],
 
               // Policy Layer Safety Wall Status Card
               Container(
@@ -193,23 +309,25 @@ class SanitizationWorkflowScreen extends StatelessWidget {
                     flex: 2,
                     child: ElevatedButton.icon(
                       icon: const Icon(Icons.play_arrow, size: 22),
-                      label: Text(controller.isJobRunning
-                          ? 'JOB ALREADY IN PROGRESS'
-                          : (isAllowed ? 'START PIPELINE' : 'BLOCKED BY POLICY')),
-                      style: ElevatedButton.styleFrom(
-                        backgroundColor: (isAllowed && !controller.isJobRunning)
-                            ? AppTheme.accentGold
-                            : AppTheme.surfaceBorder,
-                        foregroundColor: (isAllowed && !controller.isJobRunning)
-                            ? Colors.white
-                            : AppTheme.textMuted,
+                      label: Text(
+                        controller.isJobRunning
+                            ? 'JOB ALREADY IN PROGRESS'
+                            : (!isAllowed
+                                ? 'BLOCKED BY POLICY'
+                                : (requiresAcknowledgment && !isAcknowledged
+                                    ? 'ACKNOWLEDGMENT REQUIRED'
+                                    : 'START PIPELINE')),
                       ),
-                      onPressed: (isAllowed && !controller.isJobRunning)
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: canStart ? AppTheme.accentGold : AppTheme.surfaceBorder,
+                        foregroundColor: canStart ? Colors.white : AppTheme.textMuted,
+                      ),
+                      onPressed: canStart
                           ? () async {
                               final confirmed = await ConfirmationDialog.show(
                                 context,
                                 device: job.device,
-                                method: job.recommendedMethod,
+                                method: job.effectiveMethod,
                                 nistCategory: job.effectiveNistCategoryDisplayName,
                               );
                               if (confirmed) {

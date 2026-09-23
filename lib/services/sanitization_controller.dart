@@ -224,6 +224,7 @@ class SanitizationController extends ChangeNotifier {
       device,
       riskResult.score,
       riskResult.targetCategory,
+      sensitivity: _dataSensitivity,
     );
 
     final jobId = 'JOB-${DateTime.now().millisecondsSinceEpoch.toString().substring(6)}';
@@ -243,6 +244,21 @@ class SanitizationController extends ChangeNotifier {
     );
 
     _lastPolicyResult = _policyLayer.validateOperation(_currentJob!);
+  }
+
+  void setOverriddenMethod(SanitizationMethod? method) {
+    if (_currentJob != null && !isJobRunning) {
+      _currentJob!.overriddenMethod = method;
+      _lastPolicyResult = _policyLayer.validateOperation(_currentJob!);
+      notifyListeners();
+    }
+  }
+
+  void setDestroyAcknowledged(bool acknowledged) {
+    if (_currentJob != null) {
+      _currentJob!.destroyAcknowledged = acknowledged;
+      notifyListeners();
+    }
   }
 
   // Orchestrate simulated or real pipeline execution
@@ -303,13 +319,13 @@ class SanitizationController extends ChangeNotifier {
           deviceSerial: job.device.serialNumber,
           devicePath: job.device.id.startsWith('real_') ? '/dev/${job.device.id.substring(5)}' : '/dev/sdb',
           deviceName: job.device.name,
-          method: job.recommendedMethod.displayName,
+          method: job.effectiveMethod.displayName,
           startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
         ));
 
         final report = await _realSanitizeService.executeSanitization(
           device: job.device,
-          method: job.recommendedMethod,
+          method: job.effectiveMethod,
           confirmationToken: job.device.serialNumber, // verified by dialog retype
           deviceSerial: job.device.serialNumber,
           dryRun: false,
@@ -348,8 +364,8 @@ class SanitizationController extends ChangeNotifier {
         _addLog('VERIFICATION: Running post-sanitize verify LBA sampling...');
         notifyListeners();
 
-        final cliMethod = _realSanitizeService.mapMethodToCliArg(job.recommendedMethod, job.device);
-        final expectZeros = job.recommendedMethod != SanitizationMethod.cryptographicErase;
+        final cliMethod = _realSanitizeService.mapMethodToCliArg(job.effectiveMethod, job.device);
+        final expectZeros = job.effectiveMethod != SanitizationMethod.cryptographicErase;
 
         RealVerificationReport? verifyReport;
         try {
@@ -430,7 +446,14 @@ class SanitizationController extends ChangeNotifier {
         // ── Post-processing: certificate & audit log ──
         // Failures here must NOT change job.status from completed→failed.
         try {
-          _completedCertificate = _certificateService.generateCertificate(job: job, evidence: evidence);
+          _completedCertificate = _certificateService.generateCertificate(
+            job: job,
+            evidence: evidence,
+            executionMode: 'real',
+            actualMethodExecuted: report.methodUsed,
+            verificationSampleCount: verifyReport?.sampleCount,
+            verificationEntropyScore: verifyReport?.entropyScore,
+          );
           _addLog('CERTIFICATE: Issued ${completedCertificate!.certificateId} signed with ECDSA P-256 key.');
         } catch (certErr) {
           _addLog('WARNING: Certificate generation failed: $certErr');
@@ -495,7 +518,7 @@ class SanitizationController extends ChangeNotifier {
     await Future.delayed(const Duration(milliseconds: 1000));
     job.status = JobStatus.sanitizing;
     job.progress = 0.40;
-    job.currentStageDescription = 'Executing ${job.recommendedMethod.displayName}...';
+    job.currentStageDescription = 'Executing ${job.effectiveMethod.displayName}...';
     _addLog('EXECUTION: Invoking controller command payload [Simulated Engine]...');
 
     await JobStateFile.saveActiveJob(ActiveJobState(
@@ -503,7 +526,7 @@ class SanitizationController extends ChangeNotifier {
       deviceSerial: job.device.serialNumber,
       devicePath: '/dev/sdb',
       deviceName: job.device.name,
-      method: job.recommendedMethod.displayName,
+      method: job.effectiveMethod.displayName,
       startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
     ));
 
@@ -511,7 +534,7 @@ class SanitizationController extends ChangeNotifier {
     for (int p = 45; p <= 80; p += 10) {
       await Future.delayed(const Duration(milliseconds: 400));
       job.progress = p / 100.0;
-      _addLog('PROGRESS: ${job.recommendedMethod.displayName} - $p% complete');
+      _addLog('PROGRESS: ${job.effectiveMethod.displayName} - $p% complete');
       notifyListeners();
     }
 
@@ -524,7 +547,11 @@ class SanitizationController extends ChangeNotifier {
       _addLog('ERROR: Controller returned STATUS_ERR_TIMEOUT (Simulated Failure Injected)');
       
       final evidence = _verificationService.verify(job, isSuccess: false);
-      _completedCertificate = _certificateService.generateCertificate(job: job, evidence: evidence);
+      _completedCertificate = _certificateService.generateCertificate(
+        job: job,
+        evidence: evidence,
+        executionMode: 'simulated',
+      );
       await JobStateFile.clearActiveJob();
       notifyListeners();
       return;
@@ -547,7 +574,11 @@ class SanitizationController extends ChangeNotifier {
     _addLog('VERIFICATION: 50/50 Sector Samples zero-verified. SHA-256 evidence calculated.');
 
     final evidence = _verificationService.verify(job, isSuccess: true);
-    _completedCertificate = _certificateService.generateCertificate(job: job, evidence: evidence);
+    _completedCertificate = _certificateService.generateCertificate(
+      job: job,
+      evidence: evidence,
+      executionMode: 'simulated',
+    );
     _addLog('CERTIFICATE: Issued ${completedCertificate!.certificateId} signed with ECDSA P-256 key.');
     await JobStateFile.clearActiveJob();
 

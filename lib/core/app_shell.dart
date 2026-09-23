@@ -126,12 +126,14 @@ class _AppShellState extends State<AppShell> {
     final selectedIndex = _getSelectedIndex(context);
     final screenWidth = MediaQuery.of(context).size.width;
     final isCompact = screenWidth < 800;
+    final controller = context.watch<SanitizationController>();
 
     if (isCompact) {
       // Mobile/narrow: use bottom navigation
       return Scaffold(
         body: Column(
           children: [
+            if (!controller.isRealMode) _buildDemoModeBanner(controller),
             const SanitizationActiveBanner(),
             Expanded(child: widget.child),
           ],
@@ -144,6 +146,7 @@ class _AppShellState extends State<AppShell> {
     return Scaffold(
       body: Column(
         children: [
+          if (!controller.isRealMode) _buildDemoModeBanner(controller),
           const SanitizationActiveBanner(),
           Expanded(
             child: Row(
@@ -385,6 +388,40 @@ class _AppShellState extends State<AppShell> {
                   : Icons.chevron_right,
               color: AppTheme.textMuted,
               size: 20,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+  Widget _buildDemoModeBanner(SanitizationController controller) {
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: AppTheme.accentGold.withValues(alpha: 0.15),
+        border: Border(
+          bottom: BorderSide(
+            color: AppTheme.accentGold.withValues(alpha: 0.5),
+            width: 1.5,
+          ),
+        ),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: SafeArea(
+        bottom: false,
+        child: Row(
+          children: [
+            const Icon(Icons.science, color: AppTheme.accentGold, size: 18),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                '⚠ DEMO / SIMULATED MODE — No physical data will be destroyed',
+                style: GoogleFonts.inter(
+                  color: AppTheme.accentGold,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
             ),
           ],
         ),

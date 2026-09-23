@@ -10,6 +10,13 @@ import '../widgets/theme.dart';
 class ResultsScreen extends StatelessWidget {
   const ResultsScreen({super.key});
 
+  static String _formatNumber(int n) {
+    return n.toString().replaceAllMapped(
+      RegExp(r'(\d{1,3})(?=(\d{3})+(?!\d))'),
+      (Match m) => '${m[1]},',
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final controller = context.watch<SanitizationController>();
@@ -25,6 +32,13 @@ class ResultsScreen extends StatelessWidget {
 
     final evidence = cert.evidence;
     final isPassed = evidence.verifiedPassed;
+    final isSimulated = cert.executionMode == 'simulated';
+
+    // Dynamic sector calculations from device size (512 bytes / sector)
+    final totalSectors = job.device.capacityBytes ~/ 512;
+    final sampleCount = evidence.sampleOffsets.isNotEmpty ? evidence.sampleOffsets.length : (cert.verificationSampleCount ?? 50);
+    final totalSectorsFormatted = _formatNumber(totalSectors);
+    final entropyScore = cert.verificationEntropyScore ?? 0.0000;
 
     return Scaffold(
       appBar: AppBar(
@@ -39,6 +53,36 @@ class ResultsScreen extends StatelessWidget {
               // Step Progress Wizard Header
               const StepIndicator(currentStep: 5),
               const SizedBox(height: 16),
+
+              // Simulated vs Real Execution Mode indicator badge
+              if (isSimulated) ...[
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: AppTheme.accentGold.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: AppTheme.accentGold, width: 1.5),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.science, color: AppTheme.accentGold, size: 20),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'SIMULATED RECORD — No physical data was modified',
+                          style: TextStyle(
+                            color: AppTheme.accentGold,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 13,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+              ],
 
               // Status Header Banner
               Container(
@@ -172,6 +216,93 @@ class ResultsScreen extends StatelessWidget {
                   },
                 ),
               ),
+              const SizedBox(height: 16),
+
+              // Verification Confidence Card (Task 5)
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: AppTheme.surfaceDark,
+                  borderRadius: BorderRadius.circular(14),
+                  border: Border.all(color: AppTheme.accentBlue.withValues(alpha: 0.4)),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        const Icon(Icons.analytics_outlined, color: AppTheme.accentBlue, size: 20),
+                        const SizedBox(width: 8),
+                        Text(
+                          'VERIFICATION CONFIDENCE',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                            color: AppTheme.accentBlue,
+                            letterSpacing: 0.5,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text('Sample Coverage', style: TextStyle(fontSize: 11, color: AppTheme.textMuted)),
+                              const SizedBox(height: 2),
+                              Text(
+                                '$sampleCount sectors sampled out of $totalSectorsFormatted total sectors',
+                                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: AppTheme.textPrimary),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text('Shannon Entropy Score', style: TextStyle(fontSize: 11, color: AppTheme.textMuted)),
+                              const SizedBox(height: 2),
+                              Text(
+                                '${entropyScore.toStringAsFixed(4)} (Ideal zeroized: 0.0000)',
+                                style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: AppTheme.accentEmerald),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: AppTheme.surfaceCard,
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                      child: const Row(
+                        children: [
+                          Icon(Icons.info_outline, color: AppTheme.accentGold, size: 16),
+                          SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              'This is a statistical sampling check, not proof of total erasure. See Limitations for details.',
+                              style: TextStyle(fontSize: 11, color: AppTheme.textSecondary, fontStyle: FontStyle.italic),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
               const SizedBox(height: 20),
 
               // Tailored Limitations & What this Proves / Doesn't Prove Panel
@@ -202,7 +333,7 @@ class ResultsScreen extends StatelessWidget {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      '• Evaluates logical sector state across 50 pseudo-random LBA offsets.\n• Confirms firmware controller status payload response matches NIST SP 800-88r2 standards.',
+                      '• Evaluates logical sector state across $sampleCount pseudo-random LBA offsets.\n• Confirms firmware controller status payload response matches NIST SP 800-88r2 standards.',
                       style: const TextStyle(fontSize: 12, color: AppTheme.textSecondary, height: 1.4),
                     ),
                     const SizedBox(height: 12),

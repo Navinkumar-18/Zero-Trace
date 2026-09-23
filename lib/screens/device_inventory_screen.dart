@@ -3,6 +3,7 @@ import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 
 import '../models/device_profile.dart';
+import '../models/sanitization_support_level.dart';
 import '../services/sanitization_controller.dart';
 import '../widgets/dev_control_panel.dart';
 import '../widgets/step_indicator.dart';
@@ -594,6 +595,12 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
                       _getMediaColor(device.mediaType),
                       tooltip: device.mediaType.displayName,
                     ),
+                    if (!device.isSystemDisk)
+                      _buildBadge(
+                        computeSupportLevel(device).badgeLabel,
+                        computeSupportLevel(device).badgeColor,
+                        tooltip: supportLevelReason(device),
+                      ),
                     if (device.isHardwareEncrypted)
                       _buildBadge(
                         'TCG OPAL Encrypted',
@@ -665,13 +672,12 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
     if (device.hpaDcoPresent) {
       return 'Needs attention: Hidden HPA/DCO sectors detected';
     }
-    final hasAnySanitize = device.supportsAtaSanitize ||
-        device.supportsNvmeSanitize ||
-        device.supportsEmmcSanitize ||
-        device.supportsAtaSecureErase ||
-        device.isHardwareEncrypted;
-    if (!hasAnySanitize) {
-      return 'Needs attention: No hardware sanitize support';
+    final level = computeSupportLevel(device);
+    if (level == SanitizationSupportLevel.clearOnly) {
+      return 'Clear-only: ${supportLevelReason(device)}';
+    }
+    if (level == SanitizationSupportLevel.unsupported) {
+      return 'Unsupported: ${supportLevelReason(device)}';
     }
     return null;
   }

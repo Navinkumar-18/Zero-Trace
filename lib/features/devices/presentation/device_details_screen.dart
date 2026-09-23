@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 
 import '../../../models/device_profile.dart';
+import '../../../models/sanitization_support_level.dart';
 import '../../../models/storage_capability.dart';
 import '../../../services/sanitization_controller.dart';
 import '../../../widgets/theme.dart';
@@ -366,30 +367,21 @@ class DeviceDetailsScreen extends StatelessWidget {
   }
 
   Widget _buildRiskAndActions(BuildContext context, SanitizationController controller, DeviceProfile device) {
-    // Calculate quick risk indication
-    final hasAnySanitize = device.supportsAtaSanitize ||
-        device.supportsNvmeSanitize ||
-        device.supportsEmmcSanitize;
-    final hasSecureErase = device.supportsAtaSecureErase;
-    final hasEncryption = device.isHardwareEncrypted;
+    // Compute sanitization support level from the shared model
+    final supportLevel = computeSupportLevel(device);
+    final reason = supportLevelReason(device);
 
-    String riskLevel;
-    Color riskColor;
+    String badgeLabel;
+    Color badgeColor;
+    String badgeSubtitle;
     if (device.isSystemDisk) {
-      riskLevel = 'PROTECTED';
-      riskColor = AppTheme.accentRose;
-    } else if (hasAnySanitize || hasEncryption) {
-      riskLevel = 'MEDIUM';
-      riskColor = AppTheme.accentGold;
-    } else if (hasSecureErase) {
-      riskLevel = 'MEDIUM';
-      riskColor = AppTheme.accentGold;
-    } else if (device.mediaType == MediaType.hdd) {
-      riskLevel = 'LOW';
-      riskColor = AppTheme.accentEmerald;
+      badgeLabel = 'PROTECTED';
+      badgeColor = AppTheme.accentRose;
+      badgeSubtitle = 'SYSTEM DISK';
     } else {
-      riskLevel = 'HIGH';
-      riskColor = AppTheme.accentRose;
+      badgeLabel = supportLevel.badgeLabel;
+      badgeColor = supportLevel.badgeColor;
+      badgeSubtitle = 'SANITIZATION SUPPORT';
     }
 
     return Container(
@@ -407,7 +399,7 @@ class DeviceDetailsScreen extends StatelessWidget {
               const Icon(Icons.shield, color: AppTheme.accentGold, size: 20),
               const SizedBox(width: 10),
               Text(
-                'Risk & Actions',
+                'Support & Actions',
                 style: GoogleFonts.outfit(
                   color: AppTheme.textPrimary,
                   fontSize: 16,
@@ -418,29 +410,29 @@ class DeviceDetailsScreen extends StatelessWidget {
           ),
           const SizedBox(height: 16),
 
-          // Risk level badge
+          // Support level badge
           Container(
             width: double.infinity,
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: riskColor.withValues(alpha: 0.08),
+              color: badgeColor.withValues(alpha: 0.08),
               borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: riskColor.withValues(alpha: 0.3)),
+              border: Border.all(color: badgeColor.withValues(alpha: 0.3)),
             ),
             child: Column(
               children: [
                 Text(
-                  riskLevel,
+                  badgeLabel,
                   style: GoogleFonts.outfit(
-                    color: riskColor,
+                    color: badgeColor,
                     fontSize: 28,
                     fontWeight: FontWeight.w800,
                   ),
                 ),
                 Text(
-                  'RISK LEVEL',
+                  badgeSubtitle,
                   style: GoogleFonts.inter(
-                    color: riskColor,
+                    color: badgeColor,
                     fontSize: 10,
                     fontWeight: FontWeight.w600,
                   ),
@@ -448,6 +440,35 @@ class DeviceDetailsScreen extends StatelessWidget {
               ],
             ),
           ),
+
+          // Reason line
+          if (!device.isSystemDisk) ...[
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: badgeColor.withValues(alpha: 0.06),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: badgeColor.withValues(alpha: 0.2)),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.info_outline, color: badgeColor, size: 16),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      reason,
+                      style: GoogleFonts.inter(
+                        color: AppTheme.textSecondary,
+                        fontSize: 11,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
 
           const SizedBox(height: 20),
 

@@ -111,6 +111,46 @@ class SettingsScreen extends StatelessWidget {
               ),
               const SizedBox(height: 20),
 
+              // Known Limitations
+              _buildSection(
+                title: 'Known Limitations',
+                icon: Icons.report_problem_outlined,
+                color: AppTheme.accentOrange,
+                children: [
+                  _buildInfoTile(
+                    title: 'Flash Media Wear Remapping',
+                    subtitle: 'Overwrite cannot reach hidden or remapped flash blocks on SD cards and USB drives.',
+                    icon: Icons.memory,
+                    color: AppTheme.accentOrange,
+                  ),
+                  _buildInfoTile(
+                    title: 'Statistical Verification',
+                    subtitle: 'Verification is statistical (50 sampled sectors plus entropy check), not a full-media read.',
+                    icon: Icons.analytics_outlined,
+                    color: AppTheme.accentOrange,
+                  ),
+                  _buildInfoTile(
+                    title: 'Self-Signed Certificates',
+                    subtitle: 'Certificates are self-signed with a local key; they prove integrity, not third-party validation.',
+                    icon: Icons.vpn_key_outlined,
+                    color: AppTheme.accentOrange,
+                  ),
+                  _buildInfoTile(
+                    title: 'Operating Platform',
+                    subtitle: 'Currently supported platform: Linux.',
+                    icon: Icons.terminal,
+                    color: AppTheme.accentOrange,
+                  ),
+                  _buildInfoTile(
+                    title: 'Unsupported Media Types',
+                    subtitle: 'Not supported yet: smartphones, RAID volumes, optical media, tape.',
+                    icon: Icons.not_interested,
+                    color: AppTheme.accentOrange,
+                  ),
+                ],
+              ),
+              const SizedBox(height: 20),
+
               // Developer Tools
               _buildSection(
                 title: 'Developer Tools',

@@ -20,7 +20,7 @@ class PolicyLayer {
   };
 
   PolicyValidationResult validateOperation(SanitizationJob job) {
-    final method = job.recommendedMethod;
+    final method = job.effectiveMethod;
 
     // Safety Rule 2: Root disk check
     if (job.device.isSystemDisk || job.device.mountPoint == '/') {

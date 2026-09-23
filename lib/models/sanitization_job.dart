@@ -118,6 +118,8 @@ class SanitizationJob {
   DateTime? endTime;
   List<String> logs;
   bool shouldSimulateFailure;
+  SanitizationMethod? overriddenMethod;
+  bool destroyAcknowledged;
 
   SanitizationJob({
     required this.jobId,
@@ -137,15 +139,27 @@ class SanitizationJob {
     this.endTime,
     List<String>? logs,
     this.shouldSimulateFailure = false,
+    this.overriddenMethod,
+    this.destroyAcknowledged = false,
   }) : logs = logs ?? [];
 
-  /// The effective NIST category achieved by the recommended sanitization method.
+  /// The method that will actually be executed (overridden if user selected an alternative).
+  SanitizationMethod get effectiveMethod => overriddenMethod ?? recommendedMethod;
+
+  /// The effective NIST category achieved by the sanitization method.
   NistCategory get effectiveNistCategory {
+    final method = effectiveMethod;
+    if (method == SanitizationMethod.physicalDestructionRecommended ||
+        method == SanitizationMethod.unsupportedFlagForDestroy) {
+      return NistCategory.destroy;
+    }
     final ref = standardReference.toLowerCase();
-    if (ref.contains('destroy')) return NistCategory.destroy;
-    if (ref.contains('purge')) return NistCategory.purge;
-    if (ref.contains('clear')) return NistCategory.clear;
-    return recommendedMethod.nistCategory;
+    if (overriddenMethod == null) {
+      if (ref.contains('destroy')) return NistCategory.destroy;
+      if (ref.contains('purge')) return NistCategory.purge;
+      if (ref.contains('clear')) return NistCategory.clear;
+    }
+    return method.nistCategory;
   }
 
   /// Display name of the effective NIST category (e.g. "CLEAR (Logical Protection)").

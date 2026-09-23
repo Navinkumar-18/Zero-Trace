@@ -1,25 +1,74 @@
 import '../models/device_profile.dart';
 import '../models/sanitization_job.dart';
+import '../models/sanitization_support_level.dart';
 
 class RecommendationResult {
   final SanitizationMethod method;
   final String standardReference;
   final String explanation;
+  final String reason;
 
   RecommendationResult({
     required this.method,
     required this.standardReference,
     required this.explanation,
+    this.reason = '',
   });
 }
 
 abstract class IRecommendationService {
-  RecommendationResult selectMethod(DeviceProfile profile, double riskScore, NistCategory targetCategory);
+  RecommendationResult selectMethod(
+    DeviceProfile profile,
+    double riskScore,
+    NistCategory targetCategory, {
+    DataSensitivity sensitivity = DataSensitivity.public,
+  });
 }
 
 class RecommendationService implements IRecommendationService {
   @override
-  RecommendationResult selectMethod(DeviceProfile profile, double riskScore, NistCategory targetCategory) {
+  RecommendationResult selectMethod(
+    DeviceProfile profile,
+    double riskScore,
+    NistCategory targetCategory, {
+    DataSensitivity sensitivity = DataSensitivity.public,
+  }) {
+    // 0. Flash-media Destroy guard:
+    // If device is clearOnly AND data is high-sensitivity (confidential/restricted)
+    // AND the device is flash media (not HDD), recommend physical destruction.
+    final supportLevel = computeSupportLevel(profile);
+    if (supportLevel == SanitizationSupportLevel.clearOnly &&
+        (sensitivity == DataSensitivity.confidential || sensitivity == DataSensitivity.restricted)) {
+      // Only apply to flash media — HDD overwrite is effective for magnetic media
+      if (profile.mediaType != MediaType.hdd) {
+        final mediaLabel = profile.mediaType.displayName;
+        return RecommendationResult(
+          method: SanitizationMethod.physicalDestructionRecommended,
+          standardReference: 'NIST SP 800-88r2 Destroy / IEEE 2883:2022 Physical Destruction',
+          explanation:
+              '$mediaLabel without firmware-level purge cannot be reliably purged. '
+              'Overwrite cannot reach remapped or over-provisioned flash blocks. '
+              'Physical destruction is recommended for ${sensitivity.name} data '
+              'per NIST SP 800-88.',
+          reason:
+              'Clear-only flash media with ${sensitivity.name} data requires '
+              'physical destruction (NIST SP 800-88).',
+        );
+      }
+    }
+
+    // Unsupported media → always Destroy
+    if (supportLevel == SanitizationSupportLevel.unsupported) {
+      return RecommendationResult(
+        method: SanitizationMethod.unsupportedFlagForDestroy,
+        standardReference: 'NIST SP 800-88r2 Destroy / IEEE 2883:2022 Unknown Media',
+        explanation:
+            'Media type and bus characteristics cannot be safely verified. '
+            'Mandatory physical destruction required.',
+        reason: 'Unknown/unsupported media type.',
+      );
+    }
+
     // 1. Mandatory Destroy branch
     if (targetCategory == NistCategory.destroy) {
       return RecommendationResult(
@@ -135,6 +184,7 @@ class RecommendationService implements IRecommendationService {
           method: SanitizationMethod.unsupportedFlagForDestroy,
           standardReference: 'NIST SP 800-88r2 Destroy / IEEE 2883:2022 Unknown Media',
           explanation: 'Media type and bus characteristics cannot be safely verified. Mandatory physical destruction required.',
+          reason: 'Unknown/unsupported media type.',
         );
     }
   }
