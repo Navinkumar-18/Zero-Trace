@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 
 import '../models/device_profile.dart';
 import '../models/sanitization_job.dart';
+import '../models/sanitization_support_level.dart';
 import '../services/sanitization_controller.dart';
 import '../widgets/step_indicator.dart';
 import '../widgets/theme.dart';
@@ -24,6 +25,7 @@ class RiskAssessmentScreen extends StatelessWidget {
     }
 
     final job = controller.currentJob;
+    final supportLevel = computeSupportLevel(device);
 
     return Scaffold(
       appBar: AppBar(
@@ -109,7 +111,7 @@ class RiskAssessmentScreen extends StatelessWidget {
               _buildDropdownCard(
                 context: context,
                 title: '1. Data Sensitivity Level',
-                subtitle: 'Weighted 50% of risk score · Security sensitivity tier of residual data on media',
+                subtitle: 'Weighted 50% of data exposure score · Security sensitivity tier of residual data on media',
                 icon: Icons.shield_outlined,
                 child: DropdownButtonFormField<DataSensitivity>(
                   initialValue: controller.dataSensitivity,
@@ -139,7 +141,7 @@ class RiskAssessmentScreen extends StatelessWidget {
               _buildDropdownCard(
                 context: context,
                 title: '2. Device Integrity',
-                subtitle: 'Weighted 20% of risk score · Physical condition and firmware SMART diagnostics',
+                subtitle: 'Weighted 20% of data exposure score · Physical condition and firmware SMART diagnostics',
                 icon: Icons.health_and_safety_outlined,
                 child: DropdownButtonFormField<DeviceCondition>(
                   initialValue: controller.deviceCondition,
@@ -167,7 +169,7 @@ class RiskAssessmentScreen extends StatelessWidget {
               _buildDropdownCard(
                 context: context,
                 title: '3. Asset Disposal Channel',
-                subtitle: 'Weighted 30% of risk score · Intended lifecycle destination post-sanitization',
+                subtitle: 'Weighted 30% of data exposure score · Intended lifecycle destination post-sanitization',
                 icon: Icons.alt_route_outlined,
                 child: DropdownButtonFormField<DisposalPath>(
                   initialValue: controller.disposalPath,
@@ -206,6 +208,7 @@ class RiskAssessmentScreen extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Container(
                             padding: const EdgeInsets.all(10),
@@ -216,39 +219,74 @@ class RiskAssessmentScreen extends StatelessWidget {
                             child: Icon(Icons.analytics, color: _getRiskColor(job.riskScore), size: 22),
                           ),
                           const SizedBox(width: 12),
-                          Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                'Risk Score: ${(job.riskScore * 100).toStringAsFixed(1)}%',
-                                style: TextStyle(
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.bold,
-                                  color: _getRiskColor(job.riskScore),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'Data Exposure Score: ${(job.riskScore * 100).toStringAsFixed(1)}%',
+                                  style: TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.bold,
+                                    color: _getRiskColor(job.riskScore),
+                                  ),
                                 ),
+                                const SizedBox(height: 3),
+                                const Text(
+                                  'Based on data sensitivity, device condition and disposal channel. Independent of device type.',
+                                  style: TextStyle(fontSize: 11, color: AppTheme.textMuted, height: 1.3),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 16),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.end,
+                            children: [
+                              Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                                    decoration: BoxDecoration(
+                                      color: supportLevel.badgeColor.withValues(alpha: 0.15),
+                                      borderRadius: BorderRadius.circular(8),
+                                      border: Border.all(color: supportLevel.badgeColor.withValues(alpha: 0.5)),
+                                    ),
+                                    child: Text(
+                                      _getSupportLevelBadgeText(supportLevel),
+                                      style: TextStyle(
+                                        color: supportLevel.badgeColor,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 11,
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                    decoration: BoxDecoration(
+                                      color: _getNistBadgeColor(job).withValues(alpha: 0.2),
+                                      borderRadius: BorderRadius.circular(12),
+                                      border: Border.all(color: _getNistBadgeColor(job)),
+                                    ),
+                                    child: Text(
+                                      _getEffectiveNistCategory(job),
+                                      style: TextStyle(
+                                        color: _getNistBadgeColor(job),
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 12,
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ),
+                              const SizedBox(height: 6),
                               const Text(
-                                'Evaluated via weighted risk formula',
+                                'Recommendation also considers device support level.',
                                 style: TextStyle(fontSize: 11, color: AppTheme.textMuted),
                               ),
                             ],
-                          ),
-                          const Spacer(),
-                          Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                            decoration: BoxDecoration(
-                              color: _getNistBadgeColor(job).withValues(alpha: 0.2),
-                              borderRadius: BorderRadius.circular(12),
-                              border: Border.all(color: _getNistBadgeColor(job)),
-                            ),
-                            child: Text(
-                              _getEffectiveNistCategory(job),
-                              style: TextStyle(
-                                color: _getNistBadgeColor(job),
-                                fontWeight: FontWeight.bold,
-                                fontSize: 12,
-                              ),
-                            ),
                           ),
                         ],
                       ),
@@ -313,6 +351,17 @@ class RiskAssessmentScreen extends StatelessWidget {
 
   String _getEffectiveNistCategory(SanitizationJob job) {
     return job.effectiveNistCategoryShort;
+  }
+
+  String _getSupportLevelBadgeText(SanitizationSupportLevel level) {
+    switch (level) {
+      case SanitizationSupportLevel.full:
+        return 'Full';
+      case SanitizationSupportLevel.clearOnly:
+        return 'Clear-only';
+      case SanitizationSupportLevel.unsupported:
+        return 'Unsupported';
+    }
   }
 
   Color _getNistBadgeColor(SanitizationJob job) {

@@ -98,11 +98,11 @@ class RiskScoringService {
   }) {
     final pct = (score * 100).toStringAsFixed(1);
     if (category == NistCategory.destroy) {
-      return 'Risk score is High ($pct%). Target category requires physical destruction due to high data sensitivity (${dataSensitivity.name}) or critical disposal path (${disposalPath.name}).';
+      return 'Data exposure score is High ($pct%). Target category requires physical destruction due to high data sensitivity (${dataSensitivity.name}) or critical disposal path (${disposalPath.name}).';
     } else if (category == NistCategory.purge) {
-      return 'Risk score is Moderate ($pct%). Target category requires PURGE (firmware/controller-level erase or cryptographic key destruction) to safeguard confidential data prior to ${disposalPath.name}.';
+      return 'Data exposure score is Moderate ($pct%). Target category requires PURGE (firmware/controller-level erase or cryptographic key destruction) to safeguard confidential data prior to ${disposalPath.name}.';
     } else {
-      return 'Risk score is Low ($pct%). Target category CLEAR (logical pass overwrite) is sufficient for ${dataSensitivity.name} data under ${disposalPath.name}.';
+      return 'Data exposure score is Low ($pct%). Target category CLEAR (logical pass overwrite) is sufficient for ${dataSensitivity.name} data under ${disposalPath.name}.';
     }
   }
 }
