@@ -18,7 +18,7 @@ class ZeroTraceApp extends StatelessWidget {
     return ChangeNotifierProvider(
       create: (_) => SanitizationController(),
       child: MaterialApp.router(
-        title: 'Zero Trace 2.0',
+        title: 'Zero Trace',
         debugShowCheckedModeBanner: false,
         theme: AppTheme.lightTheme,
         routerConfig: appRouter,
