@@ -272,7 +272,9 @@ class ResultsScreen extends StatelessWidget {
                               const Text('Shannon Entropy Score', style: TextStyle(fontSize: 11, color: AppTheme.textMuted)),
                               const SizedBox(height: 2),
                               Text(
-                                '${entropyScore.toStringAsFixed(4)} (Ideal zeroized: 0.0000)',
+                                cert.method.toLowerCase().contains('crypto') || cert.method.toLowerCase().contains('reverttper')
+                                    ? '${entropyScore.toStringAsFixed(4)} (Ciphertext/zero: >0.70 or 0.00)'
+                                    : '${entropyScore.toStringAsFixed(4)} (Ideal zeroized: 0.0000)',
                                 style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: AppTheme.accentEmerald),
                               ),
                             ],

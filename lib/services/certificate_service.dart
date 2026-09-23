@@ -110,6 +110,26 @@ class CertificateService {
     };
   }
 
+  /// Exact method strings emitted by zt_engine (execute.rs) and Flutter simulated mode
+  /// that correspond to verified firmware-level Purge commands.
+  static const Set<String> _validPurgeMethodNames = {
+    // Exact method_used strings from zt_engine (native/zt_engine/src/execute.rs)
+    'ata secure erase',
+    'ata enhanced secure erase',
+    'ata sanitize block erase',
+    'ata sanitize crypto scramble',
+    'nvme sanitize (start-block-erase)',
+    'nvme sanitize (start-crypto-erase)',
+    'tcg opal cryptographic erase (reverttper)',
+    'emmc sanitize',
+
+    // Flutter simulated mode method display names (SanitizationMethodExtension.displayName)
+    'cryptographic erase (ce)',
+    'ata secure erase (controller-level)',
+    'nvme sanitize (block / crypto erase)',
+    'emmc sanitize / secure trim',
+  };
+
   /// Derives whether the actually executed action achieved Clear, Purge, or Destroy.
   static String deriveSanitizationCategory({
     required SanitizationMethod method,
@@ -118,12 +138,16 @@ class CertificateService {
     required bool isSuccess,
   }) {
     if (!isSuccess) return 'Failed';
-    if (method == SanitizationMethod.physicalDestructionRecommended ||
-        method == SanitizationMethod.unsupportedFlagForDestroy) {
-      return 'Destroy';
-    }
 
-    final executedLower = (actualMethodExecuted ?? method.displayName).toLowerCase();
+    final executedLower = (actualMethodExecuted ?? method.displayName).toLowerCase().trim();
+
+    // The software does not physically destroy devices.
+    if (method == SanitizationMethod.physicalDestructionRecommended ||
+        method == SanitizationMethod.unsupportedFlagForDestroy ||
+        executedLower.contains('physical destruction') ||
+        executedLower.contains('destroy')) {
+      return 'Destroy recommended, not performed';
+    }
 
     // Overwrite operations are ALWAYS Clear per NIST SP 800-88
     if (method == SanitizationMethod.singlePassOverwrite ||
@@ -147,22 +171,13 @@ class CertificateService {
       return 'Clear';
     }
 
-    // Firmware purge / crypto erase commands actually executed
-    final isPurgeCommand = method == SanitizationMethod.cryptographicErase ||
-        method == SanitizationMethod.ataSecureErase ||
-        method == SanitizationMethod.ataSanitizeBlockErase ||
-        method == SanitizationMethod.nvmeSanitize ||
-        method == SanitizationMethod.emmcSanitize ||
-        executedLower.contains('sanitize') ||
-        executedLower.contains('secure erase') ||
-        executedLower.contains('cryptographic') ||
-        executedLower.contains('crypto') ||
-        executedLower.contains('format');
-
-    if (isPurgeCommand) {
+    // Only exact verified firmware-level purge commands qualify for Purge.
+    // Filesystem formats, standard NVMe formats without sanitize, or unknown strings default to Clear.
+    if (_validPurgeMethodNames.contains(executedLower)) {
       return 'Purge';
     }
 
+    // Default to the safer label
     return 'Clear';
   }
 

@@ -365,7 +365,10 @@ class SanitizationController extends ChangeNotifier {
         notifyListeners();
 
         final cliMethod = _realSanitizeService.mapMethodToCliArg(job.effectiveMethod, job.device);
-        final expectZeros = job.effectiveMethod != SanitizationMethod.cryptographicErase;
+        final isCryptoMethod = job.effectiveMethod == SanitizationMethod.cryptographicErase ||
+            report.methodUsed.toLowerCase().contains('crypto') ||
+            report.methodUsed.toLowerCase().contains('reverttper');
+        final expectZeros = !isCryptoMethod;
 
         RealVerificationReport? verifyReport;
         try {

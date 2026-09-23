@@ -64,7 +64,7 @@ void main() {
         job: job,
         evidence: testEvidence,
         executionMode: 'simulated',
-        actualMethodExecuted: 'NVMe Sanitize (Block Erase)',
+        actualMethodExecuted: 'NVMe Sanitize (start-block-erase)',
       );
 
       expect(cert.certVersion, 2);
@@ -112,44 +112,178 @@ void main() {
       expect(service.verifyCertificateSignature(json), isTrue);
     });
 
+    const sataSsdDevice = DeviceProfile(
+      id: 'sda',
+      name: 'Crucial MX500 500GB',
+      serialNumber: 'CT500MX500123',
+      mediaType: MediaType.sataSsd,
+      busType: 'SATA',
+      capacityBytes: 500000000000,
+      supportsAtaSecureErase: true,
+      supportsAtaSanitize: true,
+    );
+
     group('Derive sanitizationCategory rules', () {
-      test('Flash media running overwrite gets Clear even if target was Purge', () {
-        final category = CertificateService.deriveSanitizationCategory(
+      test('overwrite -> Clear', () {
+        // Test single-pass zero overwrite
+        final cat1 = CertificateService.deriveSanitizationCategory(
+          method: SanitizationMethod.singlePassOverwrite,
+          device: nvmeDevice,
+          actualMethodExecuted: 'Software Overwrite (1-pass, Zeros)',
+          isSuccess: true,
+        );
+        expect(cat1, 'Clear');
+
+        // Test multi-pass overwrite
+        final cat2 = CertificateService.deriveSanitizationCategory(
+          method: SanitizationMethod.multiPassOverwrite,
+          device: nvmeDevice,
+          actualMethodExecuted: 'Software Overwrite (3-pass, NistLegacy3Pass)',
+          isSuccess: true,
+        );
+        expect(cat2, 'Clear');
+
+        // Test ATA Sanitize Overwrite
+        final cat3 = CertificateService.deriveSanitizationCategory(
+          method: SanitizationMethod.singlePassOverwrite,
+          device: sataSsdDevice,
+          actualMethodExecuted: 'ATA Sanitize Overwrite',
+          isSuccess: true,
+        );
+        expect(cat3, 'Clear');
+
+        // Test Flash media without firmware purge running overwrite
+        final cat4 = CertificateService.deriveSanitizationCategory(
           method: SanitizationMethod.singlePassOverwrite,
           device: usbDevice,
           actualMethodExecuted: 'Single-Pass Zero Overwrite',
           isSuccess: true,
         );
-        expect(category, 'Clear');
+        expect(cat4, 'Clear');
       });
 
-      test('Firmware sanitize command on NVMe gets Purge', () {
-        final category = CertificateService.deriveSanitizationCategory(
-          method: SanitizationMethod.nvmeSanitize,
-          device: nvmeDevice,
-          actualMethodExecuted: 'NVMe Sanitize (Crypto Erase)',
+      test('secure erase success -> Purge', () {
+        // Test ATA Secure Erase
+        final cat1 = CertificateService.deriveSanitizationCategory(
+          method: SanitizationMethod.ataSecureErase,
+          device: sataSsdDevice,
+          actualMethodExecuted: 'ATA Secure Erase',
           isSuccess: true,
         );
-        expect(category, 'Purge');
+        expect(cat1, 'Purge');
+
+        // Test ATA Enhanced Secure Erase
+        final cat2 = CertificateService.deriveSanitizationCategory(
+          method: SanitizationMethod.ataSecureErase,
+          device: sataSsdDevice,
+          actualMethodExecuted: 'ATA Enhanced Secure Erase',
+          isSuccess: true,
+        );
+        expect(cat2, 'Purge');
+
+        // Test ATA Sanitize Block Erase
+        final cat3 = CertificateService.deriveSanitizationCategory(
+          method: SanitizationMethod.ataSanitizeBlockErase,
+          device: sataSsdDevice,
+          actualMethodExecuted: 'ATA Sanitize Block Erase',
+          isSuccess: true,
+        );
+        expect(cat3, 'Purge');
       });
 
-      test('Failed execution gets Failed', () {
+      test('nvme sanitize -> Purge', () {
+        // Test NVMe Sanitize (start-block-erase)
+        final cat1 = CertificateService.deriveSanitizationCategory(
+          method: SanitizationMethod.nvmeSanitize,
+          device: nvmeDevice,
+          actualMethodExecuted: 'NVMe Sanitize (start-block-erase)',
+          isSuccess: true,
+        );
+        expect(cat1, 'Purge');
+
+        // Test NVMe Sanitize (start-crypto-erase)
+        final cat2 = CertificateService.deriveSanitizationCategory(
+          method: SanitizationMethod.nvmeSanitize,
+          device: nvmeDevice,
+          actualMethodExecuted: 'NVMe Sanitize (start-crypto-erase)',
+          isSuccess: true,
+        );
+        expect(cat2, 'Purge');
+
+        // Test Flutter simulated mode display name
+        final cat3 = CertificateService.deriveSanitizationCategory(
+          method: SanitizationMethod.nvmeSanitize,
+          device: nvmeDevice,
+          actualMethodExecuted: 'NVMe Sanitize (Block / Crypto Erase)',
+          isSuccess: true,
+        );
+        expect(cat3, 'Purge');
+      });
+
+      test('unknown string -> Clear (default to the safer label)', () {
+        // Filesystem formats must NOT return Purge
+        final cat1 = CertificateService.deriveSanitizationCategory(
+          method: SanitizationMethod.singlePassOverwrite,
+          device: nvmeDevice,
+          actualMethodExecuted: 'mkfs.ext4 /dev/nvme0n1',
+          isSuccess: true,
+        );
+        expect(cat1, 'Clear');
+
+        // NVMe format without secure erase parameters
+        final cat2 = CertificateService.deriveSanitizationCategory(
+          method: SanitizationMethod.singlePassOverwrite,
+          device: nvmeDevice,
+          actualMethodExecuted: 'NVMe Format (Namespace Format)',
+          isSuccess: true,
+        );
+        expect(cat2, 'Clear');
+
+        // Arbitrary tool / unknown string defaults to Clear
+        final cat3 = CertificateService.deriveSanitizationCategory(
+          method: SanitizationMethod.singlePassOverwrite,
+          device: nvmeDevice,
+          actualMethodExecuted: 'custom-vendor-erase-tool',
+          isSuccess: true,
+        );
+        expect(cat3, 'Clear');
+      });
+
+      test('failed -> Failed', () {
         final category = CertificateService.deriveSanitizationCategory(
           method: SanitizationMethod.nvmeSanitize,
           device: nvmeDevice,
-          actualMethodExecuted: 'NVMe Sanitize',
+          actualMethodExecuted: 'NVMe Sanitize (start-block-erase)',
           isSuccess: false,
         );
         expect(category, 'Failed');
       });
 
-      test('Physical destruction method gets Destroy', () {
-        final category = CertificateService.deriveSanitizationCategory(
+      test('physical destruction recommended -> not "Destroy" ("Destroy recommended, not performed")', () {
+        final cat1 = CertificateService.deriveSanitizationCategory(
           method: SanitizationMethod.physicalDestructionRecommended,
           device: usbDevice,
           isSuccess: true,
         );
-        expect(category, 'Destroy');
+        expect(cat1, isNot(equals('Destroy')));
+        expect(cat1, 'Destroy recommended, not performed');
+
+        final cat2 = CertificateService.deriveSanitizationCategory(
+          method: SanitizationMethod.unsupportedFlagForDestroy,
+          device: usbDevice,
+          isSuccess: true,
+        );
+        expect(cat2, isNot(equals('Destroy')));
+        expect(cat2, 'Destroy recommended, not performed');
+
+        final cat3 = CertificateService.deriveSanitizationCategory(
+          method: SanitizationMethod.singlePassOverwrite,
+          device: usbDevice,
+          actualMethodExecuted: 'Physical Destruction',
+          isSuccess: true,
+        );
+        expect(cat3, isNot(equals('Destroy')));
+        expect(cat3, 'Destroy recommended, not performed');
       });
     });
 
