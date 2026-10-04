@@ -16,6 +16,6 @@ pub mod certificate;
 
 /// Re-export primary types for FFI consumers
 pub use detect::{DeviceCapabilities, BusType, SmartHealth, DurationClass};
-pub use execute::{ExecutionReport, ProgressEvent, ExecutionPhase, SanitizeAction, AtaSanitizeAction, OverwritePattern};
+pub use execute::{ExecutionReport, ProgressEvent, ExecutionPhase, SanitizeAction, AtaSanitizeAction, OverwritePattern, FsContext, check_boot_disk_protection, check_boot_disk_protection_ctx};
 pub use verify::{VerificationReport, SampleResult};
 pub use certificate::{SignedCertificate, SigningMethod};

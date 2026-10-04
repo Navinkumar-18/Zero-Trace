@@ -257,21 +257,41 @@ async fn test_boot_disk_protection_blocks_root_device() {
         .and_then(|line| line.split_whitespace().next())
         .unwrap_or("/dev/sda1");
 
-    // Extract base device (e.g., /dev/sda from /dev/sda1)
-    let base = root_device.trim_end_matches(|c: char| c.is_ascii_digit());
+    // Extract base device (e.g., /dev/sda from /dev/sda1, /dev/nvme0n1 from /dev/nvme0n1p6)
+    let base = if (root_device.starts_with("/dev/nvme") || root_device.starts_with("/dev/mmcblk"))
+        && root_device.contains('p')
+    {
+        let idx = root_device.rfind('p').unwrap();
+        &root_device[..idx]
+    } else {
+        root_device.trim_end_matches(|c: char| c.is_ascii_digit())
+    };
 
     let (tx, _rx) = mpsc::channel::<ProgressEvent>(16);
 
+    // Test whole disk
     let result = nvme_sanitize(
         base,
         SanitizeAction::BlockErase,
         "any_token",
         "any_token",
         true,                  // even in dry-run, boot protection should fire
+        tx.clone(),
+    ).await;
+
+    assert!(result.is_err(), "Boot disk protection should block root base disk: {}", base);
+
+    // Also test root partition itself
+    let part_result = nvme_sanitize(
+        root_device,
+        SanitizeAction::BlockErase,
+        "any_token",
+        "any_token",
+        true,
         tx,
     ).await;
 
-    assert!(result.is_err(), "Boot disk protection should block root device: {}", base);
+    assert!(part_result.is_err(), "Boot disk protection should block root partition: {}", root_device);
 }
 
 // =========================================================================

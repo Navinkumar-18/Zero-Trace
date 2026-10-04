@@ -288,10 +288,10 @@ pub fn parse_hdparm_output(stdout: &str) -> HdparmData {
             let trimmed = line.trim().to_lowercase();
 
             // "enabled" without "not" prefix on the same line
-            if trimmed == "enabled" || (trimmed.contains("enabled") && !trimmed.contains("not")) {
-                if !trimmed.contains("enhanced erase") {
-                    data.security_enabled = true;
-                }
+            if (trimmed == "enabled" || (trimmed.contains("enabled") && !trimmed.contains("not")))
+                && !trimmed.contains("enhanced erase")
+            {
+                data.security_enabled = true;
             }
 
             if trimmed == "not\tenabled" || trimmed == "not\t enabled" || trimmed == "not enabled" {
