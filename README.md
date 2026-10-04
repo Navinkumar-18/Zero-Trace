@@ -67,3 +67,10 @@ cd native/zt_engine
 cargo test
 cargo build --release
 ```
+
+---
+
+## License
+
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+

@@ -3,6 +3,7 @@ name = "zt_engine"
 version = "0.1.0"
 edition = "2021"
 description = "Zero Trace 2.0 — Rust execution engine for NIST SP 800-88 secure data sanitization"
+license = "MIT"
 
 [lib]
 crate-type = ["cdylib", "staticlib", "lib"]
