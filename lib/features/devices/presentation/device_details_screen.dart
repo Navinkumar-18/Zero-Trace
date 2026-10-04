@@ -33,7 +33,7 @@ class DeviceDetailsScreen extends StatelessWidget {
               ),
               const SizedBox(height: 16),
               OutlinedButton(
-                onPressed: () => context.go('/devices'),
+                onPressed: () => context.go('/advanced/devices'),
                 child: const Text('Back to Devices'),
               ),
             ],
@@ -67,7 +67,7 @@ class DeviceDetailsScreen extends StatelessWidget {
                 children: [
                   IconButton(
                     icon: const Icon(Icons.arrow_back, color: AppTheme.textSecondary),
-                    onPressed: () => context.go('/devices'),
+                    onPressed: () => context.go('/advanced/devices'),
                   ),
                   const SizedBox(width: 8),
                   Text(
@@ -512,7 +512,7 @@ class DeviceDetailsScreen extends StatelessWidget {
                     ? null
                     : () {
                         controller.selectDevice(device);
-                        context.go('/sanitize');
+                        context.go('/advanced/sanitize');
                       },
               ),
             ),
@@ -522,7 +522,7 @@ class DeviceDetailsScreen extends StatelessWidget {
               child: OutlinedButton.icon(
                 icon: const Icon(Icons.psychology, size: 18),
                 label: const Text('ASK AI ABOUT THIS DEVICE'),
-                onPressed: () => context.go('/ai-assistant'),
+                onPressed: () => context.go('/advanced/ai'),
               ),
             ),
           ],

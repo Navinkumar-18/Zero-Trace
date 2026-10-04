@@ -360,7 +360,7 @@ class ResultsScreen extends StatelessWidget {
                   icon: const Icon(Icons.picture_as_pdf, size: 20),
                   label: const Text('VIEW & EXPORT AUDIT CERTIFICATE'),
                   onPressed: () {
-                    context.go('/certificates');
+                    context.go('/advanced/certificates');
                   },
                 ),
               ),

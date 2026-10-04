@@ -156,7 +156,7 @@ class _SanitizationActiveBannerState extends State<SanitizationActiveBanner>
                 style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
               ),
               onPressed: () {
-                context.go('/sanitize/progress');
+                context.go('/advanced/sanitize/progress');
               },
             ),
           ],

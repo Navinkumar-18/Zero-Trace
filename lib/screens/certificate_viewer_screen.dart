@@ -146,7 +146,7 @@ class _CertificateViewerScreenState extends State<CertificateViewerScreen> with 
           icon: const Icon(Icons.home),
           label: const Text('RETURN TO INVENTORY'),
           onPressed: () {
-            context.go('/dashboard');
+            context.go('/advanced/dashboard');
           },
         ),
       ),

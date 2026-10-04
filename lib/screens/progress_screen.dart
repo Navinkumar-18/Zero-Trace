@@ -258,7 +258,7 @@ class ProgressScreen extends StatelessWidget {
                     icon: const Icon(Icons.assessment, size: 20),
                     label: const Text('PROCEED TO VERIFICATION & CERTIFICATE'),
                     onPressed: () {
-                      context.go('/verification');
+                      context.go('/advanced/verification');
                     },
                   ),
                 ),
