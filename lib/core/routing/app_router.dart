@@ -13,34 +13,55 @@ import '../../screens/sanitization_workflow_screen.dart';
 import '../../screens/progress_screen.dart';
 import '../../screens/results_screen.dart';
 import '../../screens/certificate_viewer_screen.dart';
+import '../../simple/simple_shell.dart';
+import '../../simple/drive_list_screen.dart';
+import '../../simple/drive_detail_screen.dart';
 
 final GlobalKey<NavigatorState> _rootNavigatorKey = GlobalKey<NavigatorState>();
-final GlobalKey<NavigatorState> _shellNavigatorKey = GlobalKey<NavigatorState>();
+final GlobalKey<NavigatorState> _simpleShellKey = GlobalKey<NavigatorState>(debugLabel: 'simple');
+final GlobalKey<NavigatorState> _advancedShellKey = GlobalKey<NavigatorState>(debugLabel: 'advanced');
 
 final GoRouter appRouter = GoRouter(
   navigatorKey: _rootNavigatorKey,
-  initialLocation: '/dashboard',
+  initialLocation: '/',
   routes: [
+    // ─── Simple Mode routes (default) ───
     ShellRoute(
-      navigatorKey: _shellNavigatorKey,
+      navigatorKey: _simpleShellKey,
+      builder: (context, state, child) => SimpleShell(child: child),
+      routes: [
+        GoRoute(
+          path: '/',
+          pageBuilder: (context, state) => const NoTransitionPage(
+            child: DriveListScreen(),
+          ),
+        ),
+        GoRoute(
+          path: '/drive/:deviceId',
+          builder: (context, state) => DriveDetailScreen(
+            deviceId: state.pathParameters['deviceId'] ?? '',
+          ),
+        ),
+      ],
+    ),
+
+    // ─── Advanced Mode routes (under /advanced/*) ───
+    ShellRoute(
+      navigatorKey: _advancedShellKey,
       builder: (context, state, child) => AppShell(child: child),
       routes: [
-        // Dashboard
         GoRoute(
-          path: '/dashboard',
+          path: '/advanced/dashboard',
           pageBuilder: (context, state) => const NoTransitionPage(
             child: DashboardScreen(),
           ),
         ),
-
-        // Devices — inventory list
         GoRoute(
-          path: '/devices',
+          path: '/advanced/devices',
           pageBuilder: (context, state) => const NoTransitionPage(
             child: DeviceInventoryScreen(),
           ),
           routes: [
-            // Device details sub-route
             GoRoute(
               path: 'details/:deviceId',
               builder: (context, state) => DeviceDetailsScreen(
@@ -49,10 +70,8 @@ final GoRouter appRouter = GoRouter(
             ),
           ],
         ),
-
-        // Sanitize — risk assessment entry point
         GoRoute(
-          path: '/sanitize',
+          path: '/advanced/sanitize',
           pageBuilder: (context, state) => const NoTransitionPage(
             child: RiskAssessmentScreen(),
           ),
@@ -67,18 +86,14 @@ final GoRouter appRouter = GoRouter(
             ),
           ],
         ),
-
-        // Verification — results screen
         GoRoute(
-          path: '/verification',
+          path: '/advanced/verification',
           pageBuilder: (context, state) => const NoTransitionPage(
             child: ResultsScreen(),
           ),
         ),
-
-        // Certificates
         GoRoute(
-          path: '/certificates',
+          path: '/advanced/certificates',
           pageBuilder: (context, state) => const NoTransitionPage(
             child: CertificateViewerScreen(),
           ),
@@ -90,49 +105,82 @@ final GoRouter appRouter = GoRouter(
             ),
           ],
         ),
-
-        // AI Assistant
         GoRoute(
-          path: '/ai-assistant',
+          path: '/advanced/ai',
           pageBuilder: (context, state) => const NoTransitionPage(
             child: AiAssistantScreen(),
           ),
         ),
-
-        // Settings
         GoRoute(
-          path: '/settings',
+          path: '/advanced/settings',
           pageBuilder: (context, state) => const NoTransitionPage(
             child: SettingsScreen(),
+          ),
+        ),
+        GoRoute(
+          path: '/advanced/cert-verify',
+          pageBuilder: (context, state) => const NoTransitionPage(
+            child: CertificateVerificationScreen(),
+          ),
+        ),
+        GoRoute(
+          path: '/advanced/audit',
+          pageBuilder: (context, state) => const NoTransitionPage(
+            child: CertificateViewerScreen(),
           ),
         ),
       ],
     ),
 
-    // Legacy routes (redirect to new paths)
+    // ─── Legacy redirects (old routes → advanced paths) ───
     GoRoute(
-      path: '/',
-      redirect: (_, state) => '/dashboard',
+      path: '/dashboard',
+      redirect: (_, state) => '/advanced/dashboard',
+    ),
+    GoRoute(
+      path: '/devices',
+      redirect: (_, state) => '/advanced/devices',
+    ),
+    GoRoute(
+      path: '/sanitize',
+      redirect: (_, state) => '/advanced/sanitize',
+    ),
+    GoRoute(
+      path: '/verification',
+      redirect: (_, state) => '/advanced/verification',
+    ),
+    GoRoute(
+      path: '/certificates',
+      redirect: (_, state) => '/advanced/certificates',
+    ),
+    GoRoute(
+      path: '/ai-assistant',
+      redirect: (_, state) => '/advanced/ai',
+    ),
+    GoRoute(
+      path: '/settings',
+      redirect: (_, state) => '/advanced/settings',
     ),
     GoRoute(
       path: '/risk-assessment',
-      redirect: (_, state) => '/sanitize',
+      redirect: (_, state) => '/advanced/sanitize',
     ),
     GoRoute(
       path: '/workflow',
-      redirect: (_, state) => '/sanitize/workflow',
+      redirect: (_, state) => '/advanced/sanitize/workflow',
     ),
     GoRoute(
       path: '/progress',
-      redirect: (_, state) => '/sanitize/progress',
+      redirect: (_, state) => '/advanced/sanitize/progress',
     ),
     GoRoute(
       path: '/results',
-      redirect: (_, state) => '/verification',
+      redirect: (_, state) => '/advanced/verification',
     ),
     GoRoute(
       path: '/certificate',
-      redirect: (_, state) => '/certificates',
+      redirect: (_, state) => '/advanced/certificates',
     ),
   ],
 );
+

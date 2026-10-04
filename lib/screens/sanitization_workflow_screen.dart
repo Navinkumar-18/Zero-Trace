@@ -301,7 +301,7 @@ class SanitizationWorkflowScreen extends StatelessWidget {
                     child: OutlinedButton.icon(
                       icon: const Icon(Icons.arrow_back, size: 18),
                       label: const Text('BACK'),
-                      onPressed: () => context.go('/sanitize'),
+                      onPressed: () => context.go('/advanced/sanitize'),
                     ),
                   ),
                   const SizedBox(width: 12),
@@ -333,7 +333,7 @@ class SanitizationWorkflowScreen extends StatelessWidget {
                               if (confirmed) {
                                 controller.runSanitizationPipeline();
                                 if (context.mounted) {
-                                  context.go('/sanitize/progress');
+                                  context.go('/advanced/sanitize/progress');
                                 }
                               }
                             }

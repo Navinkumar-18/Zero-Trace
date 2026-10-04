@@ -3,7 +3,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:zero_trace/main.dart';
 
 void main() {
-  testWidgets('ZeroTraceApp loads dashboard screen', (WidgetTester tester) async {
+  testWidgets('ZeroTraceApp loads simple mode drive list screen by default', (WidgetTester tester) async {
     // Set a large screen size to avoid overflow in test environment
     tester.view.physicalSize = const Size(1920, 1080);
     tester.view.devicePixelRatio = 1.0;
@@ -11,10 +11,13 @@ void main() {
     await tester.pumpWidget(const ZeroTraceApp());
     await tester.pumpAndSettle();
 
-    // The sidebar should show ZERO TRACE branding
-    expect(find.text('ZERO TRACE'), findsOneWidget);
-    // Dashboard should be the initial screen
-    expect(find.text('Dashboard'), findsWidgets);
+    // Simple shell should show Zero Trace header and subtitle
+    expect(find.text('Zero Trace'), findsWidgets);
+    expect(find.text('Secure Data Wiping'), findsOneWidget);
+
+    // Screen 1 should show the selection banner and Available Drives
+    expect(find.text('Select a drive to securely wipe all data'), findsOneWidget);
+    expect(find.text('Available Drives'), findsOneWidget);
 
     addTearDown(() {
       tester.view.resetPhysicalSize();

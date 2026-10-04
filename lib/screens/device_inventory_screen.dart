@@ -444,7 +444,7 @@ class _DeviceInventoryScreenState extends State<DeviceInventoryScreen> {
                 }
               : () {
                   controller.selectDevice(device);
-                  context.go('/devices/details/${device.id}');
+                  context.go('/advanced/devices/details/${device.id}');
                 },
           borderRadius: BorderRadius.circular(16),
           child: AnimatedContainer(

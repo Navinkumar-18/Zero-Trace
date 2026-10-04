@@ -10,10 +10,12 @@ enum OrphanCheckStatus {
 class OrphanCheckResult {
   final OrphanCheckStatus status;
   final ActiveJobState? activeJobState;
+  final String? pid;
 
   OrphanCheckResult({
     required this.status,
     this.activeJobState,
+    this.pid,
   });
 }
 
@@ -41,9 +43,12 @@ class OrphanedProcessChecker {
       final isDdRunning = resultDd.exitCode == 0 && (resultDd.stdout as String).trim().isNotEmpty;
 
       if (isZtRunning || isDdRunning) {
+        final pidOutput = isZtRunning ? (resultZt.stdout as String) : (resultDd.stdout as String);
+        final pid = pidOutput.trim().split(RegExp(r'\s+')).firstOrNull;
         return OrphanCheckResult(
           status: OrphanCheckStatus.processActive,
           activeJobState: state,
+          pid: pid,
         );
       } else {
         return OrphanCheckResult(

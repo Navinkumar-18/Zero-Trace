@@ -301,7 +301,7 @@ class DashboardScreen extends StatelessWidget {
                     ? () {
                         // Select the first ready device and jump to Risk Assessment
                         controller.selectDevice(readyDevices.first);
-                        context.go('/sanitize');
+                        context.go('/advanced/sanitize');
                       }
                     : null,
               ),
@@ -315,7 +315,7 @@ class DashboardScreen extends StatelessWidget {
                   padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 14),
                   shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                 ),
-                onPressed: () => context.go('/devices'),
+                onPressed: () => context.go('/advanced/devices'),
               ),
             ],
           ),
@@ -465,10 +465,10 @@ class DashboardScreen extends StatelessWidget {
           if (attentionDevices.length == 1) {
             // Exactly 1 flagged device → go straight to its Risk Assessment
             controller.selectDevice(attentionDevices.first);
-            context.go('/sanitize');
+            context.go('/advanced/sanitize');
           } else {
             // Multiple flagged devices → go to inventory list
-            context.go('/devices');
+            context.go('/advanced/devices');
           }
         },
         child: Container(
@@ -800,7 +800,7 @@ class DashboardScreen extends StatelessWidget {
               ),
               onPressed: () {
                 controller.refreshDevices();
-                context.go('/devices');
+                context.go('/advanced/devices');
               },
             ),
           ),
@@ -816,7 +816,7 @@ class DashboardScreen extends StatelessWidget {
                 padding: const EdgeInsets.symmetric(vertical: 14),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
               ),
-              onPressed: () => context.go('/sanitize'),
+              onPressed: () => context.go('/advanced/sanitize'),
             ),
           ),
           const SizedBox(height: 10),
@@ -831,7 +831,7 @@ class DashboardScreen extends StatelessWidget {
                 padding: const EdgeInsets.symmetric(vertical: 14),
                 shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
               ),
-              onPressed: () => context.go('/ai-assistant'),
+              onPressed: () => context.go('/advanced/ai'),
             ),
           ),
         ],

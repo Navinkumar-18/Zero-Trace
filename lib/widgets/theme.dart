@@ -18,6 +18,12 @@ class AppTheme {
   static const Color accentRose = Color(0xFFD11E28);     // Destructive red (#d11e28)
   static const Color accentOrange = Color(0xFFEA580C);
 
+  // Simple Mode primary blue (matching Zero Trace 1.0 reference)
+  static const Color simplePrimary = Color(0xFF1E4B9A);
+  static const Color simplePrimaryLight = Color(0xFF2563EB);
+  static const Color simpleDestructive = accentRose;
+  static const Color simpleSuccess = accentEmerald;
+
   static const Color textPrimary = Color(0xFF131923);    // Primary dark charcoal (#131923)
   static const Color textSecondary = Color(0xFF606D7F);  // Slate gray text (#606d7f)
   static const Color textMuted = Color(0xFF94A3B8);      // Muted gray

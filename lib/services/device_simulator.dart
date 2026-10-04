@@ -95,6 +95,7 @@ class DeviceSimulator {
       hpaDcoPresent: true, // Triggers security warning
       mountPoint: null,
       isSystemDisk: false,
+      isRemovable: true,
       notes: 'Legacy controller without hardware sanitize primitives. Flagged for physical destruction under high risk.',
     ),
   ];

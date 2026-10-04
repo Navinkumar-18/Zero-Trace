@@ -78,106 +78,141 @@ class DeviceIntelligenceService {
     final List<DeviceProfile> detectedProfiles = [];
 
     for (final dev in devicesJson) {
-      final type = dev['type'] as String?;
-      if (type == 'disk' || type == null || type.isEmpty) {
-        final rawName = dev['name'] as String? ?? 'unknown';
-        final size = (dev['size'] as num?)?.toInt() ?? 0;
-        if (size <= 0 && rawName == 'unknown') continue;
+      final type = (dev['type'] as String?)?.toLowerCase();
+      String? unsupportedReason;
+      if (type == 'rom' || type == 'optical') {
+        unsupportedReason = 'Optical disc drive – not supported';
+      } else if (type == 'raid' || type == 'md') {
+        unsupportedReason = 'RAID array member/volume – not supported';
+      } else if (type != null && type.isNotEmpty && type != 'disk') {
+        continue;
+      }
 
-          final modelStr = (dev['model'] as String?)?.trim();
-          final name = (modelStr != null && modelStr.isNotEmpty) ? modelStr : 'Storage Device ($rawName)';
-          final serial = (dev['serial'] as String?)?.trim() ?? 'S/N-$rawName';
-          
-          final isRotational = (dev['rota'] as bool?) ?? false;
-          final tran = (dev['tran'] as String?)?.toUpperCase() ?? '';
-          
-          final isRm = dev['rm'] == true || dev['rm'] == 1 || dev['rm'] == '1';
-          final isHotplug = dev['hotplug'] == true || dev['hotplug'] == 1 || dev['hotplug'] == '1';
-          
-          // Filesystem and Partition detection
-          final mainFsType = (dev['fstype'] as String?)?.trim();
-          final mainMountPoint = (dev['mountpoint'] as String?)?.trim();
-          final children = dev['children'] as List<dynamic>?;
+      final rawName = dev['name'] as String? ?? 'unknown';
+      final size = (dev['size'] as num?)?.toInt() ?? 0;
+      if (size <= 0 && rawName == 'unknown') continue;
 
-          bool isSys = false;
-          String? systemMountPoint;
-          bool hasFilesystem = (mainFsType != null && mainFsType.isNotEmpty) ||
-              (mainMountPoint != null && mainMountPoint.isNotEmpty);
-          String? detectedFsType = mainFsType;
+      final modelStr = (dev['model'] as String?)?.trim();
+      final name = (modelStr != null && modelStr.isNotEmpty) ? modelStr : 'Storage Device ($rawName)';
+      final serial = (dev['serial'] as String?)?.trim() ?? 'S/N-$rawName';
+      
+      final isRotational = (dev['rota'] as bool?) ?? false;
+      final tran = (dev['tran'] as String?)?.toUpperCase() ?? '';
+      
+      final isRm = dev['rm'] == true || dev['rm'] == 1 || dev['rm'] == '1';
+      final isHotplug = dev['hotplug'] == true || dev['hotplug'] == 1 || dev['hotplug'] == '1';
+      
+      // Filesystem and Partition detection
+      final mainFsType = (dev['fstype'] as String?)?.trim();
+      final mainMountPoint = (dev['mountpoint'] as String?)?.trim();
+      final children = dev['children'] as List<dynamic>?;
 
-          if (children != null && children.isNotEmpty) {
-            for (final child in children) {
-              final mp = (child['mountpoint'] as String?)?.trim();
-              final childFs = (child['fstype'] as String?)?.trim();
-              if (mp != null && mp.isNotEmpty && !PolicyLayer.isMountUnmountable(mp)) {
-                isSys = true;
-                systemMountPoint = mp;
-              }
-              if (childFs == 'swap') {
-                isSys = true;
-                systemMountPoint = '[SWAP]';
-              }
-              if ((childFs != null && childFs.isNotEmpty) || (mp != null && mp.isNotEmpty)) {
-                hasFilesystem = true;
-                if (childFs != null && childFs.isNotEmpty && (detectedFsType == null || detectedFsType.isEmpty)) {
-                  detectedFsType = childFs;
-                }
-              }
+      bool isSys = false;
+      bool isLiveMedia = false;
+      String? systemMountPoint;
+      bool hasFilesystem = (mainFsType != null && mainFsType.isNotEmpty) ||
+          (mainMountPoint != null && mainMountPoint.isNotEmpty);
+      String? detectedFsType = mainFsType;
+
+      if (children != null && children.isNotEmpty) {
+        for (final child in children) {
+          final mp = (child['mountpoint'] as String?)?.trim();
+          final childFs = (child['fstype'] as String?)?.trim();
+          if (mp != null && mp.isNotEmpty) {
+            // Phase 1 boot-guard: detect live-USB/live-media mounts
+            if (_isLiveMediaMount(mp)) {
+              isLiveMedia = true;
+              isSys = true;
+              systemMountPoint = mp;
+            } else if (!PolicyLayer.isMountUnmountable(mp)) {
+              isSys = true;
+              systemMountPoint = mp;
             }
           }
-
-          final bool isWipedNoFilesystem = !hasFilesystem && (children == null || children.isEmpty);
-
-          MediaType mediaType = MediaType.unknown;
-          if (tran.contains('USB') || isRm || isHotplug) {
-            mediaType = MediaType.usbFlash;
-          } else if (isRotational) {
-            mediaType = MediaType.hdd;
-          } else if (tran.contains('NVME') || rawName.startsWith('nvme')) {
-            mediaType = MediaType.nvmeSsd;
-          } else if (tran.contains('MMC') || rawName.startsWith('mmcblk')) {
-            mediaType = MediaType.emmc;
-          } else {
-            mediaType = MediaType.sataSsd;
+          if (childFs == 'swap') {
+            isSys = true;
+            systemMountPoint = '[SWAP]';
           }
-
-          final busDisplay = tran.isNotEmpty
-              ? tran
-              : (isRm || isHotplug ? 'USB / Removable' : 'SATA/PCIe');
-
-          detectedProfiles.add(
-            DeviceProfile(
-              id: 'real_$rawName',
-              name: name,
-              serialNumber: serial,
-              mediaType: mediaType,
-              busType: busDisplay,
-              capacityBytes: size,
-              rotationalRpm: null, // lsblk does not provide rotational speed (RPM)
-              isHardwareEncrypted: mediaType == MediaType.nvmeSsd || mediaType == MediaType.sataSsd,
-              supportsAtaSecureErase: mediaType == MediaType.sataSsd || mediaType == MediaType.hdd,
-              supportsAtaSanitize: mediaType == MediaType.sataSsd,
-              supportsNvmeSanitize: mediaType == MediaType.nvmeSsd,
-              supportsEmmcSanitize: mediaType == MediaType.emmc,
-              supportsTrim: mediaType != MediaType.hdd,
-              hpaDcoPresent: false,
-              mountPoint: systemMountPoint ?? mainMountPoint,
-              isSystemDisk: isSys,
-              hasFilesystem: hasFilesystem,
-              fsType: detectedFsType,
-              isWipedNoFilesystem: isWipedNoFilesystem,
-              notes: isWipedNoFilesystem
-                  ? 'SANITIZED / NO FILESYSTEM (Raw Block Device)'
-                  : (isSys
-                      ? 'REAL SYSTEM DISK (Protected against destruction)'
-                      : (isRm || mediaType == MediaType.usbFlash
-                          ? 'REAL REMOVABLE STORAGE DEVICE'
-                          : 'REAL CONNECTED STORAGE DEVICE')),
-            ),
-          );
+          if ((childFs != null && childFs.isNotEmpty) || (mp != null && mp.isNotEmpty)) {
+            hasFilesystem = true;
+            if (childFs != null && childFs.isNotEmpty && (detectedFsType == null || detectedFsType.isEmpty)) {
+              detectedFsType = childFs;
+            }
+          }
         }
       }
 
+      final bool isWipedNoFilesystem = !hasFilesystem && (children == null || children.isEmpty);
+
+      // Removable = sysfs RM flag OR hotplug flag OR USB bus.
+      // Internal eMMC is NOT removable (RM=false, hotplug=false, tran=MMC).
+      final bool removable = isRm || isHotplug || tran.contains('USB');
+
+      MediaType mediaType = MediaType.unknown;
+      if (tran.contains('USB') || isRm || isHotplug) {
+        mediaType = MediaType.usbFlash;
+      } else if (isRotational) {
+        mediaType = MediaType.hdd;
+      } else if (tran.contains('NVME') || rawName.startsWith('nvme')) {
+        mediaType = MediaType.nvmeSsd;
+      } else if (tran.contains('MMC') || rawName.startsWith('mmcblk')) {
+        mediaType = MediaType.emmc;
+      } else if (unsupportedReason != null) {
+        mediaType = MediaType.unknown;
+      } else {
+        mediaType = MediaType.sataSsd;
+      }
+
+      final busDisplay = tran.isNotEmpty
+          ? tran
+          : (isRm || isHotplug ? 'USB / Removable' : 'SATA/PCIe');
+
+      detectedProfiles.add(
+        DeviceProfile(
+          id: 'real_$rawName',
+          name: name,
+          serialNumber: serial,
+          mediaType: mediaType,
+          busType: busDisplay,
+          capacityBytes: size,
+          rotationalRpm: null, // lsblk does not provide rotational speed (RPM)
+          isHardwareEncrypted: mediaType == MediaType.nvmeSsd || mediaType == MediaType.sataSsd,
+          supportsAtaSecureErase: mediaType == MediaType.sataSsd || mediaType == MediaType.hdd,
+          supportsAtaSanitize: mediaType == MediaType.sataSsd,
+          supportsNvmeSanitize: mediaType == MediaType.nvmeSsd,
+          supportsEmmcSanitize: mediaType == MediaType.emmc,
+          supportsTrim: mediaType != MediaType.hdd,
+          hpaDcoPresent: false,
+          mountPoint: systemMountPoint ?? mainMountPoint,
+          isSystemDisk: isSys,
+          hasFilesystem: hasFilesystem,
+          fsType: detectedFsType,
+          isWipedNoFilesystem: isWipedNoFilesystem,
+          isRemovable: removable,
+          disabledReason: unsupportedReason,
+          notes: isWipedNoFilesystem
+              ? 'SANITIZED / NO FILESYSTEM (Raw Block Device)'
+              : (isLiveMedia
+                  ? 'LIVE MEDIA DISK (Protected against destruction)'
+                  : (isSys
+                      ? 'REAL SYSTEM DISK (Protected against destruction)'
+                      : (removable
+                          ? 'REAL REMOVABLE STORAGE DEVICE'
+                          : 'REAL CONNECTED STORAGE DEVICE'))),
+        ),
+      );
+    }
+
       return detectedProfiles;
     }
+
+  /// Check for live-media mount paths (Phase 1 boot-guard matching).
+  static bool _isLiveMediaMount(String mountPoint) {
+    final mp = mountPoint.trim();
+    return mp.startsWith('/run/live') ||
+        mp.startsWith('/run/archiso') ||
+        mp.startsWith('/run/initramfs') ||
+        mp.contains('/live/medium') ||
+        mp.contains('/casper/');
+  }
   }

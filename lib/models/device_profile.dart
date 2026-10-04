@@ -7,6 +7,50 @@ enum MediaType {
   unknown,
 }
 
+/// User-facing drive type classification for Simple Mode UI.
+/// Sorted by removable-first priority for display ordering.
+enum DriveType {
+  usb,
+  sd,
+  hdd,
+  ssd,
+  nvme,
+  unknown,
+}
+
+extension DriveTypeExtension on DriveType {
+  String get label {
+    switch (this) {
+      case DriveType.usb:
+        return 'USB';
+      case DriveType.sd:
+        return 'SD';
+      case DriveType.hdd:
+        return 'HDD';
+      case DriveType.ssd:
+        return 'SSD';
+      case DriveType.nvme:
+        return 'NVMe';
+      case DriveType.unknown:
+        return 'Unknown';
+    }
+  }
+
+  /// Whether this type is considered removable media.
+  bool get isTypicallyRemovable {
+    switch (this) {
+      case DriveType.usb:
+      case DriveType.sd:
+        return true;
+      case DriveType.hdd:
+      case DriveType.ssd:
+      case DriveType.nvme:
+      case DriveType.unknown:
+        return false;
+    }
+  }
+}
+
 extension MediaTypeExtension on MediaType {
   String get displayName {
     switch (this) {
@@ -65,6 +109,14 @@ class DeviceProfile {
   final bool isWipedNoFilesystem;
   final String notes;
 
+  /// Whether the device is removable (from sysfs RM/hotplug flags + bus type).
+  /// Internal eMMC is NOT removable even though it's flash.
+  final bool isRemovable;
+
+  /// Reason this device is disabled in the UI, if any.
+  /// Non-null for unsupported devices (RAID, optical, unknown).
+  final String? disabledReason;
+
   const DeviceProfile({
     required this.id,
     required this.name,
@@ -86,7 +138,55 @@ class DeviceProfile {
     this.fsType,
     this.isWipedNoFilesystem = false,
     this.notes = '',
+    this.isRemovable = false,
+    this.disabledReason,
   });
+
+  /// Derive the user-facing drive type from MediaType + bus.
+  DriveType get driveType {
+    switch (mediaType) {
+      case MediaType.usbFlash:
+        return DriveType.usb;
+      case MediaType.emmc:
+        // SD cards detected via SD/MMC bus; internal eMMC is NOT removable/SD.
+        // It maps to DriveType.unknown and is never mapped to ssd.
+        if (isRemovable || busType.toUpperCase().contains('SD')) {
+          return DriveType.sd;
+        }
+        return DriveType.unknown;
+      case MediaType.hdd:
+        return DriveType.hdd;
+      case MediaType.sataSsd:
+        return DriveType.ssd;
+      case MediaType.nvmeSsd:
+        return DriveType.nvme;
+      case MediaType.unknown:
+        return DriveType.unknown;
+    }
+  }
+
+  /// A stable ID for routing: prefer serial, fall back to device id.
+  String get stableId {
+    final serial = serialNumber.trim();
+    if (serial.isNotEmpty && !serial.startsWith('S/N-')) {
+      return serial;
+    }
+    return id;
+  }
+
+  /// Whether this device is selectable in Simple Mode.
+  /// Returns null if selectable, or a human-readable reason if disabled.
+  String? get simpleDisabledReason {
+    if (isSystemDisk) return 'System drive – protected';
+    if (disabledReason != null) return disabledReason;
+    if (mediaType == MediaType.emmc && !isRemovable && !busType.toUpperCase().contains('SD')) {
+      return 'Internal eMMC storage – not supported';
+    }
+    if (driveType == DriveType.unknown || mediaType == MediaType.unknown) {
+      return 'Unknown or unsupported device type – cannot wipe safely';
+    }
+    return null;
+  }
 
   String get formattedCapacity {
     double gb = capacityBytes / (1024 * 1024 * 1024);
@@ -118,6 +218,8 @@ class DeviceProfile {
         'fsType': fsType,
         'isWipedNoFilesystem': isWipedNoFilesystem,
         'notes': notes,
+        'isRemovable': isRemovable,
+        'disabledReason': disabledReason,
       };
 
   factory DeviceProfile.fromJson(Map<String, dynamic> json) {
@@ -145,6 +247,8 @@ class DeviceProfile {
       fsType: json['fsType'] as String?,
       isWipedNoFilesystem: (json['isWipedNoFilesystem'] as bool?) ?? false,
       notes: (json['notes'] as String?) ?? '',
+      isRemovable: (json['isRemovable'] as bool?) ?? false,
+      disabledReason: json['disabledReason'] as String?,
     );
   }
 }
