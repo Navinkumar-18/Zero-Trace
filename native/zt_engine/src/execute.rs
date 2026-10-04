@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -1782,10 +1783,44 @@ impl SpeedEstimator {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CheckpointData {
+    pub job_id: String,
+    pub device_size: u64,
+    pub device_id_hash: String,
+    pub bytes_done: u64,
+    pub timestamp: u64,
+}
+
 pub fn get_checkpoint_dir() -> PathBuf {
     if let Ok(custom) = std::env::var("ZT_CHECKPOINT_DIR") {
         if !custom.trim().is_empty() {
             return PathBuf::from(custom);
+        }
+    }
+    // Check if running under sudo or pkexec as root
+    #[cfg(unix)]
+    {
+        if unsafe { libc::geteuid() } == 0 {
+            if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+                if !sudo_user.trim().is_empty() && sudo_user != "root" {
+                    let user_home = PathBuf::from(format!("/home/{}", sudo_user.trim()));
+                    if user_home.exists() {
+                        return user_home.join(".local").join("state").join("zero_trace");
+                    }
+                }
+            }
+            if let Ok(pkexec_uid) = std::env::var("PKEXEC_UID") {
+                if let Ok(uid) = pkexec_uid.trim().parse::<libc::uid_t>() {
+                    let passwd = unsafe { libc::getpwuid(uid) };
+                    if !passwd.is_null() {
+                        let pw_dir = unsafe { std::ffi::CStr::from_ptr((*passwd).pw_dir) };
+                        if let Ok(home_str) = pw_dir.to_str() {
+                            return PathBuf::from(home_str).join(".local").join("state").join("zero_trace");
+                        }
+                    }
+                }
+            }
         }
     }
     if let Ok(xdg_state) = std::env::var("XDG_STATE_HOME") {
@@ -1795,36 +1830,49 @@ pub fn get_checkpoint_dir() -> PathBuf {
     }
     if let Ok(home) = std::env::var("HOME") {
         if !home.trim().is_empty() {
-            return PathBuf::from(home).join(".local").join("share").join("zero_trace");
+            return PathBuf::from(home).join(".local").join("state").join("zero_trace");
         }
     }
     PathBuf::from("/tmp/zero_trace")
 }
 
-pub fn write_checkpoint_file(serial: &str, bytes_done: u64, bytes_total: u64) {
-    let dir = get_checkpoint_dir();
-    let _ = fs::create_dir_all(&dir);
+pub fn write_checkpoint_file(job_id: &str, serial: &str, device_size: u64, bytes_done: u64) {
+    write_checkpoint_file_in_dir(&get_checkpoint_dir(), job_id, serial, device_size, bytes_done);
+}
+
+pub fn remove_checkpoint_file() {
+    remove_checkpoint_file_in_dir(&get_checkpoint_dir());
+}
+
+pub fn write_checkpoint_file_in_dir(dir: &Path, job_id: &str, serial: &str, device_size: u64, bytes_done: u64) {
+    let _ = fs::create_dir_all(dir);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
     }
 
     let final_path = dir.join("active_checkpoint.json");
-    let tmp_path = dir.join("active_checkpoint.tmp");
+    let tmp_path = dir.join(format!("active_checkpoint.{}.tmp", std::process::id()));
 
     let now_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
-    let json = serde_json::json!({
-        "serial": serial,
-        "bytes_done": bytes_done,
-        "bytes_total": bytes_total,
-        "timestamp": now_ts,
-    });
-    let payload = json.to_string();
+    let device_id_hash = format!("{:x}", Sha256::digest(serial.as_bytes()));
+
+    let checkpoint = CheckpointData {
+        job_id: job_id.to_string(),
+        device_size,
+        device_id_hash,
+        bytes_done,
+        timestamp: now_ts,
+    };
+    let payload = match serde_json::to_string_pretty(&checkpoint) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
 
     #[cfg(unix)]
     {
@@ -1835,7 +1883,7 @@ pub fn write_checkpoint_file(serial: &str, bytes_done: u64, bytes_total: u64) {
             Ok(c) => c,
             Err(_) => return,
         };
-        // Unlink any prior tmp file
+        // Unlink any prior stale tmp file with this name
         let _ = unsafe { libc::unlink(c_tmp.as_ptr()) };
 
         let fd = unsafe {
@@ -1846,6 +1894,14 @@ pub fn write_checkpoint_file(serial: &str, bytes_done: u64, bytes_total: u64) {
             )
         };
         if fd >= 0 {
+            // Chown to calling user if running under sudo or pkexec
+            if let Ok(uid_str) = std::env::var("SUDO_UID").or_else(|_| std::env::var("PKEXEC_UID")) {
+                if let Ok(uid) = uid_str.trim().parse::<libc::uid_t>() {
+                    let gid = std::env::var("SUDO_GID").ok().and_then(|g| g.trim().parse::<libc::gid_t>().ok()).unwrap_or(uid);
+                    unsafe { libc::fchown(fd, uid, gid); }
+                }
+            }
+
             let mut file = unsafe { fs::File::from_raw_fd(fd) };
             if file.write_all(payload.as_bytes()).is_ok() {
                 let _ = file.sync_all();
@@ -1863,12 +1919,12 @@ pub fn write_checkpoint_file(serial: &str, bytes_done: u64, bytes_total: u64) {
     }
 }
 
-pub fn remove_checkpoint_file(_serial: &str) {
-    let dir = get_checkpoint_dir();
+pub fn remove_checkpoint_file_in_dir(dir: &Path) {
     let final_path = dir.join("active_checkpoint.json");
-    let tmp_path = dir.join("active_checkpoint.tmp");
+    let tmp_path = dir.join(format!("active_checkpoint.{}.tmp", std::process::id()));
     let _ = fs::remove_file(final_path);
     let _ = fs::remove_file(tmp_path);
+    let _ = fs::remove_file(dir.join("active_checkpoint.tmp"));
 }
 
 pub async fn execute_writer_overwrite<W: BlockWriter>(
@@ -1906,6 +1962,9 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
     let command_log = vec![format!("Native block overwrite ({} passes, mode: {})", total_passes, writer.io_mode())];
     let device_size = writer.total_size().map_err(ExecuteError::IoError)?;
     let total_bytes = total_passes as u64 * device_size;
+
+    let device_id_hash = format!("{:x}", Sha256::digest(device_serial.as_bytes()));
+    let job_id = std::env::var("ZT_JOB_ID").unwrap_or_else(|_| format!("job-{}", &device_id_hash[..12]));
 
     let cancel_flag = external_cancel_flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let _term_hook = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&cancel_flag));
@@ -1986,7 +2045,7 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
                     overall_bytes_done += uncommitted_buffered_bytes;
                     bytes_done_shared.store(overall_bytes_done, Ordering::Relaxed);
                 }
-                write_checkpoint_file(device_serial, overall_bytes_done, total_bytes);
+                write_checkpoint_file(&job_id, device_serial, device_size, overall_bytes_done);
                 let _ = hb_stop_tx.send(());
                 let _ = hb_task.await;
                 let _ = tx.send(ProgressEvent {
@@ -2027,7 +2086,7 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
                         overall_bytes_done += uncommitted_buffered_bytes;
                         bytes_done_shared.store(overall_bytes_done, Ordering::Relaxed);
                     }
-                    write_checkpoint_file(device_serial, overall_bytes_done, total_bytes);
+                    write_checkpoint_file(&job_id, device_serial, device_size, overall_bytes_done);
                     let _ = hb_stop_tx.send(());
                     let _ = hb_task.await;
                     let _ = tx.send(ProgressEvent {
@@ -2127,7 +2186,7 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
             // Periodic checkpoint file write (~every 2 seconds)
             if now.duration_since(last_checkpoint_time).as_secs() >= 2 {
                 last_checkpoint_time = now;
-                write_checkpoint_file(device_serial, overall_bytes_done, total_bytes);
+                write_checkpoint_file(&job_id, device_serial, device_size, overall_bytes_done);
             }
         }
     }
@@ -2135,6 +2194,25 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
     // Flush phase (Item 1, 2, 3)
     *phase_shared.lock().unwrap() = ExecutionPhase::Flushing;
     send_detailed_progress(&tx, ExecutionPhase::Flushing, overall_bytes_done, total_bytes, None, 0.0, None, "Finalizing, flushing to drive", false).await;
+
+    // Check cancellation promptly at start of flush
+    if cancel_flag.load(Ordering::SeqCst) {
+        let _ = hb_stop_tx.send(());
+        let _ = hb_task.await;
+        write_checkpoint_file(&job_id, device_serial, device_size, overall_bytes_done);
+        return Ok(ExecutionReport {
+            success: false,
+            method_used: method_name.to_string(),
+            command_log,
+            stdout: String::new(),
+            stderr: "Sanitization cancelled by user during flush".to_string(),
+            exit_code: 130,
+            duration_ms: start.elapsed().as_millis() as u64,
+            dry_run: false,
+            bytes_written: overall_bytes_done,
+            io_mode: writer.io_mode().to_string(),
+        });
+    }
 
     if let Err(e) = writer.sync_data() {
         let _ = hb_stop_tx.send(());
@@ -2147,14 +2225,52 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
         return Err(ExecuteError::IoError(e));
     }
 
+    // Check cancellation promptly after sync/flush
+    if cancel_flag.load(Ordering::SeqCst) {
+        let _ = hb_stop_tx.send(());
+        let _ = hb_task.await;
+        write_checkpoint_file(&job_id, device_serial, device_size, overall_bytes_done);
+        return Ok(ExecutionReport {
+            success: false,
+            method_used: method_name.to_string(),
+            command_log,
+            stdout: String::new(),
+            stderr: "Sanitization cancelled by user after flush".to_string(),
+            exit_code: 130,
+            duration_ms: start.elapsed().as_millis() as u64,
+            dry_run: false,
+            bytes_written: overall_bytes_done,
+            io_mode: writer.io_mode().to_string(),
+        });
+    }
+
     *phase_shared.lock().unwrap() = ExecutionPhase::Verification;
     send_detailed_progress(&tx, ExecutionPhase::Verification, overall_bytes_done, total_bytes, None, 0.0, None, "Verifying sector erasure...", false).await;
+
+    // Check cancellation promptly before verification
+    if cancel_flag.load(Ordering::SeqCst) {
+        let _ = hb_stop_tx.send(());
+        let _ = hb_task.await;
+        write_checkpoint_file(&job_id, device_serial, device_size, overall_bytes_done);
+        return Ok(ExecutionReport {
+            success: false,
+            method_used: method_name.to_string(),
+            command_log,
+            stdout: String::new(),
+            stderr: "Sanitization cancelled by user during verification".to_string(),
+            exit_code: 130,
+            duration_ms: start.elapsed().as_millis() as u64,
+            dry_run: false,
+            bytes_written: overall_bytes_done,
+            io_mode: writer.io_mode().to_string(),
+        });
+    }
 
     let _ = hb_stop_tx.send(());
     let _ = hb_task.await;
 
     // Checkpoint removal upon success
-    remove_checkpoint_file(device_serial);
+    remove_checkpoint_file();
 
     Ok(ExecutionReport {
         success: overall_bytes_done == total_bytes,

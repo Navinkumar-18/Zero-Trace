@@ -331,8 +331,8 @@ class SanitizationController extends ChangeNotifier {
     final job = _currentJob!;
     job.status = JobStatus.failed;
     job.endTime = DateTime.now();
-    job.currentStageDescription = 'Sanitization Force-Stopped';
-    _addLog('USER FORCE STOP: Job force stopped. Warning: Drive may be in an inconsistent state.');
+    job.currentStageDescription = 'interrupted, state unknown';
+    _addLog('USER FORCE STOP: Job force stopped. Warning: Drive in interrupted, state unknown.');
 
     await _auditLogService.appendEntry(
       AuditLogEntry(
@@ -352,7 +352,16 @@ class SanitizationController extends ChangeNotifier {
       ),
     );
 
-    await JobStateFile.clearActiveJob();
+    // Save interrupted state so checkpoint stays and discovery/recovery detects it
+    await JobStateFile.recordInterrupted(ActiveJobState(
+      jobId: job.jobId,
+      deviceSerial: job.device.serialNumber,
+      devicePath: job.device.id,
+      deviceName: job.device.name,
+      method: job.effectiveMethod.displayName,
+      startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
+    ));
+
     notifyListeners();
   }
 

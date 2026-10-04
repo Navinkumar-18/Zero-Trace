@@ -3,6 +3,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:zero_trace/models/device_profile.dart';
 import 'package:zero_trace/models/sanitization_job.dart';
 import 'package:zero_trace/services/real_sanitization_service.dart';
+import 'package:zero_trace/services/sanitization_controller.dart';
+import 'package:zero_trace/services/job_state_file.dart';
 
 void main() {
   group('Honest Progress and Telemetry Tests', () {
@@ -232,6 +234,58 @@ void main() {
       // Force stop method exists and can be invoked
       service.forceKillActiveProcess();
       expect(service.activeProcess, isNull);
+    });
+
+    test('8. Force stop transitions job to "interrupted, state unknown" and checkpoint stays', () async {
+      final controller = SanitizationController(
+        enableAutoPolling: false,
+        deferInitialDiscovery: true,
+      );
+      addTearDown(() => controller.dispose());
+
+      final testDevice = DeviceProfile(
+        id: 'test_force_dev',
+        name: 'Test USB',
+        serialNumber: 'FORCE-1234-TEST',
+        mediaType: MediaType.usbFlash,
+        busType: 'USB',
+        capacityBytes: 16000000000,
+      );
+
+      final job = SanitizationJob(
+        jobId: 'job-force-stop-test',
+        device: testDevice,
+        dataSensitivity: DataSensitivity.confidential,
+        deviceCondition: DeviceCondition.functional,
+        disposalPath: DisposalPath.recycling,
+        riskScore: 0.5,
+        targetCategory: NistCategory.clear,
+        recommendedMethod: SanitizationMethod.singlePassOverwrite,
+        standardReference: 'NIST SP 800-88 Clear',
+        explanationText: 'Single pass zeros',
+        status: JobStatus.sanitizing,
+        progress: 0.45,
+        currentStageDescription: 'Writing zeros',
+        startTime: DateTime.now(),
+      );
+
+      controller.setMockJob(job);
+
+      // Execute force stop
+      await controller.forceStopCurrentJob();
+
+      // Verify job description is 'interrupted, state unknown'
+      expect(controller.currentJob?.currentStageDescription, 'interrupted, state unknown');
+
+      // Verify checkpoint stays on disk
+      final activeJob = await JobStateFile.readActiveJob();
+      expect(activeJob, isNotNull);
+      expect(activeJob!.jobId, 'job-force-stop-test');
+      expect(activeJob.status, 'interrupted');
+      expect(activeJob.deviceSerial, 'FORCE-1234-TEST');
+
+      // Clean up test state file
+      await JobStateFile.clearActiveJob();
     });
   });
 }

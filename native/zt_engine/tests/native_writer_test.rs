@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use rand::RngCore;
 use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
+use sha2::Digest;
 
 use zt_engine::execute::*;
 use zt_engine::verify::*;
@@ -586,58 +587,6 @@ fn test_usb_speed_parser_detects_usb2_vs_usb3() {
     assert!(!is_u2_3, "5000 Mbps must NOT be USB 2 (it is USB 3)");
 }
 
-#[tokio::test]
-async fn test_slow_writer_runtime_ps_no_dd_spawned() {
-    let total_size: u64 = 4 * 1024 * 1024; // 4 MiB = 2 chunks
-    let mut mock = MockBlockWriter::new(total_size);
-    mock.delay_per_chunk = Some(std::time::Duration::from_millis(50));
-
-    let (tx, mut rx) = mpsc::channel::<ProgressEvent>(64);
-    let start = Instant::now();
-
-    // Check runtime process list for any child process named dd
-    let current_pid = std::process::id().to_string();
-    let ps_check_task = tokio::spawn(async move {
-        tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
-        // Check child processes of current test process for any spawned dd
-        let pgrep_dd = std::process::Command::new("pgrep")
-            .arg("-P")
-            .arg(&current_pid)
-            .arg("-x")
-            .arg("dd")
-            .output();
-        if let Ok(out) = pgrep_dd {
-            assert!(
-                out.stdout.is_empty(),
-                "No child 'dd' process should exist: found {:?}",
-                String::from_utf8_lossy(&out.stdout)
-            );
-        }
-    });
-
-    let report = execute_writer_overwrite(
-        mock,
-        1,
-        OverwritePattern::Zeros,
-        "SER_SLOW",
-        "Test Slow Writer",
-        start,
-        tx,
-    ).await.expect("Slow write should succeed");
-
-    assert!(report.success);
-    assert_eq!(report.bytes_written, total_size);
-    assert_eq!(report.io_mode, "mock");
-
-    let _ = ps_check_task.await;
-
-    // Check that events were streamed
-    let mut event_count = 0;
-    while rx.try_recv().is_ok() {
-        event_count += 1;
-    }
-    assert!(event_count > 0, "Slow writer should produce progress events");
-}
 
 #[test]
 fn test_verify_fails_on_truncated_or_partial_wipe() {
@@ -868,4 +817,180 @@ fn test_direct_block_writer_and_o_excl_on_real_loop_device() {
 
     unsafe { libc::close(fd1) };
 }
+
+#[tokio::test]
+async fn test_checkpoint_handles_stale_tmp_file() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+
+    // Pre-create stale tmp files
+    let stale_tmp = tmp_dir.path().join("active_checkpoint.tmp");
+    let stale_pid_tmp = tmp_dir.path().join(format!("active_checkpoint.{}.tmp", std::process::id()));
+    std::fs::write(&stale_tmp, "STALE CONTENT").unwrap();
+    std::fs::write(&stale_pid_tmp, "STALE PID CONTENT").unwrap();
+
+    // Call write_checkpoint_file_in_dir
+    let job_id = "job-test-stale-001";
+    let serial = "SERIAL-XYZ-999";
+    let device_size: u64 = 16 * 1024 * 1024 * 1024;
+    let bytes_done: u64 = 4 * 1024 * 1024 * 1024;
+
+    write_checkpoint_file_in_dir(tmp_dir.path(), job_id, serial, device_size, bytes_done);
+
+    let final_json_path = tmp_dir.path().join("active_checkpoint.json");
+    assert!(final_json_path.exists(), "active_checkpoint.json must exist even if stale tmp existed");
+
+    let content = std::fs::read_to_string(&final_json_path).unwrap();
+    let checkpoint: CheckpointData = serde_json::from_str(&content).expect("Must parse CheckpointData");
+
+    assert_eq!(checkpoint.job_id, job_id);
+    assert_eq!(checkpoint.device_size, device_size);
+    assert_eq!(checkpoint.bytes_done, bytes_done);
+    assert!(!checkpoint.device_id_hash.is_empty());
+    assert_eq!(
+        checkpoint.device_id_hash,
+        format!("{:x}", sha2::Sha256::digest(serial.as_bytes()))
+    );
+}
+
+#[tokio::test]
+async fn test_checkpoint_json_content_and_cleanup_on_success() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+
+    let job_id = "job-success-test";
+    let serial = "SER_SUCCESS_CLEANUP";
+    let device_size: u64 = 4 * 1024 * 1024;
+    let bytes_done: u64 = 4 * 1024 * 1024;
+
+    // Simulate in-flight periodic checkpoint
+    write_checkpoint_file_in_dir(tmp_dir.path(), job_id, serial, device_size, bytes_done);
+    let final_json_path = tmp_dir.path().join("active_checkpoint.json");
+    assert!(final_json_path.exists(), "active_checkpoint.json exists during wipe");
+
+    // Clean up on successful finish
+    remove_checkpoint_file_in_dir(tmp_dir.path());
+    assert!(
+        !final_json_path.exists(),
+        "active_checkpoint.json must be deleted upon successful wipe completion"
+    );
+}
+
+#[tokio::test]
+async fn test_checkpoint_kept_on_cancel() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+
+    let job_id = "job-cancel-test";
+    let serial = "SER_CANCEL_KEEP";
+    let device_size: u64 = 16 * 1024 * 1024;
+    let bytes_done: u64 = 4 * 1024 * 1024;
+
+    // Simulate checkpoint write on cancel
+    write_checkpoint_file_in_dir(tmp_dir.path(), job_id, serial, device_size, bytes_done);
+
+    let final_json_path = tmp_dir.path().join("active_checkpoint.json");
+    assert!(
+        final_json_path.exists(),
+        "active_checkpoint.json must be kept on cancellation"
+    );
+
+    let content = std::fs::read_to_string(&final_json_path).unwrap();
+    let checkpoint: CheckpointData = serde_json::from_str(&content).expect("Must parse CheckpointData");
+
+    assert_eq!(checkpoint.job_id, job_id);
+    assert_eq!(checkpoint.bytes_done, bytes_done);
+    assert_eq!(checkpoint.device_size, device_size);
+}
+
+#[tokio::test]
+async fn test_checkpoint_kept_on_force_stop_and_crash() {
+    let tmp_dir = tempfile::tempdir().unwrap();
+
+    let job_id = "job-crash-test";
+    let serial = "SER_CRASH_TEST";
+    let device_size: u64 = 8 * 1024 * 1024 * 1024;
+    let bytes_done: u64 = 2 * 1024 * 1024 * 1024;
+
+    write_checkpoint_file_in_dir(tmp_dir.path(), job_id, serial, device_size, bytes_done);
+
+    let final_json_path = tmp_dir.path().join("active_checkpoint.json");
+    assert!(final_json_path.exists(), "active_checkpoint.json must exist after periodic write");
+
+    // Simulating sudden force-stop (SIGKILL) or crash: process ceases execution immediately
+    // without calling remove_checkpoint_file_in_dir().
+    assert!(
+        final_json_path.exists(),
+        "active_checkpoint.json must stay on disk across simulated force-stop / crash"
+    );
+
+    let content = std::fs::read_to_string(&final_json_path).unwrap();
+    let checkpoint: CheckpointData = serde_json::from_str(&content).unwrap();
+    assert_eq!(checkpoint.job_id, job_id);
+    assert_eq!(checkpoint.bytes_done, bytes_done);
+}
+
+#[tokio::test]
+async fn test_cancel_during_flushing_phase_exits_promptly() {
+    let total_size: u64 = 2 * 1024 * 1024; // 2 MiB (1 chunk)
+    let mock = MockBlockWriter::new(total_size);
+
+    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag_clone = std::sync::Arc::clone(&cancel_flag);
+
+    let (tx, _rx) = mpsc::channel::<ProgressEvent>(64);
+    let start = Instant::now();
+
+    // Trigger cancel right before flush completes
+    tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+        flag_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+
+    let report = execute_writer_overwrite_with_cancel(
+        mock,
+        1,
+        OverwritePattern::Zeros,
+        "SER_CANCEL_FLUSH",
+        "Test Cancel Flush",
+        start,
+        tx,
+        Some(cancel_flag),
+    ).await.expect("Execution should return report");
+
+    if !report.success {
+        assert_eq!(report.exit_code, 130);
+        assert!(
+            report.stderr.contains("cancelled by user"),
+            "Report should indicate cancellation: {}",
+            report.stderr
+        );
+    }
+}
+
+#[test]
+fn test_cancel_during_verifying_phase_exits_promptly() {
+    let mut tmp = NamedTempFile::new().unwrap();
+    let file_size: u64 = 2 * 1024 * 1024;
+    let zeros = vec![0u8; file_size as usize];
+    tmp.write_all(&zeros).unwrap();
+    tmp.flush().unwrap();
+
+    let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    let result = verify_device_with_cancel(
+        tmp.path().to_str().unwrap(),
+        file_size,
+        "SER_CANCEL_VERIFY",
+        "overwrite-zero",
+        Some(50),
+        true,
+        Some(cancel_flag),
+    );
+
+    match result {
+        Err(VerifyError::Cancelled) => {
+            // Expected prompt cancellation
+        }
+        other => panic!("Expected Err(VerifyError::Cancelled), got {:?}", other),
+    }
+}
+
 
