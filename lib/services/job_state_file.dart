@@ -8,6 +8,7 @@ class ActiveJobState {
   final String deviceName;
   final String method;
   final String startedAt;
+  final String status;
 
   ActiveJobState({
     required this.jobId,
@@ -16,6 +17,7 @@ class ActiveJobState {
     required this.deviceName,
     required this.method,
     required this.startedAt,
+    this.status = 'running',
   });
 
   Map<String, dynamic> toJson() => {
@@ -25,6 +27,7 @@ class ActiveJobState {
         'deviceName': deviceName,
         'method': method,
         'startedAt': startedAt,
+        'status': status,
       };
 
   factory ActiveJobState.fromJson(Map<String, dynamic> json) {
@@ -35,6 +38,7 @@ class ActiveJobState {
       deviceName: json['deviceName'] as String? ?? '',
       method: json['method'] as String? ?? '',
       startedAt: json['startedAt'] as String? ?? '',
+      status: json['status'] as String? ?? 'running',
     );
   }
 }
@@ -52,15 +56,29 @@ class JobStateFile {
   static Future<void> saveActiveJob(ActiveJobState state) async {
     try {
       final file = _getFile();
-      await file.writeAsString(jsonEncode(state.toJson()), flush: true);
+      file.writeAsStringSync(jsonEncode(state.toJson()), flush: true);
     } catch (_) {}
+  }
+
+  /// Records an interrupted job state for recovery on subsequent application launches.
+  static Future<void> recordInterrupted(ActiveJobState state) async {
+    final interrupted = ActiveJobState(
+      jobId: state.jobId,
+      deviceSerial: state.deviceSerial,
+      devicePath: state.devicePath,
+      deviceName: state.deviceName,
+      method: state.method,
+      startedAt: state.startedAt,
+      status: 'interrupted',
+    );
+    await saveActiveJob(interrupted);
   }
 
   static Future<ActiveJobState?> readActiveJob() async {
     try {
       final file = _getFile();
-      if (!await file.exists()) return null;
-      final content = await file.readAsString();
+      if (!file.existsSync()) return null;
+      final content = file.readAsStringSync();
       if (content.trim().isEmpty) return null;
       return ActiveJobState.fromJson(jsonDecode(content));
     } catch (_) {
@@ -71,8 +89,8 @@ class JobStateFile {
   static Future<void> clearActiveJob() async {
     try {
       final file = _getFile();
-      if (await file.exists()) {
-        await file.delete();
+      if (file.existsSync()) {
+        file.deleteSync();
       }
     } catch (_) {}
   }

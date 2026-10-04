@@ -368,5 +368,156 @@ void main() {
     expect(find.byType(ElevatedButton), findsOneWidget); // Back button only, NO wipe button
     expect(find.text('Secure Wipe'), findsNothing);
   });
+
+  testWidgets('Unknown-media USB device shows neutral Clear-only wording, no flash or HDD claim (Item 4)', (tester) async {
+    tester.view.physicalSize = const Size(1920, 1080);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    const unknownUsb = DeviceProfile(
+      id: 'sdc',
+      name: 'Generic USB Storage Bridge',
+      serialNumber: 'USB-BRIDGE-999',
+      mediaType: MediaType.unknown,
+      busType: 'USB',
+      capacityBytes: 64000000000,
+      rotationalRpm: 0,
+      isRemovable: true,
+    );
+
+    final controller = SanitizationController(
+      enableAutoPolling: false,
+      deferInitialDiscovery: true,
+    );
+    addTearDown(() => controller.dispose());
+    controller.setMockDevices([unknownUsb]);
+
+    await tester.pumpWidget(createSubject(controller, deviceId: 'USB-BRIDGE-999'));
+    await tester.pumpAndSettle();
+
+    // Verify neutral Clear-only warning is present
+    expect(
+      find.text('Clear level only. Logical overwrite cannot guarantee firmware-level purge.'),
+      findsOneWidget,
+    );
+
+    // Verify no Flash or HDD claims are made
+    expect(find.textContaining('Flash media:'), findsNothing);
+    expect(find.textContaining('magnetic'), findsNothing);
+    expect(find.textContaining('HDD'), findsNothing);
+  });
+
+  testWidgets('canCancelJob is false during firmware sanitize (NVMe sanitize/ATA erase) and true during overwrite (Item 5)', (tester) async {
+    final controller = SanitizationController(
+      enableAutoPolling: false,
+      deferInitialDiscovery: true,
+    );
+    addTearDown(() => controller.dispose());
+
+    const nvmeDevice = DeviceProfile(
+      id: 'nvme0n1',
+      name: 'Samsung 980 Pro',
+      serialNumber: 'NVME-PRO-1',
+      mediaType: MediaType.nvmeSsd,
+      busType: 'NVMe',
+      capacityBytes: 500000000000,
+      supportsNvmeSanitize: true,
+    );
+
+    final firmwareJob = SanitizationJob(
+      jobId: 'firmware-job-1',
+      device: nvmeDevice,
+      dataSensitivity: DataSensitivity.confidential,
+      deviceCondition: DeviceCondition.functional,
+      disposalPath: DisposalPath.recycling,
+      riskScore: 0.5,
+      targetCategory: NistCategory.purge,
+      recommendedMethod: SanitizationMethod.nvmeSanitize,
+      standardReference: 'NIST SP 800-88 Purge',
+      explanationText: 'NVMe Sanitize Crypto Erase',
+      status: JobStatus.sanitizing,
+      progress: 0.30,
+      currentStageDescription: 'Firmware Sanitize in progress',
+      startTime: DateTime.now(),
+    );
+    controller.setMockJob(firmwareJob);
+
+    // Firmware sanitize cannot be cancelled
+    expect(controller.canCancelJob, false);
+
+    // Overwrite job CAN be cancelled
+    final overwriteJob = SanitizationJob(
+      jobId: 'overwrite-job-1',
+      device: usbDevice,
+      dataSensitivity: DataSensitivity.confidential,
+      deviceCondition: DeviceCondition.functional,
+      disposalPath: DisposalPath.recycling,
+      riskScore: 0.5,
+      targetCategory: NistCategory.clear,
+      recommendedMethod: SanitizationMethod.singlePassOverwrite,
+      standardReference: 'NIST SP 800-88 Clear',
+      explanationText: 'Single-Pass Zero Overwrite',
+      status: JobStatus.sanitizing,
+      progress: 0.30,
+      currentStageDescription: 'Writing zeros',
+      startTime: DateTime.now(),
+    );
+    controller.setMockJob(overwriteJob);
+
+    expect(controller.canCancelJob, true);
+  });
+
+  testWidgets('SIMULATION banner is displayed on Screen 2 and in progress area (Item 5)', (tester) async {
+    tester.view.physicalSize = const Size(1920, 1080);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final controller = SanitizationController(
+      enableAutoPolling: false,
+      deferInitialDiscovery: true,
+    );
+    addTearDown(() => controller.dispose());
+    controller.setMockDevices([usbDevice]);
+    controller.isSimulated = true;
+
+    final simJob = SanitizationJob(
+      jobId: 'sim-job-1',
+      device: usbDevice,
+      dataSensitivity: DataSensitivity.confidential,
+      deviceCondition: DeviceCondition.functional,
+      disposalPath: DisposalPath.recycling,
+      riskScore: 0.5,
+      targetCategory: NistCategory.clear,
+      recommendedMethod: SanitizationMethod.singlePassOverwrite,
+      standardReference: 'NIST SP 800-88 Clear',
+      explanationText: 'Simulated Wipe',
+      status: JobStatus.sanitizing,
+      progress: 0.5,
+      currentStageDescription: 'Simulating zero write (50%)',
+      startTime: DateTime.now(),
+    );
+    controller.setMockJob(simJob);
+
+    await tester.pumpWidget(createSubject(controller));
+    await tester.pumpAndSettle();
+
+    // 1. Screen 2 banner
+    expect(
+      find.text('SIMULATION MODE — No real drives will be modified'),
+      findsOneWidget,
+    );
+
+    // 2. Progress area banner
+    expect(
+      find.text('SIMULATION MODE'),
+      findsWidgets,
+    );
+  });
 }
 

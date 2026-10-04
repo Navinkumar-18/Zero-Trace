@@ -139,8 +139,8 @@ class DriveDetailScreen extends StatelessWidget {
     final isWipeFailed = isFailed && !wipeCompleted;
 
     final supportLevel = computeSupportLevel(device);
-    final isFlash = device.mediaType == MediaType.usbFlash ||
-        device.mediaType == MediaType.emmc;
+    final isFlash = device.mediaTechnology == MediaTechnology.flash;
+    final isUnknown = device.mediaTechnology == MediaTechnology.unknown;
     final cert = controller.completedCertificate;
     final hasCert = cert != null && isFinished;
     final verifyPassed = cert?.evidence.verifiedPassed ?? false;
@@ -307,31 +307,55 @@ class DriveDetailScreen extends StatelessWidget {
                         const SizedBox(height: 4),
                         _metaRow('Method:', 'Decided at confirmation'),
 
-                        // Flash caveat
-                        if (supportLevel == SanitizationSupportLevel.clearOnly &&
-                            isFlash) ...[
-                          const SizedBox(height: 8),
-                          Container(
-                            padding: const EdgeInsets.all(8),
-                            decoration: BoxDecoration(
-                              color: AppTheme.accentGold.withValues(alpha: 0.08),
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: const Row(
-                              children: [
-                                Icon(Icons.info_outline,
-                                    color: AppTheme.accentGold, size: 14),
-                                SizedBox(width: 6),
-                                Expanded(
-                                  child: Text(
-                                    'Flash media: Clear level only. Overwrite cannot reach remapped blocks.',
-                                    style: TextStyle(
-                                        color: AppTheme.accentGold, fontSize: 11),
+                        // Clear-only caveat (Flash vs Unknown)
+                        if (supportLevel == SanitizationSupportLevel.clearOnly) ...[
+                          if (isFlash) ...[
+                            const SizedBox(height: 8),
+                            Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color: AppTheme.accentGold.withValues(alpha: 0.08),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: const Row(
+                                children: [
+                                  Icon(Icons.info_outline,
+                                      color: AppTheme.accentGold, size: 14),
+                                  SizedBox(width: 6),
+                                  Expanded(
+                                    child: Text(
+                                      'Flash media: Clear level only. Overwrite cannot reach remapped blocks.',
+                                      style: TextStyle(
+                                          color: AppTheme.accentGold, fontSize: 11),
+                                    ),
                                   ),
-                                ),
-                              ],
+                                ],
+                              ),
                             ),
-                          ),
+                          ] else if (isUnknown) ...[
+                            const SizedBox(height: 8),
+                            Container(
+                              padding: const EdgeInsets.all(8),
+                              decoration: BoxDecoration(
+                                color: AppTheme.accentGold.withValues(alpha: 0.08),
+                                borderRadius: BorderRadius.circular(8),
+                              ),
+                              child: const Row(
+                                children: [
+                                  Icon(Icons.info_outline,
+                                      color: AppTheme.accentGold, size: 14),
+                                  SizedBox(width: 6),
+                                  Expanded(
+                                    child: Text(
+                                      'Clear level only. Logical overwrite cannot guarantee firmware-level purge.',
+                                      style: TextStyle(
+                                          color: AppTheme.accentGold, fontSize: 11),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
                         ],
 
                         // Badge (post-wipe)

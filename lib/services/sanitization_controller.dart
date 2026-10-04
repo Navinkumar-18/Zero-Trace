@@ -280,6 +280,59 @@ class SanitizationController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Handle window exit confirmation when a job is active.
+  /// Records the job as "interrupted" (NOT cancelled) in JobStateFile.
+  /// For software overwrite: child process is aborted / marked interrupted.
+  /// For firmware sanitize: commands execute on storage controller firmware;
+  /// cannot be aborted without bricking drive, so it is left running on hardware and
+  /// recorded as "interrupted" (never reported as "cancelled").
+  Future<void> interruptOnExit() async {
+    if (_currentJob == null) return;
+    final job = _currentJob!;
+
+    // Save interrupted state to JobStateFile so next launch displays interrupted card
+    await JobStateFile.recordInterrupted(ActiveJobState(
+      jobId: job.jobId,
+      deviceSerial: job.device.serialNumber,
+      devicePath: job.device.id,
+      deviceName: job.device.name,
+      method: job.effectiveMethod.displayName,
+      startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
+    ));
+
+    final isFirmware = !canCancelJob;
+    job.status = JobStatus.failed;
+    job.endTime = DateTime.now();
+
+    if (isFirmware) {
+      job.currentStageDescription = 'Interrupted: Firmware Sanitize in progress on hardware controller';
+      _addLog('EXIT INTERRUPT: Firmware sanitize in progress on controller. Not cancelled.');
+    } else {
+      job.currentStageDescription = 'Interrupted: Partially Wiped';
+      _addLog('EXIT INTERRUPT: Overwrite interrupted by user exit. Warning: Drive may be partially wiped.');
+    }
+
+    await _auditLogService.appendEntry(
+      AuditLogEntry(
+        timestamp: DateTime.now().toIso8601String(),
+        jobId: job.jobId,
+        deviceSerial: job.device.serialNumber,
+        devicePath: job.device.id,
+        method: job.effectiveMethod.displayName,
+        standardReference: job.standardReference,
+        nistCategory: 'INTERRUPTED',
+        success: false,
+        fingerprintHash: isFirmware ? 'INTERRUPTED_FIRMWARE' : 'INTERRUPTED_PARTIALLY_WIPED',
+        entropyScore: 0.0,
+        sampleCount: 0,
+        commandLog: List<String>.from(job.logs)
+          ..add('Application exited during wipe - operation interrupted.'),
+      ),
+    );
+
+    notifyListeners();
+  }
+
   DeviceProfile? attachOrphan() {
     if (_orphanResult?.activeJobState != null) {
       final active = _orphanResult!.activeJobState!;
@@ -331,6 +384,13 @@ class SanitizationController extends ChangeNotifier {
   List<DeviceProfile> get devices => _devices;
   DeviceProfile? get selectedDevice => _selectedDevice;
   bool get isRealMode => _isRealMode;
+  bool get isSimulated => !_isRealMode;
+
+  @visibleForTesting
+  set isSimulated(bool value) {
+    _isRealMode = !value;
+    notifyListeners();
+  }
   String? get lastScanError => _intelligenceService.lastScanError;
   bool get isAutoPollingActive => _autoPollTimer?.isActive ?? false;
   ClassificationService get classificationService => _classificationService;

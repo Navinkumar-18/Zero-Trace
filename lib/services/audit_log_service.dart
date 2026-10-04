@@ -78,7 +78,7 @@ class AuditLogService {
     try {
       final file = _getLogFile();
       final line = '${jsonEncode(entry.toJson())}\n';
-      await file.writeAsString(line, mode: FileMode.append, flush: true);
+      file.writeAsStringSync(line, mode: FileMode.append, flush: true);
     } catch (_) {
       // In web/sandboxed modes, this might fail, fail silently or print.
     }

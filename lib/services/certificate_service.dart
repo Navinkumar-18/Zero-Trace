@@ -157,10 +157,7 @@ class CertificateService {
     }
 
     // Flash media without firmware-level purge is Clear-only
-    final isFlash = device.mediaType == MediaType.usbFlash ||
-        device.mediaType == MediaType.emmc ||
-        device.mediaType == MediaType.sataSsd ||
-        device.mediaType == MediaType.nvmeSsd;
+    final isFlash = device.mediaTechnology == MediaTechnology.flash;
 
     if (isFlash &&
         !device.supportsAtaSanitize &&

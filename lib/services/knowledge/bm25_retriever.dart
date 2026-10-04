@@ -55,7 +55,17 @@ class BM25Retriever {
     'in', 'on', 'with', 'at', 'by', 'from', 'about', 'what', 'how', 'why', 'can',
     'should', 'i', 'my', 'this', 'that', 'it', 'me', 'be', 'do', 'does', 'did',
     'you', 'your', 'please', 'tell', 'describe', 'explain', 'show', 'write', 'give',
-    'simple', 'term', 'terms',
+    'simple', 'term', 'terms', 'vs', 'versus', 'between', 'not', 'no',
+  };
+
+  static const Set<String> protectedAcronyms = {
+    'ssd',
+    'hdd',
+    'nvme',
+    'hpa',
+    'dco',
+    'ftl',
+    'opal',
   };
 
   /// Tokenizes text with light stemming, alias expansion, and stopword removal.
@@ -71,8 +81,13 @@ class BM25Retriever {
     final result = <String>[];
     for (final token in rawTokens) {
       if (stopWords.contains(token)) continue;
+      if (protectedAcronyms.contains(token)) {
+        result.add(token);
+        continue;
+      }
 
-      final stemmed = _lightStem(token);
+      final canonicalPre = _aliasMap[token] ?? token;
+      final stemmed = _lightStem(canonicalPre);
       final canonical = _aliasMap[stemmed] ?? stemmed;
       result.add(canonical);
     }
@@ -82,17 +97,24 @@ class BM25Retriever {
   static const Map<String, String> _aliasMap = {
     'crypto': 'cryptograph',
     'cryptographic': 'cryptograph',
-    'ftl': 'translat',
-    'hdd': 'magnet',
     'destruct': 'destroy',
     'destruction': 'destroy',
     'cert': 'certif',
     'certificate': 'certif',
-    'sanitize': 'sanit',
-    'sanitizing': 'sanit',
-    'sanitization': 'sanit',
-    'overwriting': 'overwrit',
+    'erase': 'eras',
+    'erased': 'eras',
+    'erases': 'eras',
+    'erasing': 'eras',
     'overwrite': 'overwrit',
+    'overwrites': 'overwrit',
+    'overwriting': 'overwrit',
+    'overwritten': 'overwrit',
+    'sanitize': 'sanit',
+    'sanitizes': 'sanit',
+    'sanitizing': 'sanit',
+    'sanitized': 'sanit',
+    'sanitization': 'sanit',
+    'sanitizations': 'sanit',
     'purging': 'purg',
     'purge': 'purg',
     'clearing': 'clear',
@@ -101,17 +123,33 @@ class BM25Retriever {
   static String _lightStem(String word) {
     if (word.length <= 3) return word;
 
+    // Plural and s/es stripping:
+    // Plural -ies -> -y (e.g. categories -> category)
+    if (word.endsWith('ies') && word.length > 4) {
+      return '${word.substring(0, word.length - 3)}y';
+    }
+
+    // Only strip -es if the root ends in sibilants (s, x, z, ch, sh)
+    if ((word.endsWith('sses') ||
+            word.endsWith('shes') ||
+            word.endsWith('ches') ||
+            word.endsWith('xes') ||
+            word.endsWith('zes')) &&
+        word.length > 4) {
+      return word.substring(0, word.length - 2);
+    }
+
+    // Words ending in 's' (excluding 'ss'): strip 's'
+    // E.g. devices -> device, erases -> erase
+    if (word.endsWith('s') && !word.endsWith('ss') && word.length > 3) {
+      return word.substring(0, word.length - 1);
+    }
+
     if (word.endsWith('ing') && word.length > 5) {
       return word.substring(0, word.length - 3);
     }
     if (word.endsWith('ed') && word.length > 4) {
       return word.substring(0, word.length - 2);
-    }
-    if (word.endsWith('es') && word.length > 4) {
-      return word.substring(0, word.length - 2);
-    }
-    if (word.endsWith('s') && !word.endsWith('ss') && word.length > 3) {
-      return word.substring(0, word.length - 1);
     }
     return word;
   }
@@ -185,8 +223,10 @@ class BM25Retriever {
       final bodyTokens = tokenize(entry.content);
 
       double baseScore = 0.0;
+      int matchedQueryTerms = 0;
+      final uniqueQueryTerms = queryTokens.toSet();
 
-      for (final term in queryTokens) {
+      for (final term in uniqueQueryTerms) {
         final idf = _calculateIdf(term);
 
         // Weighted term frequency
@@ -199,6 +239,7 @@ class BM25Retriever {
             (tfBody * bodyWeight);
 
         if (weightedTf > 0) {
+          matchedQueryTerms++;
           final denominator = weightedTf + k1 * (1 - b + b * (docLength / _avgDocLength));
           final tfComponent = (weightedTf * (k1 + 1)) / denominator;
           baseScore += idf * tfComponent;
@@ -206,6 +247,9 @@ class BM25Retriever {
       }
 
       if (baseScore > 0) {
+        // Coordination factor: penalize partial query overlap (precision guard)
+        final coverage = matchedQueryTerms / uniqueQueryTerms.length;
+        baseScore *= math.pow(coverage, 2.0);
         // Compute context boost (BOOST only, never exclude)
         double boost = 1.0;
         if (context != null) {

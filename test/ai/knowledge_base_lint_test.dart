@@ -108,7 +108,7 @@ void main() {
       );
     });
 
-    test('flags overclaim words unless inline marker <!-- lint-allow: <word> --> is present', () {
+    test('flags overclaim words unless inline marker <!-- lint-allow: <word> --> is present in the same paragraph', () {
       final overclaims = ['guaranteed', 'unrecoverable', 'military-grade', '100% secure'];
 
       for (final word in overclaims) {
@@ -148,6 +148,50 @@ void main() {
           reason: 'Word "$word" must be permitted when <!-- lint-allow: $word --> is present',
         );
       }
+    });
+
+    test('lint-allow must name exact word and does not silence a different overclaim word (Item 7)', () {
+      // One marker (<!-- lint-allow: guaranteed -->) must NOT silence "military-grade"
+      final mismatchedEntry = KnowledgeEntry(
+        id: 'mismatched_marker',
+        title: 'Mismatched Marker Entry',
+        reviewStatus: KnowledgeReviewStatus.reviewed,
+        lastReviewed: DateTime(2026, 10, 4),
+        topics: ['test'],
+        keywords: ['test'],
+        appliesWhen: const {},
+        errorCodes: const [],
+        content: 'This erasure is military-grade <!-- lint-allow: guaranteed --> under testing.',
+      );
+
+      final result = KnowledgeLint.lintEntry(mismatchedEntry);
+      expect(
+        result.issues.any((i) => i.rule == 'overclaim_word' && i.message.contains('military-grade')),
+        true,
+        reason: 'Marker for "guaranteed" must NOT silence "military-grade"',
+      );
+    });
+
+    test('lint-allow marker in one paragraph does NOT silence word in a different paragraph (Item 7)', () {
+      final multiParagraphEntry = KnowledgeEntry(
+        id: 'cross_paragraph_marker',
+        title: 'Cross Paragraph Marker Entry',
+        reviewStatus: KnowledgeReviewStatus.reviewed,
+        lastReviewed: DateTime(2026, 10, 4),
+        topics: ['test'],
+        keywords: ['test'],
+        appliesWhen: const {},
+        errorCodes: const [],
+        content: 'Paragraph 1: Sanitization is guaranteed <!-- lint-allow: guaranteed --> in lab conditions.\n\n'
+            'Paragraph 2: Media erasure is guaranteed on magnetic media.',
+      );
+
+      final result = KnowledgeLint.lintEntry(multiParagraphEntry);
+      expect(
+        result.issues.any((i) => i.rule == 'overclaim_word'),
+        true,
+        reason: 'Marker in paragraph 1 must NOT silence "guaranteed" in paragraph 2',
+      );
     });
 
     test('blocks Section/§/Table/Clause/Appendix + number', () {

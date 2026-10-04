@@ -194,5 +194,122 @@ void main() {
     final wipeButtonFinder = find.widgetWithText(ElevatedButton, 'SECURE WIPE');
     expect(tester.widget<ElevatedButton>(wipeButtonFinder).onPressed, isNull);
   });
+
+  testWidgets('serial+size re-check aborts at confirm (Item 5)', (tester) async {
+    tester.view.physicalSize = const Size(1920, 1080);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    const originalDevice = DeviceProfile(
+      id: 'sdb',
+      name: 'SanDisk Blade',
+      serialNumber: 'SN-PINNED-1234',
+      mediaType: MediaType.usbFlash,
+      busType: 'USB',
+      capacityBytes: 16000000000,
+      isRemovable: true,
+    );
+
+    // Controller has swapped or resized drive under same stable id
+    const modifiedDevice = DeviceProfile(
+      id: 'sdb',
+      name: 'SanDisk Blade (Swapped)',
+      serialNumber: 'SN-PINNED-1234',
+      mediaType: MediaType.usbFlash,
+      busType: 'USB',
+      capacityBytes: 32000000000, // Size changed!
+      isRemovable: true,
+    );
+
+    final controller = SanitizationController(
+      enableAutoPolling: false,
+      deferInitialDiscovery: true,
+    );
+    addTearDown(() => controller.dispose());
+    controller.setMockDevices([modifiedDevice]);
+
+    ConfirmWipeResult? result;
+
+    await tester.pumpWidget(
+      ChangeNotifierProvider<SanitizationController>.value(
+        value: controller,
+        child: MaterialApp(
+          home: Scaffold(
+            body: Builder(
+              builder: (ctx) => ElevatedButton(
+                onPressed: () async {
+                  result = await showDialog<ConfirmWipeResult>(
+                    context: ctx,
+                    builder: (_) => const SimpleConfirmDialog(device: originalDevice),
+                  );
+                },
+                child: const Text('Open Dialog'),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // Open dialog
+    await tester.tap(find.text('Open Dialog'));
+    await tester.pumpAndSettle();
+
+    // Enter last 4 digits of original device serial: '1234'
+    final textFieldFinder = find.byType(TextField);
+    await tester.enterText(textFieldFinder, '1234');
+    await tester.pumpAndSettle();
+
+    // SECURE WIPE button is enabled
+    final wipeButtonFinder = find.widgetWithText(ElevatedButton, 'SECURE WIPE');
+    expect(tester.widget<ElevatedButton>(wipeButtonFinder).onPressed, isNotNull);
+
+    // Click SECURE WIPE
+    await tester.tap(wipeButtonFinder);
+    await tester.pumpAndSettle();
+
+    // Wipe must be aborted due to serial/size mismatch at confirm
+    expect(result, isNull);
+    expect(find.text('Drive identity changed or disconnected.'), findsOneWidget);
+  });
+
+  testWidgets('SIMULATION banner is displayed in confirm dialog (Item 5)', (tester) async {
+    const simDevice = DeviceProfile(
+      id: 'sdb',
+      name: 'Simulated USB Drive',
+      serialNumber: 'SIM-9999',
+      mediaType: MediaType.usbFlash,
+      busType: 'USB',
+      capacityBytes: 16000000000,
+      isRemovable: true,
+    );
+
+    final controller = SanitizationController(
+      enableAutoPolling: false,
+      deferInitialDiscovery: true,
+    );
+    addTearDown(() => controller.dispose());
+    controller.setMockDevices([simDevice]);
+    controller.isSimulated = true;
+
+    await tester.pumpWidget(
+      ChangeNotifierProvider<SanitizationController>.value(
+        value: controller,
+        child: const MaterialApp(
+          home: Scaffold(
+            body: SimpleConfirmDialog(device: simDevice),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // Verify SIMULATION banner in confirm dialog
+    expect(find.text('SIMULATION MODE — Virtual Wipe'), findsOneWidget);
+  });
 }
 

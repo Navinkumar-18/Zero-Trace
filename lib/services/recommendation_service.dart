@@ -40,7 +40,7 @@ class RecommendationService implements IRecommendationService {
     if (supportLevel == SanitizationSupportLevel.clearOnly &&
         (sensitivity == DataSensitivity.confidential || sensitivity == DataSensitivity.restricted)) {
       // Only apply to flash media — HDD overwrite is effective for magnetic media
-      if (profile.mediaType != MediaType.hdd) {
+      if (profile.mediaTechnology == MediaTechnology.flash) {
         final mediaLabel = profile.mediaType.displayName;
         return RecommendationResult(
           method: SanitizationMethod.physicalDestructionRecommended,

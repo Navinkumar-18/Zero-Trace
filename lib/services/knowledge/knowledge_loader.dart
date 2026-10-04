@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'knowledge_entry.dart';
 import 'knowledge_lint.dart';
 
@@ -12,6 +13,14 @@ class KnowledgeLoader {
     this.autoLint = true,
     this.wordCap = KnowledgeLint.defaultWordCap,
   });
+
+  /// Production loader ensuring release guard uses [kReleaseMode].
+  factory KnowledgeLoader.production({bool autoLint = false}) {
+    return KnowledgeLoader(
+      isRelease: kReleaseMode,
+      autoLint: autoLint,
+    );
+  }
 
   /// Loads and parses all markdown knowledge base entries from a directory.
   /// If [isRelease] is true, excludes any entries with reviewStatus != reviewed.

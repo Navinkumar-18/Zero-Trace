@@ -72,8 +72,11 @@ extension SanitizationSupportLevelExtension on SanitizationSupportLevel {
 /// Note: system-disk protection is handled separately (the device stays
 /// PROTECTED as before); this function does not return a "protected" level.
 SanitizationSupportLevel computeSupportLevel(DeviceProfile device) {
-  // Unknown / unidentifiable media → unsupported
-  if (device.mediaType == MediaType.unknown) {
+  // DriveType.unknown or unidentifiable bus with unknown media → unsupported
+  // USB or SATA with unknown media is clearOnly (cautious Clear-only wording per Item 4)
+  if (device.mediaType == MediaType.unknown &&
+      device.driveType != DriveType.usb &&
+      !device.busType.toUpperCase().contains('SATA')) {
     return SanitizationSupportLevel.unsupported;
   }
 
@@ -110,10 +113,13 @@ String supportLevelReason(DeviceProfile device) {
       return 'ATA Secure Erase available; controller-level erase reaches all user data blocks.';
 
     case SanitizationSupportLevel.clearOnly:
-      if (device.mediaType == MediaType.hdd) {
+      if (device.mediaTechnology == MediaTechnology.rotational) {
         return 'No firmware purge available; logical overwrite is effective for magnetic media.';
+      } else if (device.mediaTechnology == MediaTechnology.flash) {
+        return 'No firmware purge available; overwrite cannot reach remapped or over-provisioned flash blocks.';
+      } else {
+        return 'No firmware purge available; logical overwrite provides Clear-level assurance.';
       }
-      return 'No firmware purge available; overwrite cannot reach remapped or over-provisioned flash blocks.';
 
     case SanitizationSupportLevel.unsupported:
       return 'Unknown media type or bus; sanitization capability cannot be determined.';

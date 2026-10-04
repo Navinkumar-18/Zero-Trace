@@ -168,6 +168,13 @@ class DeviceProfile {
       case MediaType.nvmeSsd:
         return DriveType.nvme;
       case MediaType.unknown:
+        final b = busType.toUpperCase();
+        if (b.contains('USB')) {
+          return DriveType.usb;
+        }
+        if (b.contains('SD') || b.contains('MMC')) {
+          return DriveType.sd;
+        }
         return DriveType.unknown;
     }
   }
@@ -207,33 +214,17 @@ class DeviceProfile {
             mediaType == MediaType.emmc)) {
       return MediaTechnology.unknown;
     }
-    // 3) Contradictory: reported as HDD but RPM is explicitly 0 (not rotational)
-    if (mediaType == MediaType.hdd && rotationalRpm == 0) {
-      return MediaTechnology.unknown;
-    }
-
-    // Positive RPM decides rotational (USB HDD, SATA HDD, etc.)
-    if (hasPositiveRpm) {
-      return MediaTechnology.rotational;
-    }
-
-    // If reported as HDD but no positive RPM (null or 0):
-    // "Remove the 'reported as HDD but RPM 0' case. NVMe, SD, eMMC = flash; positive RPM = rotational;
-    //  USB or SATA with unknown media and no RPM = unknown"
-    if (mediaType == MediaType.hdd) {
-      return MediaTechnology.unknown;
-    }
 
     // Explicit flash media or dedicated flash buses
     // NVMe, SD, eMMC = flash
-    if (mediaType == MediaType.nvmeSsd ||
-        mediaType == MediaType.emmc ||
-        mediaType == MediaType.usbFlash ||
-        mediaType == MediaType.sataSsd ||
-        driveType == DriveType.sd ||
-        driveType == DriveType.nvme ||
-        driveType == DriveType.ssd) {
+    if (isExplicitFlash) {
       return MediaTechnology.flash;
+    }
+
+    // Positive RPM decides rotational (USB HDD, SATA HDD, etc.)
+    // or explicit HDD media/drive type without conflicting flash signals
+    if (hasPositiveRpm || isExplicitHdd) {
+      return MediaTechnology.rotational;
     }
 
     // USB or SATA with unknown media and no RPM = unknown
@@ -252,8 +243,10 @@ class DeviceProfile {
   String? get simpleDisabledReason {
     if (isSystemDisk) return 'System drive – protected';
     if (disabledReason != null) return disabledReason;
-    // Internal eMMC is NOT disabled by default (only if system drive or unsupported)
-    if (mediaType == MediaType.unknown || (driveType == DriveType.unknown && mediaType != MediaType.emmc)) {
+    // Internal eMMC is NOT disabled by default (only if system drive or unsupported).
+    // USB or SATA with unknown media is selectable for Clear-only wiping.
+    if ((driveType == DriveType.unknown && mediaType != MediaType.emmc) ||
+        (mediaType == MediaType.unknown && driveType != DriveType.usb && !busType.toUpperCase().contains('SATA'))) {
       return 'Unknown or unsupported device type – cannot wipe safely';
     }
     return null;

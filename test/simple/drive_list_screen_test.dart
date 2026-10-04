@@ -223,4 +223,137 @@ void main() {
 
     expect(find.text('Interrupted wipe detected'), findsNothing);
   });
+
+  testWidgets('DriveType.unknown disabled with reason (Item 5)', (tester) async {
+    tester.view.physicalSize = const Size(1920, 1080);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    const unknownDriveType = DeviceProfile(
+      id: 'loop0',
+      name: 'Loop / Virtual Device',
+      serialNumber: 'UNKNOWN-LOOP-1',
+      mediaType: MediaType.unknown,
+      busType: 'Virtual',
+      capacityBytes: 1000000000,
+      isRemovable: false,
+      disabledReason: 'Unknown drive type – sanitization unsupported',
+    );
+
+    final controller = SanitizationController(enableAutoPolling: false);
+    addTearDown(() => controller.dispose());
+    controller.setMockDevices([unknownDriveType]);
+
+    await tester.pumpWidget(createSubject(controller));
+    await tester.pumpAndSettle();
+
+    // Toggle internal drives to see non-removable virtual drive
+    await tester.tap(find.text('Show internal drives'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Loop / Virtual Device'), findsOneWidget);
+    expect(find.text('Unknown drive type – sanitization unsupported'), findsOneWidget);
+
+    // Verify DriveType.unknown
+    expect(unknownDriveType.driveType, DriveType.unknown);
+    expect(unknownDriveType.simpleDisabledReason, 'Unknown drive type – sanitization unsupported');
+  });
+
+  group('Internal eMMC Qualification (Moved to drive-list tests per Item 5)', () {
+    test('internal eMMC is non-removable, not typed SD, and not disabled by default', () {
+      const emmc = DeviceProfile(
+        id: 'mmcblk0',
+        name: 'SanDisk DF4064 eMMC 64GB',
+        serialNumber: 'EMMC64G-99A1',
+        mediaType: MediaType.emmc,
+        busType: 'eMMC 5.1',
+        capacityBytes: 64424509440,
+        rotationalRpm: 0,
+        isRemovable: false,
+        isSystemDisk: false,
+      );
+
+      expect(emmc.isRemovable, false, reason: 'Internal eMMC must be non-removable');
+      expect(emmc.driveType != DriveType.sd, true, reason: 'Internal eMMC must NOT be typed SD');
+      expect(emmc.driveType, isNot(DriveType.sd));
+      expect(emmc.simpleDisabledReason, isNull, reason: 'Internal eMMC must NOT be disabled by default');
+      expect(emmc.mediaTechnology, MediaTechnology.flash);
+    });
+
+    test('internal eMMC is disabled ONLY if it is the system drive or unsupported', () {
+      const emmcSys = DeviceProfile(
+        id: 'mmcblk0',
+        name: 'System Board eMMC',
+        serialNumber: 'EMMC-SYS-1',
+        mediaType: MediaType.emmc,
+        busType: 'eMMC',
+        capacityBytes: 64424509440,
+        rotationalRpm: 0,
+        isRemovable: false,
+        isSystemDisk: true,
+      );
+      expect(emmcSys.simpleDisabledReason, 'System drive – protected');
+
+      const emmcDisabled = DeviceProfile(
+        id: 'mmcblk0',
+        name: 'Faulty eMMC',
+        serialNumber: 'EMMC-FAULT',
+        mediaType: MediaType.emmc,
+        busType: 'eMMC',
+        capacityBytes: 64424509440,
+        rotationalRpm: 0,
+        isRemovable: false,
+        isSystemDisk: false,
+        disabledReason: 'Hardware write-protection active',
+      );
+      expect(emmcDisabled.simpleDisabledReason, 'Hardware write-protection active');
+    });
+
+    testWidgets('internal eMMC is hidden by default and selectable when internal drives shown', (tester) async {
+      tester.view.physicalSize = const Size(1920, 1080);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      const emmc = DeviceProfile(
+        id: 'mmcblk0',
+        name: 'SanDisk DF4064 eMMC 64GB',
+        serialNumber: 'EMMC64G-99A1',
+        mediaType: MediaType.emmc,
+        busType: 'eMMC 5.1',
+        capacityBytes: 64424509440,
+        rotationalRpm: 0,
+        isRemovable: false,
+        isSystemDisk: false,
+      );
+
+      final controller = SanitizationController(enableAutoPolling: false);
+      addTearDown(() => controller.dispose());
+      controller.setMockDevices([usbDevice, emmc]);
+
+      await tester.pumpWidget(createSubject(controller));
+      await tester.pumpAndSettle();
+
+      // eMMC hidden by default
+      expect(find.text('SanDisk DF4064 eMMC 64GB'), findsNothing);
+
+      // Toggle internal drives
+      await tester.tap(find.text('Show internal drives'));
+      await tester.pumpAndSettle();
+
+      // Visible and selectable
+      expect(find.text('SanDisk DF4064 eMMC 64GB'), findsOneWidget);
+      final inkWellFinder = find.widgetWithText(InkWell, 'SanDisk DF4064 eMMC 64GB');
+      expect(inkWellFinder, findsOneWidget);
+      final inkWell = tester.widget<InkWell>(inkWellFinder);
+      expect(inkWell.onTap, isNotNull);
+      expect(find.text('System drive – protected'), findsNothing);
+      expect(find.text('Unknown or unsupported device type – cannot wipe safely'), findsNothing);
+    });
+  });
 }

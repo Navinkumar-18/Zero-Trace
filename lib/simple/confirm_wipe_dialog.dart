@@ -106,8 +106,8 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
     final isDestroyRecommended =
         method == SanitizationMethod.physicalDestructionRecommended ||
         method == SanitizationMethod.unsupportedFlagForDestroy;
-    final isFlash = widget.device.mediaType == MediaType.usbFlash ||
-        widget.device.mediaType == MediaType.emmc;
+    final isFlash = widget.device.mediaTechnology == MediaTechnology.flash;
+    final isUnknown = widget.device.mediaTechnology == MediaTechnology.unknown;
     final isClearOnly = supportLevel == SanitizationSupportLevel.clearOnly;
 
     return Dialog(
@@ -236,6 +236,28 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                         child: Text(
                           'Flash media: overwrite cannot reach remapped blocks. '
                           'Result will be "Clear" level, not "Purge".',
+                          style: TextStyle(color: AppTheme.accentGold, fontSize: 11),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ] else if (isClearOnly && isUnknown) ...[
+                const SizedBox(height: 8),
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: AppTheme.accentGold.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: AppTheme.accentGold.withValues(alpha: 0.3)),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.info_outline, color: AppTheme.accentGold, size: 16),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Clear level only. Logical overwrite cannot guarantee firmware-level purge.',
                           style: TextStyle(color: AppTheme.accentGold, fontSize: 11),
                         ),
                       ),

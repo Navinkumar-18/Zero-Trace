@@ -86,13 +86,62 @@ void main() {
       final cryptoResults = retriever.search('crypto');
       expect(cryptoResults.any((m) => m.entry.id == 'kb_crypto_erase'), true);
 
-      // "ftl" -> "translat"
+      // "ftl" matches topic directly without mangling
       final ftlResults = retriever.search('ftl');
       expect(ftlResults.any((m) => m.entry.id == 'kb_flash_translation_layer'), true);
 
       // "ssds" -> "ssd"
       final ssdResults = retriever.search('ssds');
       expect(ssdResults.any((m) => m.entry.id == 'kb_flash_translation_layer'), true);
+    });
+
+    test('stemmer matches required variants and preserves protected storage acronyms (Item 1)', () {
+      // 1. device / devices match each other
+      expect(
+        BM25Retriever.tokenize('device'),
+        BM25Retriever.tokenize('devices'),
+        reason: 'device and devices must tokenize to the same stem',
+      );
+
+      // 2. erase / erases / erasing / erased match each other
+      final eraseVariants = ['erase', 'erases', 'erasing', 'erased'];
+      final eraseStems = eraseVariants.map(BM25Retriever.tokenize).toList();
+      for (int i = 1; i < eraseStems.length; i++) {
+        expect(
+          eraseStems[i],
+          eraseStems[0],
+          reason: '${eraseVariants[i]} must match ${eraseVariants[0]}',
+        );
+      }
+
+      // 3. overwrite / overwriting / overwritten match each other
+      final overwriteVariants = ['overwrite', 'overwriting', 'overwritten'];
+      final overwriteStems = overwriteVariants.map(BM25Retriever.tokenize).toList();
+      for (int i = 1; i < overwriteStems.length; i++) {
+        expect(
+          overwriteStems[i],
+          overwriteStems[0],
+          reason: '${overwriteVariants[i]} must match ${overwriteVariants[0]}',
+        );
+      }
+
+      // 4. sanitize / sanitization match each other
+      expect(
+        BM25Retriever.tokenize('sanitize'),
+        BM25Retriever.tokenize('sanitization'),
+        reason: 'sanitize and sanitization must match each other',
+      );
+
+      // 5. Protected acronyms must NOT be mangled
+      final protectedAcronyms = ['ssd', 'hdd', 'nvme', 'hpa', 'dco', 'ftl', 'opal'];
+      for (final acronym in protectedAcronyms) {
+        final tokens = BM25Retriever.tokenize(acronym);
+        expect(
+          tokens,
+          [acronym],
+          reason: 'Acronym "$acronym" must not be mangled or altered by stemmer/alias map',
+        );
+      }
     });
 
     test('applies_when and error_codes only BOOST, never exclude', () {
@@ -159,22 +208,50 @@ void main() {
       expect(retriever.findBestMatch('what is'), isNull);
     });
 
-    test('calibrates "not sure" threshold against in-scope and out-of-scope question sets', () {
-      final inScopeQuestions = [
-        'What is CLEAR vs PURGE?',
-        'Explain cryptographic erase',
-        'Why is overwrite not recommended for SSDs?',
-        'What are the NIST media sanitization categories?',
-        'How does the Flash Translation Layer manage blocks?',
+    test('calibrates "not sure" threshold against in-scope questions, hard negatives, and out-of-scope queries (Item 2)', () {
+      // Data-driven in-scope queries derived from all loaded knowledge fixtures
+      final inScopeQuestions = <String>[];
+      for (final entry in fixtures) {
+        // Direct title and natural question on title
+        inScopeQuestions.add(entry.title);
+        inScopeQuestions.add('What is ${entry.title}?');
+
+        // Questions from topics
+        if (entry.topics.length >= 2) {
+          inScopeQuestions.add('What is ${entry.topics[0]} and ${entry.topics[1]}?');
+        }
+
+        // Distinct keyword combinations
+        final distinctKeywords = <String>[];
+        final seenStems = <String>{};
+        for (final kw in entry.keywords) {
+          final tokens = BM25Retriever.tokenize(kw);
+          if (tokens.isNotEmpty && seenStems.add(tokens.first)) {
+            distinctKeywords.add(kw);
+          }
+        }
+        if (distinctKeywords.length >= 2) {
+          inScopeQuestions.add('Explain ${distinctKeywords[0]} vs ${distinctKeywords[1]}');
+        }
+      }
+
+      // Hard negatives: In-domain storage questions but NOT present in the knowledge base
+      final hardNegatives = [
+        'best SSD to buy',
+        'how to recover deleted files',
+        'does BitLocker slow the drive',
       ];
 
-      final outOfScopeQuestions = [
+      // Generic out-of-scope queries
+      final genericOutOfScope = [
         'What is the capital of France?',
         'How do I bake a chocolate cake?',
         'Can you write a poem about the sunrise?',
         'Who won the 2022 FIFA World Cup?',
         'Explain quantum entanglement in simple terms',
       ];
+
+      final allOutOfScopeQuestions = [...hardNegatives, ...genericOutOfScope];
 
       double minInScopeScore = double.infinity;
       for (final q in inScopeQuestions) {
@@ -187,7 +264,7 @@ void main() {
       }
 
       double maxOutOfScopeScore = 0.0;
-      for (final q in outOfScopeQuestions) {
+      for (final q in allOutOfScopeQuestions) {
         final matches = retriever.search(q);
         final topScore = matches.isNotEmpty ? matches.first.score : 0.0;
         if (topScore > maxOutOfScopeScore) {
@@ -195,11 +272,12 @@ void main() {
         }
       }
 
-      // Assert clear score separation between in-scope and out-of-scope questions
+      // Assert clear margin separation between lowest in-scope and highest out-of-scope/hard-negative
+      final margin = minInScopeScore - maxOutOfScopeScore;
       expect(
-        minInScopeScore,
-        greaterThan(maxOutOfScopeScore),
-        reason: 'In-scope lowest score ($minInScopeScore) must be strictly higher than out-of-scope highest score ($maxOutOfScopeScore)',
+        margin,
+        greaterThan(0.2),
+        reason: 'Margin between lowest in-scope ($minInScopeScore) and highest out-of-scope ($maxOutOfScopeScore) must be distinct (margin: $margin)',
       );
 
       // Calibrate threshold strictly in between
@@ -213,10 +291,10 @@ void main() {
         expect(match, isNotNull, reason: 'In-scope question "$q" must meet threshold $calibratedThreshold');
       }
 
-      // Every out-of-scope question returns null ("not sure")
-      for (final q in outOfScopeQuestions) {
+      // Every out-of-scope question and hard negative returns null ("not sure")
+      for (final q in allOutOfScopeQuestions) {
         final match = retriever.findBestMatch(q);
-        expect(match, isNull, reason: 'Out-of-scope question "$q" must be rejected under threshold $calibratedThreshold');
+        expect(match, isNull, reason: 'Out-of-scope/hard negative question "$q" must be rejected under threshold $calibratedThreshold');
       }
     });
   });

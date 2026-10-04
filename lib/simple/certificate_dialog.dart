@@ -40,7 +40,8 @@ class SimpleCertificateDialog extends StatelessWidget {
     final isSimulated = cert.executionMode == 'simulated';
     final isFailed = cert.result == 'FAILED';
     final isFlash = cert.mediaType.toLowerCase().contains('flash') ||
-        cert.mediaType.toLowerCase().contains('usb') ||
+        cert.mediaType.toLowerCase().contains('nvme') ||
+        cert.mediaType.toLowerCase().contains('sd') ||
         cert.mediaType.toLowerCase().contains('emmc');
     final badgeText = isFailed
         ? 'WIPE FAILED'

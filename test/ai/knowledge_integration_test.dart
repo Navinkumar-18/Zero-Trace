@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:zero_trace/models/assistant_context.dart';
 import 'package:zero_trace/models/sanitization_error_code.dart';
@@ -161,6 +162,40 @@ void main() {
       expect(response.isSimulated, true);
       expect(response.answer, contains('[SIMULATION MODE]'));
       expect(response.warnings.any((w) => w.contains('[SIMULATION MODE]')), true);
+    });
+  });
+
+  group('Production Loader & Unregistered Assets Fallback (Item 3)', () {
+    test('KnowledgeLoader.production() uses isRelease: kReleaseMode', () {
+      final prodLoader = KnowledgeLoader.production();
+      expect(prodLoader.isRelease, kReleaseMode);
+    });
+
+    test('with assets/knowledge empty or unregistered, app starts and answers from legacy handlers only', () {
+      // Simulate missing or unregistered assets/knowledge directory
+      final emptyDir = Directory('test/fixtures/non_existent_knowledge_dir');
+      final loader = const KnowledgeLoader(isRelease: false, autoLint: false);
+      final entries = loader.loadFromDirectory(emptyDir);
+
+      expect(entries, isEmpty);
+
+      // AiService initialized with empty knowledge base
+      final aiService = AiService(retriever: BM25Retriever(entries));
+
+      final testCases = <String, String>{
+        'What is cryptographic erase?': 'crypto_erase',
+        'What are NIST standards?': 'nist_standards',
+        'What is PALES research?': 'pales_research',
+        'Explain CLEAR vs PURGE': 'clear_vs_purge',
+      };
+
+      for (final entry in testCases.entries) {
+        final response = aiService.processQuery(entry.key);
+        expect(response.handlerId, entry.value);
+        expect(response.kbEntryIds, isEmpty);
+        expect(response.researchBasis?.contains('Based on:'), isNot(true));
+        expect(response.answer, isNotEmpty);
+      }
     });
   });
 }

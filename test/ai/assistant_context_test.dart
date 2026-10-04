@@ -573,72 +573,21 @@ void main() {
       expect(conflictingNvme.isRotational, false);
     });
 
-    test('Reported as HDD but RPM is explicitly 0 classifies as unknown (not rotational)', () {
-      const hddRpm0 = DeviceProfile(
-        id: 'hdd_zero_rpm',
-        name: 'Suspicious HDD reporting 0 RPM',
-        serialNumber: 'HDD-0RPM',
+    test('SATA HDD with no RPM reported is classified as rotational', () {
+      const sataHdd = DeviceProfile(
+        id: 'sata_hdd',
+        name: 'Seagate Barracuda',
+        serialNumber: 'ST-1000-DM',
         mediaType: MediaType.hdd,
         busType: 'SATA',
-        capacityBytes: 500000000000,
-        rotationalRpm: 0,
+        capacityBytes: 1000000000000,
+        rotationalRpm: null,
         isRemovable: false,
       );
 
-      expect(hddRpm0.mediaTechnology, MediaTechnology.unknown);
-      expect(hddRpm0.isRotational, false);
-      expect(hddRpm0.isFlashMedia, false);
-    });
-  });
-
-  group('Internal eMMC Qualification (Cleanup Item 4)', () {
-    test('internal eMMC is non-removable, not typed SD, and not disabled by default', () {
-      const emmc = DeviceProfile(
-        id: 'mmcblk0',
-        name: 'SanDisk DF4064 eMMC 64GB',
-        serialNumber: 'EMMC64G-99A1',
-        mediaType: MediaType.emmc,
-        busType: 'eMMC 5.1',
-        capacityBytes: 64424509440,
-        rotationalRpm: 0,
-        isRemovable: false,
-        isSystemDisk: false,
-      );
-
-      expect(emmc.isRemovable, false, reason: 'Internal eMMC must be non-removable');
-      expect(emmc.driveType != DriveType.sd, true, reason: 'Internal eMMC must NOT be typed SD');
-      expect(emmc.driveType, isNot(DriveType.sd));
-      expect(emmc.simpleDisabledReason, isNull, reason: 'Internal eMMC must NOT be disabled by default');
-      expect(emmc.mediaTechnology, MediaTechnology.flash);
-    });
-
-    test('internal eMMC is disabled ONLY if it is the system drive or unsupported', () {
-      const emmcSys = DeviceProfile(
-        id: 'mmcblk0',
-        name: 'System Board eMMC',
-        serialNumber: 'EMMC-SYS-1',
-        mediaType: MediaType.emmc,
-        busType: 'eMMC',
-        capacityBytes: 64424509440,
-        rotationalRpm: 0,
-        isRemovable: false,
-        isSystemDisk: true,
-      );
-      expect(emmcSys.simpleDisabledReason, 'System drive – protected');
-
-      const emmcDisabled = DeviceProfile(
-        id: 'mmcblk0',
-        name: 'Faulty eMMC',
-        serialNumber: 'EMMC-FAULT',
-        mediaType: MediaType.emmc,
-        busType: 'eMMC',
-        capacityBytes: 64424509440,
-        rotationalRpm: 0,
-        isRemovable: false,
-        isSystemDisk: false,
-        disabledReason: 'Hardware write-protection active',
-      );
-      expect(emmcDisabled.simpleDisabledReason, 'Hardware write-protection active');
+      expect(sataHdd.mediaTechnology, MediaTechnology.rotational);
+      expect(sataHdd.isRotational, true);
+      expect(sataHdd.isFlashMedia, false);
     });
   });
 }

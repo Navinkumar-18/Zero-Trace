@@ -36,8 +36,8 @@ class OrphanedProcessChecker {
 
     try {
       // Check if zt_engine or dd process is alive matching device or zt_engine
-      final resultZt = await Process.run('pgrep', ['-f', 'zt_engine']);
-      final resultDd = await Process.run('pgrep', ['-f', 'dd']);
+      final resultZt = Process.runSync('pgrep', ['-f', 'zt_engine']);
+      final resultDd = Process.runSync('pgrep', ['-x', 'dd']);
 
       final isZtRunning = resultZt.exitCode == 0 && (resultZt.stdout as String).trim().isNotEmpty;
       final isDdRunning = resultDd.exitCode == 0 && (resultDd.stdout as String).trim().isNotEmpty;

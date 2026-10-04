@@ -150,9 +150,35 @@ class KnowledgeLint {
       ));
     }
 
-    // 3. Body Content Analysis (Line by line)
+    // 3. Body Content Analysis (Line by line with paragraph scoping)
     final lines = entry.content.split('\n');
     bool inCodeFence = false;
+
+    // Group lines into paragraphs (delimited by blank lines) for same-paragraph lint-allow checks
+    final paragraphMap = <int, String>{};
+    final currentParagraphLines = <String>[];
+    final currentLineNumbers = <int>[];
+
+    void flushParagraph() {
+      if (currentParagraphLines.isNotEmpty) {
+        final paragraphText = currentParagraphLines.join('\n');
+        for (final lineNum in currentLineNumbers) {
+          paragraphMap[lineNum] = paragraphText;
+        }
+        currentParagraphLines.clear();
+        currentLineNumbers.clear();
+      }
+    }
+
+    for (int i = 0; i < lines.length; i++) {
+      if (lines[i].trim().isEmpty) {
+        flushParagraph();
+      } else {
+        currentParagraphLines.add(lines[i]);
+        currentLineNumbers.add(i + 1);
+      }
+    }
+    flushParagraph();
 
     for (int i = 0; i < lines.length; i++) {
       final line = lines[i];
@@ -188,18 +214,18 @@ class KnowledgeLint {
         }
       }
 
-      // Overclaiming words (unless allowed by inline comment)
+      // Overclaiming words (must name the exact word and be in the same paragraph)
       for (final word in overclaimWords) {
         final wordPattern = RegExp(r'\b' + RegExp.escape(word) + r'\b', caseSensitive: false);
         if (wordPattern.hasMatch(line)) {
-          final allowMarker = '<!-- lint-allow: $word -->'.toLowerCase();
-          final isAllowedInLine = line.toLowerCase().contains(allowMarker);
-          final isAllowedInDoc = entry.content.toLowerCase().contains(allowMarker);
+          final paragraphText = paragraphMap[lineNumber] ?? line;
+          final exactAllowMarker = '<!-- lint-allow: $word -->'.toLowerCase();
+          final isAllowedInParagraph = paragraphText.toLowerCase().contains(exactAllowMarker);
 
-          if (!isAllowedInLine && !isAllowedInDoc) {
+          if (!isAllowedInParagraph) {
             issues.add(LintIssue(
               rule: 'overclaim_word',
-              message: 'Overclaiming term "$word" found without inline allowance <!-- lint-allow: $word -->.',
+              message: 'Overclaiming term "$word" found without inline allowance <!-- lint-allow: $word --> in the same paragraph.',
               lineNumber: lineNumber,
             ));
           }

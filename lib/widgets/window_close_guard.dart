@@ -78,9 +78,11 @@ class _WindowCloseGuardState extends State<WindowCloseGuard> {
             ),
             FilledButton(
               style: FilledButton.styleFrom(backgroundColor: AppTheme.accentRose),
-              onPressed: () {
-                controller.cancelCurrentJob();
-                Navigator.of(ctx).pop(true);
+              onPressed: () async {
+                await controller.interruptOnExit();
+                if (ctx.mounted) {
+                  Navigator.of(ctx).pop(true);
+                }
               },
               child: const Text('Stop Wipe & Exit'),
             ),
