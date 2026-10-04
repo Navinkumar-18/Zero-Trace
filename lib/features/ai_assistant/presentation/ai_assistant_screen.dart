@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 
+import '../../../models/assistant_context.dart';
 import '../../../models/device_profile.dart';
 import '../../../services/ai_service.dart';
+import '../../../services/assistant_context_builder.dart';
 import '../../../services/sanitization_controller.dart';
 import '../../../widgets/theme.dart';
 
@@ -20,18 +22,9 @@ class _AiAssistantScreenState extends State<AiAssistantScreen> {
   final ScrollController _scrollController = ScrollController();
   final List<_ChatMessage> _messages = [];
 
-  static const List<String> _quickQuestions = [
-    'Why is overwrite not recommended for SSDs?',
-    'What sanitization method is recommended?',
-    'What does cryptographic erase mean?',
-    'Explain NIST SP 800-88 categories',
-    'Why is this device high risk?',
-    'What is the Flash Translation Layer?',
-    'Explain CLEAR vs PURGE',
-    'What are HPA/DCO hidden sectors?',
-    'Why did verification fail?',
-    'Explain this certificate',
-  ];
+  // Local assistant device selection (decoupled from controller.selectedDevice)
+  DeviceProfile? _assistantDevice;
+  bool _deviceCleared = false;
 
   @override
   void initState() {
@@ -46,6 +39,7 @@ class _AiAssistantScreenState extends State<AiAssistantScreen> {
           '⚠️ All responses are advisory only. I do not execute sanitization operations '
           'or generate shell commands.',
       timestamp: DateTime.now(),
+      targetSummary: 'None (general knowledge)',
     ));
   }
 
@@ -56,11 +50,19 @@ class _AiAssistantScreenState extends State<AiAssistantScreen> {
     super.dispose();
   }
 
+  AssistantContext _getCurrentContext(SanitizationController controller) {
+    return AssistantContextBuilder.fromController(
+      controller,
+      overrideDevice: _assistantDevice,
+      clearDevice: _deviceCleared,
+    );
+  }
+
   void _sendMessage(String text) {
     if (text.trim().isEmpty) return;
 
     final controller = context.read<SanitizationController>();
-    final device = controller.selectedDevice;
+    final currentContext = _getCurrentContext(controller);
 
     setState(() {
       _messages.add(_ChatMessage(
@@ -72,8 +74,8 @@ class _AiAssistantScreenState extends State<AiAssistantScreen> {
 
     _inputController.clear();
 
-    // Process with AI service
-    final response = _aiService.processQuery(text, device: device);
+    // Process with AI service using AssistantContext
+    final response = _aiService.processQuery(text, context: currentContext);
 
     setState(() {
       _messages.add(_ChatMessage(
@@ -81,6 +83,7 @@ class _AiAssistantScreenState extends State<AiAssistantScreen> {
         text: response.answer,
         timestamp: DateTime.now(),
         response: response,
+        targetSummary: currentContext.targetSummary,
       ));
     });
 
@@ -96,18 +99,112 @@ class _AiAssistantScreenState extends State<AiAssistantScreen> {
     });
   }
 
+  void _showDeviceSelector(BuildContext context, SanitizationController controller) {
+    final devices = controller.devices;
+
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: AppTheme.surfaceDark,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (bottomSheetContext) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'Select Assistant Context Drive',
+                          style: GoogleFonts.outfit(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            color: AppTheme.textPrimary,
+                          ),
+                        ),
+                      ),
+                      TextButton(
+                        onPressed: () {
+                          // Clear selection without altering controller
+                          setState(() {
+                            _deviceCleared = true;
+                            _assistantDevice = null;
+                          });
+                          Navigator.pop(bottomSheetContext);
+                        },
+                        child: const Text('Clear Context', style: TextStyle(color: AppTheme.accentRose)),
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(color: AppTheme.surfaceBorder),
+                if (devices.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.all(20),
+                    child: Text('No drives currently detected.', style: TextStyle(color: AppTheme.textMuted)),
+                  )
+                else
+                  Flexible(
+                    child: ListView.builder(
+                      shrinkWrap: true,
+                      itemCount: devices.length,
+                      itemBuilder: (context, index) {
+                        final d = devices[index];
+                        final isSelected = !_deviceCleared &&
+                            ((_assistantDevice != null && _assistantDevice!.stableId == d.stableId) ||
+                             (_assistantDevice == null && controller.selectedDevice?.stableId == d.stableId));
+
+                        return ListTile(
+                          leading: Icon(
+                            d.isFlashMedia ? Icons.flash_on : Icons.storage,
+                            color: isSelected ? AppTheme.accentGold : AppTheme.textSecondary,
+                          ),
+                          title: Text(d.name, style: const TextStyle(color: AppTheme.textPrimary)),
+                          subtitle: Text(
+                            '${d.formattedCapacity} • ${d.busType}',
+                            style: const TextStyle(color: AppTheme.textMuted, fontSize: 12),
+                          ),
+                          trailing: isSelected ? const Icon(Icons.check, color: AppTheme.accentGold) : null,
+                          onTap: () {
+                            // Update assistant context only — never mutate controller.selectedDevice
+                            setState(() {
+                              _assistantDevice = d;
+                              _deviceCleared = false;
+                            });
+                            Navigator.pop(bottomSheetContext);
+                          },
+                        );
+                      },
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final controller = context.watch<SanitizationController>();
-    final device = controller.selectedDevice;
+    final currentContext = _getCurrentContext(controller);
 
     return Scaffold(
       backgroundColor: AppTheme.bgDark,
       body: SafeArea(
         child: Column(
           children: [
-            // Header
-            _buildHeader(device),
+            // Header with interactive context chip
+            _buildHeader(currentContext, controller),
 
             // Chat messages
             Expanded(
@@ -119,9 +216,9 @@ class _AiAssistantScreenState extends State<AiAssistantScreen> {
               ),
             ),
 
-            // Quick questions (show when few messages)
-            if (_messages.length < 4)
-              _buildQuickQuestions(),
+            // Quick questions
+            if (_messages.length < 5)
+              _buildQuickQuestions(currentContext),
 
             // Input bar
             _buildInputBar(),
@@ -131,7 +228,29 @@ class _AiAssistantScreenState extends State<AiAssistantScreen> {
     );
   }
 
-  Widget _buildHeader(DeviceProfile? device) {
+  Widget _buildHeader(AssistantContext contextSnapshot, SanitizationController controller) {
+    final bool isDisconnected = contextSnapshot.isDisconnected;
+    final bool hasDevice = contextSnapshot.hasDevice;
+
+    String chipLabel;
+    Color chipColor;
+    IconData chipIcon;
+
+    if (isDisconnected) {
+      chipLabel = '${contextSnapshot.deviceName} (disconnected)';
+      chipColor = AppTheme.accentRose;
+      chipIcon = Icons.link_off;
+    } else if (hasDevice) {
+      final name = contextSnapshot.deviceName!;
+      chipLabel = name.length > 20 ? '${name.substring(0, 20)}...' : name;
+      chipColor = AppTheme.accentGold;
+      chipIcon = Icons.storage;
+    } else {
+      chipLabel = 'No device selected';
+      chipColor = AppTheme.textMuted;
+      chipIcon = Icons.help_outline;
+    }
+
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: const BoxDecoration(
@@ -171,32 +290,36 @@ class _AiAssistantScreenState extends State<AiAssistantScreen> {
               ],
             ),
           ),
-          if (device != null)
-            Container(
+          InkWell(
+            key: const Key('assistant_context_chip'),
+            onTap: () => _showDeviceSelector(context, controller),
+            borderRadius: BorderRadius.circular(8),
+            child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
               decoration: BoxDecoration(
-                color: AppTheme.accentGold.withValues(alpha: 0.12),
+                color: chipColor.withValues(alpha: 0.12),
                 borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: AppTheme.accentGold.withValues(alpha: 0.3)),
+                border: Border.all(color: chipColor.withValues(alpha: 0.3)),
               ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Icon(Icons.storage, color: AppTheme.accentGold, size: 14),
+                  Icon(chipIcon, color: chipColor, size: 14),
                   const SizedBox(width: 6),
                   Text(
-                    device.name.length > 20
-                        ? '${device.name.substring(0, 20)}...'
-                        : device.name,
+                    chipLabel,
                     style: GoogleFonts.inter(
-                      color: AppTheme.accentGold,
+                      color: chipColor,
                       fontSize: 11,
                       fontWeight: FontWeight.w600,
                     ),
                   ),
+                  const SizedBox(width: 4),
+                  Icon(Icons.arrow_drop_down, color: chipColor, size: 16),
                 ],
               ),
             ),
+          ),
         ],
       ),
     );
@@ -242,6 +365,25 @@ class _AiAssistantScreenState extends State<AiAssistantScreen> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  // Target summary badge (Amendment 5)
+                  if (!msg.isUser && msg.targetSummary != null) ...[
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.info_outline, size: 11, color: AppTheme.textMuted),
+                        const SizedBox(width: 4),
+                        Text(
+                          'Answered for: ${msg.targetSummary}',
+                          style: GoogleFonts.inter(
+                            color: AppTheme.textMuted,
+                            fontSize: 10,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 8),
+                  ],
                   SelectableText(
                     msg.text,
                     style: GoogleFonts.inter(
@@ -288,6 +430,8 @@ class _AiAssistantScreenState extends State<AiAssistantScreen> {
               _metaBadge('Method', response.recommendedMethod!, AppTheme.accentBlue),
             if (response.riskLevel != null)
               _metaBadge('Risk', response.riskLevel!, _getRiskColor(response.riskLevel!)),
+            if (response.isSimulated)
+              _metaBadge('Mode', 'Simulated', AppTheme.accentGold),
             if (response.researchBasis != null)
               _metaBadge('Research', 'See basis', AppTheme.accentEmerald),
           ],
@@ -379,7 +523,9 @@ class _AiAssistantScreenState extends State<AiAssistantScreen> {
     }
   }
 
-  Widget _buildQuickQuestions() {
+  Widget _buildQuickQuestions(AssistantContext contextSnapshot) {
+    final questions = contextSnapshot.quickQuestions;
+
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
       child: Column(
@@ -398,7 +544,7 @@ class _AiAssistantScreenState extends State<AiAssistantScreen> {
           Wrap(
             spacing: 8,
             runSpacing: 6,
-            children: _quickQuestions.map((q) => ActionChip(
+            children: questions.map((q) => ActionChip(
                   label: Text(
                     q,
                     style: GoogleFonts.inter(
@@ -474,11 +620,13 @@ class _ChatMessage {
   final String text;
   final DateTime timestamp;
   final AiResponse? response;
+  final String? targetSummary;
 
   const _ChatMessage({
     required this.isUser,
     required this.text,
     required this.timestamp,
     this.response,
+    this.targetSummary,
   });
 }
