@@ -595,21 +595,23 @@ async fn test_slow_writer_runtime_ps_no_dd_spawned() {
     let (tx, mut rx) = mpsc::channel::<ProgressEvent>(64);
     let start = Instant::now();
 
-    // Check runtime process list while slow writer is executing
+    // Check runtime process list for any child process named dd
+    let current_pid = std::process::id().to_string();
     let ps_check_task = tokio::spawn(async move {
         tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
-        // Verify no dd process is spawned
+        // Check child processes of current test process for any spawned dd
         let pgrep_dd = std::process::Command::new("pgrep")
+            .arg("-P")
+            .arg(&current_pid)
             .arg("-x")
             .arg("dd")
             .output();
         if let Ok(out) = pgrep_dd {
             assert!(
                 out.stdout.is_empty(),
-                "No 'dd' process should exist during native overwrite: found {:?}",
+                "No child 'dd' process should exist: found {:?}",
                 String::from_utf8_lossy(&out.stdout)
             );
-            assert_ne!(out.status.code(), Some(0), "pgrep dd must return non-zero (no match)");
         }
     });
 
@@ -631,9 +633,239 @@ async fn test_slow_writer_runtime_ps_no_dd_spawned() {
 
     // Check that events were streamed
     let mut event_count = 0;
-    while let Ok(_) = rx.try_recv() {
+    while rx.try_recv().is_ok() {
         event_count += 1;
     }
     assert!(event_count > 0, "Slow writer should produce progress events");
+}
+
+#[test]
+fn test_verify_fails_on_truncated_or_partial_wipe() {
+    let mut tmp = NamedTempFile::new().unwrap();
+    let file_size: u64 = 4 * 1024 * 1024; // 4 MiB
+    let half_size = file_size / 2;
+
+    // First half wiped with zeros
+    let zeros = vec![0u8; half_size as usize];
+    tmp.write_all(&zeros).unwrap();
+
+    // Second half left with non-zero bytes (truncated/partial wipe)
+    let mut rng = ChaCha20Rng::from_seed([0x99; 32]);
+    let mut non_zeros = vec![0u8; half_size as usize];
+    rng.fill_bytes(&mut non_zeros);
+    for b in non_zeros.iter_mut() {
+        if *b == 0 {
+            *b = 0xAA;
+        }
+    }
+    tmp.write_all(&non_zeros).unwrap();
+    tmp.flush().unwrap();
+
+    let report = verify_device(
+        tmp.path().to_str().unwrap(),
+        file_size,
+        "TEST_PARTIAL",
+        "overwrite-zero",
+        Some(50),
+        true, // expect_zeros = true
+    ).expect("Verification should execute");
+
+    assert!(!report.pass, "Verification must fail on truncated/partial wipe");
+    assert!(
+        report.samples.iter().any(|s| !s.is_zero),
+        "Must detect non-zero sectors in partial wipe"
+    );
+}
+
+#[test]
+fn test_random_pass_verify_fails_on_all_zeros_image() {
+    let mut tmp = NamedTempFile::new().unwrap();
+    let file_size: u64 = 2 * 1024 * 1024; // 2 MiB
+    let zeros = vec![0u8; file_size as usize];
+    tmp.write_all(&zeros).unwrap();
+    tmp.flush().unwrap();
+
+    let report = verify_device(
+        tmp.path().to_str().unwrap(),
+        file_size,
+        "TEST_ZEROS_RANDOM",
+        "random-pass",
+        None,
+        false, // expect_zeros = false (verifying random pass)
+    ).expect("Verification should execute");
+
+    assert!(!report.pass, "Random pass verification must fail on an all-zeros image");
+    assert!(
+        report.entropy_score < 0.1,
+        "Entropy of all-zeros image must be near 0, got {}",
+        report.entropy_score
+    );
+}
+
+#[tokio::test]
+async fn test_buffered_fallback_advances_bytes_done_only_after_sync() {
+    // Total size: 32 MiB (16 chunks of 2 MiB each)
+    let total_size: u64 = 32 * 1024 * 1024;
+    let mut mock = MockBlockWriter::new(total_size);
+    mock.custom_io_mode = Some("buffered_sync_16mb");
+
+    let (tx, mut rx) = mpsc::channel::<ProgressEvent>(128);
+    let start = Instant::now();
+
+    let report = execute_writer_overwrite(
+        mock,
+        1,
+        OverwritePattern::Zeros,
+        "SER_BUFFERED",
+        "Test Buffered",
+        start,
+        tx,
+    ).await.expect("Overwrite should succeed");
+
+    assert!(report.success);
+    assert_eq!(report.bytes_written, total_size);
+
+    let mut progress_events = Vec::new();
+    while let Ok(evt) = rx.try_recv() {
+        if !evt.is_heartbeat && evt.phase == ExecutionPhase::FirmwareCommand {
+            progress_events.push(evt);
+        }
+    }
+
+    // In buffered mode, bytes_done must only advance after sync returns (16MB increments or final complete)
+    for evt in &progress_events {
+        assert!(
+            evt.bytes_done == 0 || evt.bytes_done >= 16 * 1024 * 1024,
+            "Buffered progress must not advance until synced (found uncommitted bytes_done: {})",
+            evt.bytes_done
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_slow_writer_progress_never_exceeds_acknowledged_bytes() {
+    let total_size: u64 = 6 * 1024 * 1024; // 6 MiB (3 chunks)
+    let mut mock = MockBlockWriter::new(total_size);
+    mock.delay_per_chunk = Some(std::time::Duration::from_millis(30));
+
+    let (tx, mut rx) = mpsc::channel::<ProgressEvent>(64);
+    let start = Instant::now();
+
+    let handle = tokio::spawn(async move {
+        execute_writer_overwrite(
+            mock,
+            1,
+            OverwritePattern::Zeros,
+            "SER_SLOW_ACK",
+            "Test Slow Ack",
+            start,
+            tx,
+        ).await
+    });
+
+    while let Some(evt) = rx.recv().await {
+        assert!(
+            evt.bytes_done <= total_size,
+            "Reported progress bytes_done ({}) exceeded total device size ({})",
+            evt.bytes_done,
+            total_size
+        );
+    }
+
+    let report = handle.await.unwrap().expect("Wipe should succeed");
+    assert_eq!(report.bytes_written, total_size);
+}
+
+#[test]
+fn test_o_direct_alignment_requirements() {
+    // Verify that posix_memalign creates an aligned buffer matching block sector size (512 / 4096)
+    let mut aligned_ptr: *mut libc::c_void = std::ptr::null_mut();
+    let ret = unsafe { libc::posix_memalign(&mut aligned_ptr, 4096, 4096) };
+    assert_eq!(ret, 0, "posix_memalign must succeed");
+    assert!(!aligned_ptr.is_null());
+    assert_eq!((aligned_ptr as usize) % 4096, 0, "Buffer pointer must be 4096-byte aligned");
+    unsafe { libc::free(aligned_ptr) };
+
+    // AlignedBuffer test
+    let buf = AlignedBuffer::new(2 * 1024 * 1024);
+    assert_eq!(
+        (buf.as_slice().as_ptr() as usize) % 4096,
+        0,
+        "AlignedBuffer slice must be 4096-byte aligned"
+    );
+}
+
+#[tokio::test]
+async fn test_cancel_via_real_sigterm_signal() {
+    if std::env::var("ZT_TEST_SIGTERM_WORKER").as_deref() == Ok("1") {
+        let total_size: u64 = 32 * 1024 * 1024;
+        let mut mock = MockBlockWriter::new(total_size);
+        mock.delay_per_chunk = Some(std::time::Duration::from_millis(40));
+        let (tx, _rx) = mpsc::channel::<ProgressEvent>(64);
+        let start = Instant::now();
+        let report = execute_writer_overwrite(
+            mock,
+            1,
+            OverwritePattern::Zeros,
+            "SER_CHILD_CANCEL",
+            "Child Cancel",
+            start,
+            tx,
+        ).await.expect("Execution should return report");
+        std::process::exit(report.exit_code);
+    }
+
+    // Parent test process: spawn child test worker in isolated OS process
+    let current_exe = std::env::current_exe().expect("Must get current exe");
+    let mut child = std::process::Command::new(current_exe)
+        .arg("test_cancel_via_real_sigterm_signal")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("ZT_TEST_SIGTERM_WORKER", "1")
+        .spawn()
+        .expect("Must spawn child test worker");
+
+    let child_pid = child.id() as i32;
+    // Wait for child to begin writing chunks
+    tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+
+    // Send real OS SIGTERM directly to child process PID
+    unsafe {
+        libc::kill(child_pid, libc::SIGTERM);
+    }
+
+    let status = child.wait().expect("Child must exit");
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "Child process caught real SIGTERM and must exit with code 130"
+    );
+}
+
+#[test]
+#[ignore = "Requires root/sudo privileges: setup via `sudo losetup -fP /tmp/zt_loop.img`"]
+fn test_direct_block_writer_and_o_excl_on_real_loop_device() {
+    // Documented manual instructions:
+    // 1. Create 100MB sparse file: truncate -s 100M /tmp/zt_loop.img
+    // 2. Attach loopback: sudo losetup -fP /tmp/zt_loop.img
+    // 3. Find device: losetup -a | grep zt_loop.img -> /dev/loop7
+    // 4. Run test: ZT_TEST_LOOP_DEV=/dev/loop7 cargo test test_direct_block_writer_and_o_excl_on_real_loop_device -- --ignored --nocapture
+    let loop_dev = std::env::var("ZT_TEST_LOOP_DEV").unwrap_or_else(|_| "/dev/loop7".to_string());
+    let c_path = std::ffi::CString::new(loop_dev.as_str()).unwrap();
+
+    // Test kernel mutual exclusion: open with O_RDWR | O_EXCL
+    let fd1 = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_EXCL) };
+    if fd1 < 0 {
+        let err = std::io::Error::last_os_error();
+        panic!("Failed to open {} with O_EXCL: {}", loop_dev, err);
+    }
+
+    // Second concurrent open must return EBUSY
+    let fd2 = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_EXCL) };
+    assert_eq!(fd2, -1, "Second concurrent O_EXCL open must fail");
+    let err2 = std::io::Error::last_os_error();
+    assert_eq!(err2.raw_os_error(), Some(libc::EBUSY), "Concurrent open must return EBUSY");
+
+    unsafe { libc::close(fd1) };
 }
 

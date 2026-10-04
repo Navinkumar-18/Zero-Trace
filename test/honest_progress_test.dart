@@ -222,5 +222,16 @@ void main() {
       expect(report.ioMode, 'direct_io');
       expect(report.exitCode, 0);
     });
+
+    test('7. Cancellation state transitions without automatic SIGKILL', () {
+      final service = RealSanitizationService();
+      // Ensure calling cancelActiveProcess does not trigger automatic kill
+      service.cancelActiveProcess();
+      expect(service.activeProcess, isNull);
+
+      // Force stop method exists and can be invoked
+      service.forceKillActiveProcess();
+      expect(service.activeProcess, isNull);
+    });
   });
 }

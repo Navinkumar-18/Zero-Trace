@@ -1676,6 +1676,7 @@ pub struct MockBlockWriter {
     pub sync_called: bool,
     pub delay_per_chunk: Option<std::time::Duration>,
     pub cancel_flag_on_write: Option<Arc<AtomicBool>>,
+    pub custom_io_mode: Option<&'static str>,
 }
 
 impl MockBlockWriter {
@@ -1691,6 +1692,7 @@ impl MockBlockWriter {
             sync_called: false,
             delay_per_chunk: None,
             cancel_flag_on_write: None,
+            custom_io_mode: None,
         }
     }
 }
@@ -1736,7 +1738,7 @@ impl BlockWriter for MockBlockWriter {
     }
 
     fn io_mode(&self) -> &'static str {
-        "mock"
+        self.custom_io_mode.unwrap_or("mock")
     }
 }
 
@@ -1780,23 +1782,93 @@ impl SpeedEstimator {
     }
 }
 
+pub fn get_checkpoint_dir() -> PathBuf {
+    if let Ok(custom) = std::env::var("ZT_CHECKPOINT_DIR") {
+        if !custom.trim().is_empty() {
+            return PathBuf::from(custom);
+        }
+    }
+    if let Ok(xdg_state) = std::env::var("XDG_STATE_HOME") {
+        if !xdg_state.trim().is_empty() {
+            return PathBuf::from(xdg_state).join("zero_trace");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            return PathBuf::from(home).join(".local").join("share").join("zero_trace");
+        }
+    }
+    PathBuf::from("/tmp/zero_trace")
+}
+
 pub fn write_checkpoint_file(serial: &str, bytes_done: u64, bytes_total: u64) {
-    let sanitized_serial: String = serial.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
-    let path = format!("/tmp/zt_checkpoint_{}.json", sanitized_serial);
-    let now_ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let dir = get_checkpoint_dir();
+    let _ = fs::create_dir_all(&dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    }
+
+    let final_path = dir.join("active_checkpoint.json");
+    let tmp_path = dir.join("active_checkpoint.tmp");
+
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
     let json = serde_json::json!({
         "serial": serial,
         "bytes_done": bytes_done,
         "bytes_total": bytes_total,
         "timestamp": now_ts,
     });
-    let _ = fs::write(path, json.to_string());
+    let payload = json.to_string();
+
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_tmp = match std::ffi::CString::new(tmp_path.as_os_str().as_bytes()) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        // Unlink any prior tmp file
+        let _ = unsafe { libc::unlink(c_tmp.as_ptr()) };
+
+        let fd = unsafe {
+            libc::open(
+                c_tmp.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW,
+                0o600,
+            )
+        };
+        if fd >= 0 {
+            let mut file = unsafe { fs::File::from_raw_fd(fd) };
+            if file.write_all(payload.as_bytes()).is_ok() {
+                let _ = file.sync_all();
+                drop(file);
+                let _ = fs::rename(&tmp_path, &final_path);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if fs::write(&tmp_path, &payload).is_ok() {
+            let _ = fs::rename(&tmp_path, &final_path);
+        }
+    }
 }
 
-pub fn remove_checkpoint_file(serial: &str) {
-    let sanitized_serial: String = serial.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
-    let path = format!("/tmp/zt_checkpoint_{}.json", sanitized_serial);
-    let _ = fs::remove_file(path);
+pub fn remove_checkpoint_file(_serial: &str) {
+    let dir = get_checkpoint_dir();
+    let final_path = dir.join("active_checkpoint.json");
+    let tmp_path = dir.join("active_checkpoint.tmp");
+    let _ = fs::remove_file(final_path);
+    let _ = fs::remove_file(tmp_path);
 }
 
 pub async fn execute_writer_overwrite<W: BlockWriter>(
@@ -1820,6 +1892,7 @@ pub async fn execute_writer_overwrite<W: BlockWriter>(
     ).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
     mut writer: W,
     total_passes: u8,
@@ -1880,6 +1953,8 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
     });
 
     let mut overall_bytes_done: u64 = 0;
+    let mut uncommitted_buffered_bytes: u64 = 0;
+    let is_buffered_mode = writer.io_mode().starts_with("buffered");
     let mut last_event_time = Instant::now();
     let mut last_checkpoint_time = Instant::now();
 
@@ -1907,6 +1982,10 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
             // Check cancellation flag
             if cancel_flag.load(Ordering::SeqCst) {
                 let _ = writer.sync_data();
+                if is_buffered_mode && uncommitted_buffered_bytes > 0 {
+                    overall_bytes_done += uncommitted_buffered_bytes;
+                    bytes_done_shared.store(overall_bytes_done, Ordering::Relaxed);
+                }
                 write_checkpoint_file(device_serial, overall_bytes_done, total_bytes);
                 let _ = hb_stop_tx.send(());
                 let _ = hb_task.await;
@@ -1944,6 +2023,10 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
             while written_for_chunk < write_len {
                 if cancel_flag.load(Ordering::SeqCst) {
                     let _ = writer.sync_data();
+                    if is_buffered_mode && uncommitted_buffered_bytes > 0 {
+                        overall_bytes_done += uncommitted_buffered_bytes;
+                        bytes_done_shared.store(overall_bytes_done, Ordering::Relaxed);
+                    }
                     write_checkpoint_file(device_serial, overall_bytes_done, total_bytes);
                     let _ = hb_stop_tx.send(());
                     let _ = hb_task.await;
@@ -1981,8 +2064,23 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
                     }
                     Ok(n) => {
                         written_for_chunk += n;
-                        overall_bytes_done += n as u64;
-                        bytes_done_shared.store(overall_bytes_done, Ordering::Relaxed);
+                        if is_buffered_mode {
+                            uncommitted_buffered_bytes += n as u64;
+                            // In buffered mode, flush periodically (e.g. 16MB) or when pass finishes
+                            if uncommitted_buffered_bytes >= 16 * 1024 * 1024 || (offset + written_for_chunk as u64 >= device_size) {
+                                if let Err(e) = writer.sync_data() {
+                                    let _ = hb_stop_tx.send(());
+                                    let _ = hb_task.await;
+                                    return Err(ExecuteError::IoError(e));
+                                }
+                                overall_bytes_done += uncommitted_buffered_bytes;
+                                uncommitted_buffered_bytes = 0;
+                                bytes_done_shared.store(overall_bytes_done, Ordering::Relaxed);
+                            }
+                        } else {
+                            overall_bytes_done += n as u64;
+                            bytes_done_shared.store(overall_bytes_done, Ordering::Relaxed);
+                        }
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) if e.raw_os_error() == Some(libc::EIO) => {
@@ -2026,8 +2124,8 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
                 send_detailed_progress(&tx, ExecutionPhase::FirmwareCommand, overall_bytes_done, total_bytes, Some(pct), cur_speed, eta, &msg, false).await;
             }
 
-            // Periodic checkpoint file write (~every 3 seconds)
-            if now.duration_since(last_checkpoint_time).as_secs() >= 3 {
+            // Periodic checkpoint file write (~every 2 seconds)
+            if now.duration_since(last_checkpoint_time).as_secs() >= 2 {
                 last_checkpoint_time = now;
                 write_checkpoint_file(device_serial, overall_bytes_done, total_bytes);
             }
