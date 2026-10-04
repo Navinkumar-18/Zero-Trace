@@ -4,6 +4,8 @@
 //! and parses their output into a strongly-typed `DeviceCapabilities` struct.
 
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
 use std::process::Command;
 use thiserror::Error;
 
@@ -90,6 +92,12 @@ pub struct DeviceCapabilities {
     // eMMC (mmc extcsd)
     pub emmc_sanitize_supported: bool,
 
+    // USB Link Speed (sysfs)
+    #[serde(default)]
+    pub usb_speed_mbps: Option<u32>,
+    #[serde(default)]
+    pub is_usb_2: bool,
+
     // Meta
     pub estimated_duration_class: DurationClass,
     pub probe_errors: Vec<String>,
@@ -123,6 +131,8 @@ impl DeviceCapabilities {
             opal_supported: false,
             opal_locked: false,
             emmc_sanitize_supported: false,
+            usb_speed_mbps: None,
+            is_usb_2: false,
             estimated_duration_class: DurationClass::Unknown,
             probe_errors: Vec::new(),
         }
@@ -598,7 +608,39 @@ pub fn probe_device(device_path: &str) -> DeviceCapabilities {
         }
     }
 
+    // 6. USB Link speed detection via sysfs
+    let (usb_speed, is_u2) = detect_usb_speed(device_path, "/sys");
+    if let Some(spd) = usb_speed {
+        caps.usb_speed_mbps = Some(spd);
+        caps.is_usb_2 = is_u2;
+        if caps.bus_type == BusType::Unknown {
+            caps.bus_type = BusType::USB;
+        }
+    }
+
     caps
+}
+
+/// Detect USB link speed from sysfs by traversing parent directory nodes from the block device.
+pub fn detect_usb_speed(device_path: &str, sys_root: &str) -> (Option<u32>, bool) {
+    let dev_name = device_path.rsplit('/').next().unwrap_or(device_path);
+    let block_dir = Path::new(sys_root).join("class/block").join(dev_name);
+    if let Ok(canon) = fs::canonicalize(&block_dir) {
+        let mut curr = canon.parent();
+        while let Some(parent) = curr {
+            let speed_file = parent.join("speed");
+            if speed_file.exists() {
+                if let Ok(content) = fs::read_to_string(&speed_file) {
+                    if let Ok(speed_num) = content.trim().parse::<u32>() {
+                        let is_usb2 = speed_num <= 480;
+                        return (Some(speed_num), is_usb2);
+                    }
+                }
+            }
+            curr = parent.parent();
+        }
+    }
+    (None, false)
 }
 
 #[cfg(test)]

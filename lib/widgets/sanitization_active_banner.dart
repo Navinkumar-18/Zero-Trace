@@ -60,7 +60,7 @@ class _SanitizationActiveBannerState extends State<SanitizationActiveBanner>
     final job = controller.currentJob;
     if (job == null) return const SizedBox.shrink();
 
-    final percentStr = (job.progress * 100).toInt();
+    final percentStr = job.progress != null ? '${(job.progress! * 100).toInt()}%' : 'In progress';
 
     return Container(
       width: double.infinity,
@@ -213,7 +213,7 @@ class _SanitizationActiveBannerState extends State<SanitizationActiveBanner>
                   Text(
                     isProcessActive
                         ? 'Active zt_engine process running on ${state?.deviceName ?? "Device"} (${state?.devicePath})'
-                        : 'Device ${state?.deviceName ?? "Target"} was not cleanly verified before app closed. Verify before reuse.',
+                        : 'Device ${state?.deviceName ?? "Target"}: ${result.checkpointWording ?? "about 0 GB reported written at the last check, not verified"}. Verify before reuse.',
                     style: const TextStyle(
                       color: AppTheme.textPrimary,
                       fontSize: 12,

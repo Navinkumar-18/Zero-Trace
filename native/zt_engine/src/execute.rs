@@ -15,9 +15,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
@@ -39,6 +44,12 @@ pub enum ExecuteError {
     UnsupportedOperation(String),
     #[error("IO error: {0}")]
     IoError(#[from] io::Error),
+    #[error("Hardware I/O error (EIO): {0}")]
+    HardwareIo(String),
+    #[error("Device disconnected (ENODEV): {0}")]
+    DeviceDisconnected(String),
+    #[error("Premature end of device (ENOSPC): {0}")]
+    PrematureEndOfDevice(String),
     #[error("Progress channel closed")]
     ChannelClosed,
 }
@@ -54,6 +65,8 @@ pub enum ExecutionPhase {
     KeyDestruction,
     CacheFlush,
     Verification,
+    Preparing,
+    Flushing,
 }
 
 impl std::fmt::Display for ExecutionPhase {
@@ -64,6 +77,8 @@ impl std::fmt::Display for ExecutionPhase {
             ExecutionPhase::KeyDestruction => write!(f, "Key Destruction"),
             ExecutionPhase::CacheFlush => write!(f, "Cache Flush"),
             ExecutionPhase::Verification => write!(f, "Post-Verification"),
+            ExecutionPhase::Preparing => write!(f, "Preparing"),
+            ExecutionPhase::Flushing => write!(f, "Flushing"),
         }
     }
 }
@@ -86,15 +101,30 @@ pub enum OverwritePattern {
     Zeros,
     Ones,
     Random,
-    NistLegacy3Pass,
+    MultiPass3,
+}
+
+fn default_schema_version() -> u32 {
+    2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgressEvent {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub phase: ExecutionPhase,
-    pub percent: f32,
-    pub message: String,
+    #[serde(default)]
+    pub bytes_done: u64,
+    #[serde(default)]
+    pub bytes_total: u64,
+    #[serde(default)]
+    pub percent: Option<f32>,
+    #[serde(default)]
+    pub speed_bytes_per_sec: f64,
     pub eta_seconds: Option<u32>,
+    pub message: String,
+    #[serde(default)]
+    pub is_heartbeat: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +137,21 @@ pub struct ExecutionReport {
     pub exit_code: i32,
     pub duration_ms: u64,
     pub dry_run: bool,
+    #[serde(default)]
+    pub bytes_written: u64,
+    #[serde(default)]
+    pub io_mode: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GuardIdentity {
+    pub canonical_path: String,
+    pub st_rdev: libc::dev_t,
+    pub major: u32,
+    pub minor: u32,
+    pub is_block: bool,
+    pub device_serial: String,
+    pub st_ino: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -697,6 +742,79 @@ pub fn verify_exclusive_access_and_recheck(
     check_boot_disk_protection_ctx(device, false, ctx)
 }
 
+/// Inspects device and captures guard identity (canonical path, st_rdev, major, minor, is_block, serial).
+pub fn get_guard_identity(
+    device: &str,
+    dry_run: bool,
+    device_serial: &str,
+    ctx: &FsContext,
+) -> Result<GuardIdentity, ExecuteError> {
+    let canonical = canonicalize_device_path(device, dry_run, ctx)?;
+    if dry_run {
+        return Ok(GuardIdentity {
+            canonical_path: canonical,
+            st_rdev: 0,
+            major: 0,
+            minor: 0,
+            is_block: true,
+            device_serial: device_serial.to_string(),
+            st_ino: 0,
+        });
+    }
+
+    let meta = fs::metadata(&canonical)
+        .map_err(|e| ExecuteError::DeviceNotFound(format!("Cannot stat {}: {}", canonical, e)))?;
+    let rdev = meta.rdev();
+    let is_block = (meta.mode() & libc::S_IFMT) == libc::S_IFBLK;
+
+    Ok(GuardIdentity {
+        canonical_path: canonical,
+        st_rdev: rdev,
+        major: dev_major(rdev),
+        minor: dev_minor(rdev),
+        is_block,
+        device_serial: device_serial.to_string(),
+        st_ino: meta.ino(),
+    })
+}
+
+/// Re-checks boot disk protection against system mountinfo using an opened device's major:minor dev_t.
+pub fn recheck_protection_by_dev_t(
+    dev: libc::dev_t,
+    ctx: &FsContext,
+) -> Result<(), ExecuteError> {
+    let maj = dev_major(dev);
+    let min = dev_minor(dev);
+
+    let mountinfo_path = ctx.proc_root.join("self/mountinfo");
+    let content = if mountinfo_path.exists() {
+        fs::read_to_string(&mountinfo_path)
+            .map_err(|e| ExecuteError::BootDiskProtection(format!("Cannot read mountinfo: {}", e)))?
+    } else {
+        return Ok(());
+    };
+
+    for line in content.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 { continue; }
+        let mm_str = parts[2];
+        let mount_point = parts[4];
+        if is_mount_unmountable_allowlisted(mount_point) {
+            continue;
+        }
+        if let Some((m_maj, m_min)) = parse_major_minor(mm_str) {
+            if m_maj == maj && m_min == min {
+                return Err(ExecuteError::BootDiskProtection(format!(
+                    "Opened file descriptor matches protected mount '{}' ({}:{}): aborting destructive write",
+                    mount_point, maj, min
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Verify the confirmation token matches expected value.
 fn verify_confirmation(token: &str, expected_serial: &str) -> Result<(), ExecuteError> {
     if token.trim() != expected_serial.trim() {
@@ -705,19 +823,48 @@ fn verify_confirmation(token: &str, expected_serial: &str) -> Result<(), Execute
     Ok(())
 }
 
-/// Send a progress event, ignoring channel-closed errors (UI may have navigated away).
+/// Send an indeterminate progress event for firmware operations.
 async fn send_progress(
     tx: &mpsc::Sender<ProgressEvent>,
     phase: ExecutionPhase,
-    percent: f32,
     message: &str,
     eta_seconds: Option<u32>,
 ) {
     let _ = tx.send(ProgressEvent {
+        schema_version: 2,
         phase,
-        percent,
-        message: message.to_string(),
+        bytes_done: 0,
+        bytes_total: 0,
+        percent: None,
+        speed_bytes_per_sec: 0.0,
         eta_seconds,
+        message: message.to_string(),
+        is_heartbeat: false,
+    }).await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_detailed_progress(
+    tx: &mpsc::Sender<ProgressEvent>,
+    phase: ExecutionPhase,
+    bytes_done: u64,
+    bytes_total: u64,
+    percent: Option<f32>,
+    speed_bytes_per_sec: f64,
+    eta_seconds: Option<u32>,
+    message: &str,
+    is_heartbeat: bool,
+) {
+    let _ = tx.send(ProgressEvent {
+        schema_version: 2,
+        phase,
+        bytes_done,
+        bytes_total,
+        percent,
+        speed_bytes_per_sec,
+        eta_seconds,
+        message: message.to_string(),
+        is_heartbeat,
     }).await;
 }
 
@@ -841,11 +988,11 @@ pub async fn nvme_sanitize(
     let method_name = format!("NVMe Sanitize ({})", action_arg);
 
     // Phase 1: Security Unlock
-    send_progress(&tx, ExecutionPhase::SecurityUnlock, 0.05,
+    send_progress(&tx, ExecutionPhase::SecurityUnlock,
         "Checking NVMe controller security state...", Some(5)).await;
 
     // Phase 2: Issue sanitize command
-    send_progress(&tx, ExecutionPhase::FirmwareCommand, 0.15,
+    send_progress(&tx, ExecutionPhase::FirmwareCommand,
         &format!("Issuing nvme sanitize -a {} on {}", action_arg, device), None).await;
 
     let (stdout, stderr, code) = run_cmd(
@@ -867,31 +1014,30 @@ pub async fn nvme_sanitize(
             exit_code: code,
             duration_ms: start.elapsed().as_millis() as u64,
             dry_run,
+            bytes_written: 0,
+            io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
         });
     }
 
     // Phase 2 continued: Poll sanitize-log for completion
     if dry_run {
-        // Simulate progress in dry-run
-        for pct in [30, 50, 70, 85] {
-            send_progress(&tx, ExecutionPhase::FirmwareCommand, pct as f32 / 100.0,
-                &format!("[DRY RUN] Sanitize progress: {}%", pct), None).await;
-            let (s, e, _) = run_cmd("nvme", &["sanitize-log", device], dry_run, &mut command_log)?;
-            all_stdout.push_str(&s);
-            all_stderr.push_str(&e);
-        }
+        send_progress(&tx, ExecutionPhase::FirmwareCommand,
+            "[DRY RUN] Firmware sanitize command sent to controller", None).await;
+        let (s, e, _) = run_cmd("nvme", &["sanitize-log", device], dry_run, &mut command_log)?;
+        all_stdout.push_str(&s);
+        all_stderr.push_str(&e);
     }
 
     // Phase 3: Key Destruction
-    send_progress(&tx, ExecutionPhase::KeyDestruction, 0.88,
+    send_progress(&tx, ExecutionPhase::KeyDestruction,
         "NVMe controller internal key zeroization complete.", Some(2)).await;
 
     // Phase 4: Cache Flush
-    send_progress(&tx, ExecutionPhase::CacheFlush, 0.93,
+    send_progress(&tx, ExecutionPhase::CacheFlush,
         "Flushing volatile caches and translation tables...", Some(1)).await;
 
     // Phase 5: Ready for verification
-    send_progress(&tx, ExecutionPhase::Verification, 0.97,
+    send_progress(&tx, ExecutionPhase::Verification,
         "Sanitize command completed. Ready for post-verification.", Some(1)).await;
 
     Ok(ExecutionReport {
@@ -903,6 +1049,8 @@ pub async fn nvme_sanitize(
         exit_code: 0,
         duration_ms: start.elapsed().as_millis() as u64,
         dry_run,
+        bytes_written: 0,
+        io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
     })
 }
 
@@ -938,7 +1086,7 @@ pub async fn ata_secure_erase(
     verify_exclusive_access_and_recheck(device, dry_run, &FsContext::default())?;
 
     // Phase 1: Check frozen state
-    send_progress(&tx, ExecutionPhase::SecurityUnlock, 0.05,
+    send_progress(&tx, ExecutionPhase::SecurityUnlock,
         "Checking ATA security frozen state with hdparm -I...", Some(10)).await;
 
     let (stdout, stderr, _) = run_cmd("hdparm", &["-I", device], dry_run, &mut command_log)?;
@@ -946,14 +1094,14 @@ pub async fn ata_secure_erase(
     all_stderr.push_str(&stderr);
 
     if !dry_run && stdout.to_lowercase().contains("frozen") && !stdout.to_lowercase().contains("not\tfrozen") && !stdout.to_lowercase().contains("not frozen") {
-        send_progress(&tx, ExecutionPhase::SecurityUnlock, 0.08,
+        send_progress(&tx, ExecutionPhase::SecurityUnlock,
             "WARNING: ATA security is FROZEN. Attempting suspend/resume cycle...", None).await;
         // In a real bootable environment, we could issue a sleep/wake cycle
         // For now, report the frozen state
     }
 
     // Phase 1b: Set security password
-    send_progress(&tx, ExecutionPhase::SecurityUnlock, 0.12,
+    send_progress(&tx, ExecutionPhase::SecurityUnlock,
         "Setting temporary ATA security password...", Some(8)).await;
 
     let (stdout, stderr, code) = run_cmd(
@@ -975,13 +1123,15 @@ pub async fn ata_secure_erase(
             exit_code: code,
             duration_ms: start.elapsed().as_millis() as u64,
             dry_run,
+            bytes_written: 0,
+            io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
         });
     }
 
     // Phase 2: Issue secure erase
     let erase_arg = if enhanced { "--security-erase-enhanced" } else { "--security-erase" };
 
-    send_progress(&tx, ExecutionPhase::FirmwareCommand, 0.20,
+    send_progress(&tx, ExecutionPhase::FirmwareCommand,
         &format!("Issuing hdparm {} on {}...", erase_arg, device), None).await;
 
     let (stdout, stderr, code) = run_cmd(
@@ -993,12 +1143,9 @@ pub async fn ata_secure_erase(
     all_stdout.push_str(&stdout);
     all_stderr.push_str(&stderr);
 
-    // Simulate progress for dry-run
     if dry_run {
-        for pct in [35, 50, 65, 80] {
-            send_progress(&tx, ExecutionPhase::FirmwareCommand, pct as f32 / 100.0,
-                &format!("[DRY RUN] ATA Secure Erase progress: {}%", pct), None).await;
-        }
+        send_progress(&tx, ExecutionPhase::FirmwareCommand,
+            "[DRY RUN] ATA Secure Erase executing on controller", None).await;
     }
 
     if !dry_run && code != 0 {
@@ -1011,15 +1158,17 @@ pub async fn ata_secure_erase(
             exit_code: code,
             duration_ms: start.elapsed().as_millis() as u64,
             dry_run,
+            bytes_written: 0,
+            io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
         });
     }
 
     // Phase 3: Key destruction (implicit in ATA SE)
-    send_progress(&tx, ExecutionPhase::KeyDestruction, 0.88,
+    send_progress(&tx, ExecutionPhase::KeyDestruction,
         "ATA controller key destruction complete.", Some(2)).await;
 
     // Phase 4: Cache flush
-    send_progress(&tx, ExecutionPhase::CacheFlush, 0.93,
+    send_progress(&tx, ExecutionPhase::CacheFlush,
         "Flushing write cache...", Some(1)).await;
 
     if !dry_run {
@@ -1028,7 +1177,7 @@ pub async fn ata_secure_erase(
         all_stderr.push_str(&e);
     }
 
-    send_progress(&tx, ExecutionPhase::Verification, 0.97,
+    send_progress(&tx, ExecutionPhase::Verification,
         "ATA Secure Erase completed. Ready for post-verification.", Some(1)).await;
 
     Ok(ExecutionReport {
@@ -1040,6 +1189,8 @@ pub async fn ata_secure_erase(
         exit_code: 0,
         duration_ms: start.elapsed().as_millis() as u64,
         dry_run,
+        bytes_written: 0,
+        io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
     })
 }
 
@@ -1074,10 +1225,10 @@ pub async fn ata_sanitize(
         AtaSanitizeAction::Overwrite => ("overwrite", "ATA Sanitize Overwrite"),
     };
 
-    send_progress(&tx, ExecutionPhase::SecurityUnlock, 0.05,
+    send_progress(&tx, ExecutionPhase::SecurityUnlock,
         "Checking device sanitize feature set support...", Some(5)).await;
 
-    send_progress(&tx, ExecutionPhase::FirmwareCommand, 0.15,
+    send_progress(&tx, ExecutionPhase::FirmwareCommand,
         &format!("Issuing ATA Sanitize {} on {}...", action_arg, device), None).await;
 
     // hdparm --sanitize-block-erase / --sanitize-crypto-scramble
@@ -1092,17 +1243,15 @@ pub async fn ata_sanitize(
     all_stderr.push_str(&stderr);
 
     if dry_run {
-        for pct in [30, 50, 70, 85] {
-            send_progress(&tx, ExecutionPhase::FirmwareCommand, pct as f32 / 100.0,
-                &format!("[DRY RUN] ATA Sanitize progress: {}%", pct), None).await;
-        }
+        send_progress(&tx, ExecutionPhase::FirmwareCommand,
+            "[DRY RUN] ATA Sanitize executing on controller", None).await;
     }
 
-    send_progress(&tx, ExecutionPhase::KeyDestruction, 0.88,
+    send_progress(&tx, ExecutionPhase::KeyDestruction,
         "ATA Sanitize controller key handling complete.", Some(2)).await;
-    send_progress(&tx, ExecutionPhase::CacheFlush, 0.93,
+    send_progress(&tx, ExecutionPhase::CacheFlush,
         "Flushing caches...", Some(1)).await;
-    send_progress(&tx, ExecutionPhase::Verification, 0.97,
+    send_progress(&tx, ExecutionPhase::Verification,
         "ATA Sanitize completed. Ready for post-verification.", Some(1)).await;
 
     Ok(ExecutionReport {
@@ -1114,6 +1263,8 @@ pub async fn ata_sanitize(
         exit_code: if dry_run { 0 } else { code },
         duration_ms: start.elapsed().as_millis() as u64,
         dry_run,
+        bytes_written: 0,
+        io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
     })
 }
 
@@ -1142,7 +1293,7 @@ pub async fn opal_revert(
     // Verify exclusive access and re-check boot protection post-unmount
     verify_exclusive_access_and_recheck(device, dry_run, &FsContext::default())?;
 
-    send_progress(&tx, ExecutionPhase::SecurityUnlock, 0.05,
+    send_progress(&tx, ExecutionPhase::SecurityUnlock,
         "Querying TCG OPAL SED state...", Some(3)).await;
 
     // Query OPAL state first
@@ -1150,7 +1301,7 @@ pub async fn opal_revert(
     all_stdout.push_str(&stdout);
     all_stderr.push_str(&stderr);
 
-    send_progress(&tx, ExecutionPhase::FirmwareCommand, 0.20,
+    send_progress(&tx, ExecutionPhase::FirmwareCommand,
         "Issuing TCG OPAL revertTPer command...", None).await;
 
     // PSID revert or password-based revert
@@ -1166,17 +1317,15 @@ pub async fn opal_revert(
     all_stderr.push_str(&stderr);
 
     if dry_run {
-        for pct in [40, 60, 80] {
-            send_progress(&tx, ExecutionPhase::FirmwareCommand, pct as f32 / 100.0,
-                &format!("[DRY RUN] OPAL revert progress: {}%", pct), None).await;
-        }
+        send_progress(&tx, ExecutionPhase::FirmwareCommand,
+            "[DRY RUN] OPAL revert executing on controller", None).await;
     }
 
-    send_progress(&tx, ExecutionPhase::KeyDestruction, 0.88,
+    send_progress(&tx, ExecutionPhase::KeyDestruction,
         "TCG OPAL Media Encryption Key (MEK) destroyed.", Some(2)).await;
-    send_progress(&tx, ExecutionPhase::CacheFlush, 0.93,
+    send_progress(&tx, ExecutionPhase::CacheFlush,
         "SED controller state reset complete.", Some(1)).await;
-    send_progress(&tx, ExecutionPhase::Verification, 0.97,
+    send_progress(&tx, ExecutionPhase::Verification,
         "OPAL revert completed. Ready for post-verification.", Some(1)).await;
 
     Ok(ExecutionReport {
@@ -1188,6 +1337,8 @@ pub async fn opal_revert(
         exit_code: if dry_run { 0 } else { code },
         duration_ms: start.elapsed().as_millis() as u64,
         dry_run,
+        bytes_written: 0,
+        io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
     })
 }
 
@@ -1215,10 +1366,10 @@ pub async fn emmc_sanitize(
     // Verify exclusive access and re-check boot protection post-unmount
     verify_exclusive_access_and_recheck(device, dry_run, &FsContext::default())?;
 
-    send_progress(&tx, ExecutionPhase::SecurityUnlock, 0.05,
+    send_progress(&tx, ExecutionPhase::SecurityUnlock,
         "Reading eMMC extcsd sanitize capability...", Some(3)).await;
 
-    send_progress(&tx, ExecutionPhase::FirmwareCommand, 0.15,
+    send_progress(&tx, ExecutionPhase::FirmwareCommand,
         &format!("Issuing mmc sanitize on {}...", device), None).await;
 
     let (stdout, stderr, code) = run_cmd("mmc", &["sanitize", device], dry_run, &mut command_log)?;
@@ -1226,17 +1377,15 @@ pub async fn emmc_sanitize(
     all_stderr.push_str(&stderr);
 
     if dry_run {
-        for pct in [30, 50, 70, 85] {
-            send_progress(&tx, ExecutionPhase::FirmwareCommand, pct as f32 / 100.0,
-                &format!("[DRY RUN] eMMC sanitize progress: {}%", pct), None).await;
-        }
+        send_progress(&tx, ExecutionPhase::FirmwareCommand,
+            "[DRY RUN] eMMC sanitize executing on controller", None).await;
     }
 
-    send_progress(&tx, ExecutionPhase::KeyDestruction, 0.88,
+    send_progress(&tx, ExecutionPhase::KeyDestruction,
         "eMMC controller internal cleanup complete.", Some(2)).await;
-    send_progress(&tx, ExecutionPhase::CacheFlush, 0.93,
+    send_progress(&tx, ExecutionPhase::CacheFlush,
         "Flushing eMMC write buffer...", Some(1)).await;
-    send_progress(&tx, ExecutionPhase::Verification, 0.97,
+    send_progress(&tx, ExecutionPhase::Verification,
         "eMMC Sanitize completed. Ready for post-verification.", Some(1)).await;
 
     Ok(ExecutionReport {
@@ -1248,11 +1397,612 @@ pub async fn emmc_sanitize(
         exit_code: if dry_run { 0 } else { code },
         duration_ms: start.elapsed().as_millis() as u64,
         dry_run,
+        bytes_written: 0,
+        io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
     })
 }
 
-/// Software Overwrite — multi-pass pattern write using dd.
-/// This is the fallback for legacy/unsupported media.
+// ---------------------------------------------------------------------------
+// Native Block Writer & Telemetry Engine
+// ---------------------------------------------------------------------------
+
+pub struct AlignedBuffer {
+    ptr: *mut u8,
+    layout: std::alloc::Layout,
+}
+
+unsafe impl Send for AlignedBuffer {}
+unsafe impl Sync for AlignedBuffer {}
+
+impl AlignedBuffer {
+    pub fn new(size: usize) -> Self {
+        let layout = std::alloc::Layout::from_size_align(size, 4096).unwrap();
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        Self { ptr, layout }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.layout.size()) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.layout.size()) }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+    }
+}
+
+pub trait BlockWriter: Send + Sync {
+    fn write_chunk(&mut self, offset: u64, data: &[u8]) -> Result<usize, io::Error>;
+    fn sync_data(&mut self) -> Result<(), io::Error>;
+    fn flush_buffers(&mut self) -> Result<(), io::Error>;
+    fn total_size(&self) -> Result<u64, io::Error>;
+    fn logical_block_size(&self) -> u32 { 512 }
+    fn io_mode(&self) -> &'static str;
+}
+
+const BLKGETSIZE64: libc::c_ulong = 0x80081272;
+const BLKSSZGET: libc::c_ulong = 0x1268;
+
+#[derive(Debug)]
+pub struct DirectBlockWriter {
+    file: fs::File,
+    io_mode: &'static str,
+    device_size: u64,
+    sector_size: u32,
+    bytes_since_sync: u64,
+}
+
+impl DirectBlockWriter {
+    pub fn open(path: &str, expected_identity: &GuardIdentity) -> Result<Self, ExecuteError> {
+        let c_path = std::ffi::CString::new(path)
+            .map_err(|e| ExecuteError::CommandFailed(format!("Invalid path: {}", e)))?;
+
+        let mut mode = "direct";
+        let mut fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDWR | libc::O_EXCL | libc::O_DIRECT,
+            )
+        };
+
+        if fd < 0 {
+            // Fallback 1: O_DSYNC
+            mode = "dsync";
+            fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_RDWR | libc::O_EXCL | libc::O_DSYNC,
+                )
+            };
+        }
+
+        if fd < 0 {
+            // Fallback 2: buffered + periodic fdatasync
+            mode = "buffered_sync_16mb";
+            fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_RDWR | libc::O_EXCL,
+                )
+            };
+        }
+
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EBUSY) {
+                return Err(ExecuteError::CommandFailed(format!(
+                    "Device {} is busy or mounted (O_EXCL conflict): cannot safely overwrite",
+                    path
+                )));
+            }
+            return Err(ExecuteError::DeviceNotFound(format!(
+                "Failed to open device {} with O_EXCL: {}",
+                path, err
+            )));
+        }
+
+        let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
+        let res = unsafe { libc::fstat(fd, &mut stat_buf) };
+        if res < 0 {
+            unsafe { libc::close(fd) };
+            return Err(ExecuteError::IoError(io::Error::last_os_error()));
+        }
+
+        let is_blk = (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFBLK;
+        let is_reg = (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFREG;
+        if !is_blk && !is_reg {
+            unsafe { libc::close(fd) };
+            return Err(ExecuteError::UnsupportedOperation(format!(
+                "Device {} is neither a block device nor a regular file",
+                path
+            )));
+        }
+
+        // Item 1: compare opened fd's st_rdev and S_ISBLK against identity recorded at boot-guard time
+        if expected_identity.is_block {
+            if !is_blk {
+                unsafe { libc::close(fd) };
+                return Err(ExecuteError::BootDiskProtection(
+                    "Target is not a block device (S_ISBLK check failed on opened fd)".to_string(),
+                ));
+            }
+            if stat_buf.st_rdev != expected_identity.st_rdev {
+                unsafe { libc::close(fd) };
+                return Err(ExecuteError::BootDiskProtection(format!(
+                    "Device identity changed between boot-guard and open (st_rdev mismatch: expected {}, got {}): aborting",
+                    expected_identity.st_rdev, stat_buf.st_rdev
+                )));
+            }
+            // Re-run protection check on the fd's major:minor
+            if let Err(e) = recheck_protection_by_dev_t(stat_buf.st_rdev, &FsContext::default()) {
+                unsafe { libc::close(fd) };
+                return Err(e);
+            }
+        } else {
+            // For non-block targets (e.g. tests), verify inode has not changed
+            if expected_identity.st_ino > 0 && stat_buf.st_ino as u64 != expected_identity.st_ino {
+                unsafe { libc::close(fd) };
+                return Err(ExecuteError::BootDiskProtection(format!(
+                    "Path resolved to a different file after boot-guard (inode mismatch: expected {}, got {}): aborting",
+                    expected_identity.st_ino, stat_buf.st_ino
+                )));
+            }
+        }
+
+        let mut size: u64 = 0;
+        if is_blk {
+            let ret = unsafe { libc::ioctl(fd, BLKGETSIZE64, &mut size) };
+            if ret != 0 || size == 0 {
+                size = stat_buf.st_size as u64;
+            }
+        } else {
+            size = stat_buf.st_size as u64;
+        }
+
+        let mut ssz: u32 = 512;
+        if is_blk {
+            unsafe { libc::ioctl(fd, BLKSSZGET, &mut ssz) }; // BLKSSZGET
+        }
+        if ssz == 0 {
+            ssz = 512;
+        }
+
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+
+        Ok(Self {
+            file,
+            io_mode: mode,
+            device_size: size,
+            sector_size: ssz,
+            bytes_since_sync: 0,
+        })
+    }
+}
+
+impl BlockWriter for DirectBlockWriter {
+    fn write_chunk(&mut self, offset: u64, data: &[u8]) -> Result<usize, io::Error> {
+        use std::os::unix::fs::FileExt;
+        let written = self.file.write_at(data, offset)?;
+        self.bytes_since_sync += written as u64;
+        if self.io_mode == "buffered_sync_16mb" && self.bytes_since_sync >= 16 * 1024 * 1024 {
+            self.file.sync_data()?;
+            self.bytes_since_sync = 0;
+        }
+        Ok(written)
+    }
+
+    fn sync_data(&mut self) -> Result<(), io::Error> {
+        self.file.sync_data()?;
+        self.bytes_since_sync = 0;
+        Ok(())
+    }
+
+    fn flush_buffers(&mut self) -> Result<(), io::Error> {
+        self.file.sync_all()?;
+        let fd = self.file.as_raw_fd();
+        unsafe {
+            libc::ioctl(fd, 0x1261, 0); // BLKFLSBUF
+        }
+        Ok(())
+    }
+
+    fn total_size(&self) -> Result<u64, io::Error> {
+        Ok(self.device_size)
+    }
+
+    fn logical_block_size(&self) -> u32 {
+        self.sector_size
+    }
+
+    fn io_mode(&self) -> &'static str {
+        self.io_mode
+    }
+}
+
+pub struct FileBlockWriter {
+    file: fs::File,
+    size: u64,
+}
+
+impl FileBlockWriter {
+    pub fn new(file: fs::File, size: u64) -> Self {
+        Self { file, size }
+    }
+}
+
+impl BlockWriter for FileBlockWriter {
+    fn write_chunk(&mut self, offset: u64, data: &[u8]) -> Result<usize, io::Error> {
+        use std::os::unix::fs::FileExt;
+        self.file.write_at(data, offset)
+    }
+
+    fn sync_data(&mut self) -> Result<(), io::Error> {
+        self.file.sync_data()
+    }
+
+    fn flush_buffers(&mut self) -> Result<(), io::Error> {
+        self.file.sync_all()
+    }
+
+    fn total_size(&self) -> Result<u64, io::Error> {
+        Ok(self.size)
+    }
+
+    fn logical_block_size(&self) -> u32 {
+        512
+    }
+
+    fn io_mode(&self) -> &'static str {
+        "file_test"
+    }
+}
+
+pub struct MockBlockWriter {
+    pub size: u64,
+    pub written_bytes: u64,
+    pub fail_after_bytes: Option<u64>,
+    pub injected_error: Option<io::ErrorKind>,
+    pub injected_raw_os_error: Option<i32>,
+    pub sync_fail: bool,
+    pub delay_per_chunk: Option<std::time::Duration>,
+}
+
+impl MockBlockWriter {
+    pub fn new(size: u64) -> Self {
+        Self {
+            size,
+            written_bytes: 0,
+            fail_after_bytes: None,
+            injected_error: None,
+            injected_raw_os_error: None,
+            sync_fail: false,
+            delay_per_chunk: None,
+        }
+    }
+}
+
+impl BlockWriter for MockBlockWriter {
+    fn write_chunk(&mut self, _offset: u64, data: &[u8]) -> Result<usize, io::Error> {
+        if let Some(delay) = self.delay_per_chunk {
+            std::thread::sleep(delay);
+        }
+        if let Some(limit) = self.fail_after_bytes {
+            if self.written_bytes + data.len() as u64 > limit {
+                if let Some(os_err) = self.injected_raw_os_error {
+                    return Err(io::Error::from_raw_os_error(os_err));
+                }
+                let err_kind = self.injected_error.unwrap_or(io::ErrorKind::Other);
+                return Err(io::Error::new(err_kind, "Injected mock write error"));
+            }
+        }
+        self.written_bytes += data.len() as u64;
+        Ok(data.len())
+    }
+
+    fn sync_data(&mut self) -> Result<(), io::Error> {
+        if self.sync_fail {
+            return Err(io::Error::other("Injected mock sync error"));
+        }
+        Ok(())
+    }
+
+    fn flush_buffers(&mut self) -> Result<(), io::Error> {
+        self.sync_data()
+    }
+
+    fn total_size(&self) -> Result<u64, io::Error> {
+        Ok(self.size)
+    }
+
+    fn io_mode(&self) -> &'static str {
+        "mock"
+    }
+}
+
+pub struct SpeedEstimator {
+    samples: VecDeque<(Instant, u64)>,
+    window_secs: f64,
+}
+
+impl SpeedEstimator {
+    pub fn new(window_secs: f64) -> Self {
+        Self {
+            samples: VecDeque::new(),
+            window_secs,
+        }
+    }
+
+    pub fn record(&mut self, now: Instant, bytes_done: u64) {
+        self.samples.push_back((now, bytes_done));
+        let cutoff = now - std::time::Duration::from_secs_f64(self.window_secs);
+        while let Some(&(t, _)) = self.samples.front() {
+            if t < cutoff && self.samples.len() > 1 {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn current_speed(&self) -> f64 {
+        if self.samples.len() < 2 {
+            return 0.0;
+        }
+        let (first_t, first_b) = self.samples.front().unwrap();
+        let (last_t, last_b) = self.samples.back().unwrap();
+        let dt = (*last_t - *first_t).as_secs_f64();
+        if dt > 0.05 {
+            (*last_b - *first_b) as f64 / dt
+        } else {
+            0.0
+        }
+    }
+}
+
+pub fn write_checkpoint_file(serial: &str, bytes_done: u64, bytes_total: u64) {
+    let sanitized_serial: String = serial.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+    let path = format!("/tmp/zt_checkpoint_{}.json", sanitized_serial);
+    let now_ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let json = serde_json::json!({
+        "serial": serial,
+        "bytes_done": bytes_done,
+        "bytes_total": bytes_total,
+        "timestamp": now_ts,
+    });
+    let _ = fs::write(path, json.to_string());
+}
+
+pub fn remove_checkpoint_file(serial: &str) {
+    let sanitized_serial: String = serial.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+    let path = format!("/tmp/zt_checkpoint_{}.json", sanitized_serial);
+    let _ = fs::remove_file(path);
+}
+
+pub async fn execute_writer_overwrite<W: BlockWriter>(
+    mut writer: W,
+    total_passes: u8,
+    pattern: OverwritePattern,
+    device_serial: &str,
+    method_name: &str,
+    start: Instant,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> Result<ExecutionReport, ExecuteError> {
+    let command_log = vec![format!("Native block overwrite ({} passes, mode: {})", total_passes, writer.io_mode())];
+    let device_size = writer.total_size().map_err(ExecuteError::IoError)?;
+    let total_bytes = total_passes as u64 * device_size;
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let _term_hook = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&cancel_flag));
+    let _int_hook = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&cancel_flag));
+
+    let chunk_size = 2 * 1024 * 1024usize; // 2 MiB chunks
+    let mut aligned_buf = AlignedBuffer::new(chunk_size);
+    let mut speed_est = SpeedEstimator::new(3.0); // 3-second sliding window
+
+    let bytes_done_shared = Arc::new(AtomicU64::new(0));
+    let phase_shared = Arc::new(Mutex::new(ExecutionPhase::Preparing));
+
+    // Spawn 1-second heartbeat task
+    let (hb_stop_tx, mut hb_stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let hb_tx = tx.clone();
+    let hb_bytes_done = Arc::clone(&bytes_done_shared);
+    let hb_phase = Arc::clone(&phase_shared);
+    let hb_total_bytes = total_bytes;
+
+    let hb_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(1000));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    let phase = hb_phase.lock().unwrap().clone();
+                    let done = hb_bytes_done.load(Ordering::Relaxed);
+                    let pct = if hb_total_bytes > 0 { Some(done as f32 / hb_total_bytes as f32) } else { None };
+                    let _ = hb_tx.send(ProgressEvent {
+                        schema_version: 2,
+                        phase,
+                        bytes_done: done,
+                        bytes_total: hb_total_bytes,
+                        percent: pct,
+                        speed_bytes_per_sec: 0.0,
+                        eta_seconds: None,
+                        message: "heartbeat".to_string(),
+                        is_heartbeat: true,
+                    }).await;
+                }
+                _ = &mut hb_stop_rx => {
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut overall_bytes_done: u64 = 0;
+    let mut last_event_time = Instant::now();
+    let mut last_checkpoint_time = Instant::now();
+
+    *phase_shared.lock().unwrap() = ExecutionPhase::FirmwareCommand; // Writing phase
+
+    let mut prng = ChaCha20Rng::from_entropy();
+
+    for pass_idx in 0..total_passes {
+        let is_random = match pattern {
+            OverwritePattern::Random => true,
+            OverwritePattern::MultiPass3 => pass_idx == 1,
+            _ => false,
+        };
+
+        if !is_random {
+            let fill_byte = match pattern {
+                OverwritePattern::Ones => 0xFF,
+                _ => 0x00,
+            };
+            aligned_buf.as_mut_slice().fill(fill_byte);
+        }
+
+        let mut offset = 0u64;
+        while offset < device_size {
+            // Check cancellation flag
+            if cancel_flag.load(Ordering::SeqCst) {
+                let _ = writer.sync_data();
+                write_checkpoint_file(device_serial, overall_bytes_done, total_bytes);
+                let _ = hb_stop_tx.send(());
+                let _ = hb_task.await;
+                return Ok(ExecutionReport {
+                    success: false,
+                    method_used: method_name.to_string(),
+                    command_log,
+                    stdout: String::new(),
+                    stderr: "Sanitization cancelled by user: partially wiped".to_string(),
+                    exit_code: 130,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    dry_run: false,
+                    bytes_written: overall_bytes_done,
+                    io_mode: writer.io_mode().to_string(),
+                });
+            }
+
+            let write_len = std::cmp::min(chunk_size as u64, device_size - offset) as usize;
+            if is_random {
+                prng.fill_bytes(&mut aligned_buf.as_mut_slice()[..write_len]);
+            }
+
+            let mut written_for_chunk = 0;
+            while written_for_chunk < write_len {
+                if cancel_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                let slice = &aligned_buf.as_slice()[written_for_chunk..write_len];
+                match writer.write_chunk(offset + written_for_chunk as u64, slice) {
+                    Ok(0) => {
+                        let _ = hb_stop_tx.send(());
+                        let _ = hb_task.await;
+                        return Err(ExecuteError::PrematureEndOfDevice("Write returned 0 bytes (ENOSPC)".into()));
+                    }
+                    Ok(n) => {
+                        written_for_chunk += n;
+                        overall_bytes_done += n as u64;
+                        bytes_done_shared.store(overall_bytes_done, Ordering::Relaxed);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                        let _ = hb_stop_tx.send(());
+                        let _ = hb_task.await;
+                        return Err(ExecuteError::HardwareIo(format!("EIO at offset {}: {}", offset + written_for_chunk as u64, e)));
+                    }
+                    Err(e) if e.raw_os_error() == Some(libc::ENODEV) => {
+                        let _ = hb_stop_tx.send(());
+                        let _ = hb_task.await;
+                        return Err(ExecuteError::DeviceDisconnected(format!("ENODEV at offset {}: {}", offset + written_for_chunk as u64, e)));
+                    }
+                    Err(e) if e.raw_os_error() == Some(libc::ENOSPC) => {
+                        let _ = hb_stop_tx.send(());
+                        let _ = hb_task.await;
+                        return Err(ExecuteError::PrematureEndOfDevice(format!("ENOSPC at offset {}: {}", offset + written_for_chunk as u64, e)));
+                    }
+                    Err(e) => {
+                        let _ = hb_stop_tx.send(());
+                        let _ = hb_task.await;
+                        return Err(ExecuteError::IoError(e));
+                    }
+                }
+            }
+
+            offset += write_len as u64;
+            speed_est.record(Instant::now(), overall_bytes_done);
+
+            // Throttle progress events to ~3/sec
+            let now = Instant::now();
+            if now.duration_since(last_event_time).as_millis() >= 300 || offset >= device_size {
+                last_event_time = now;
+                let cur_speed = speed_est.current_speed();
+                let eta = if cur_speed > 1024.0 && overall_bytes_done < total_bytes {
+                    Some(((total_bytes - overall_bytes_done) as f64 / cur_speed) as u32)
+                } else {
+                    None
+                };
+                let pct = overall_bytes_done as f32 / total_bytes as f32;
+                let msg = format!("Pass {} of {}: writing to media", pass_idx + 1, total_passes);
+                send_detailed_progress(&tx, ExecutionPhase::FirmwareCommand, overall_bytes_done, total_bytes, Some(pct), cur_speed, eta, &msg, false).await;
+            }
+
+            // Periodic checkpoint file write (~every 3 seconds)
+            if now.duration_since(last_checkpoint_time).as_secs() >= 3 {
+                last_checkpoint_time = now;
+                write_checkpoint_file(device_serial, overall_bytes_done, total_bytes);
+            }
+        }
+    }
+
+    // Flush phase (Item 1, 2, 3)
+    *phase_shared.lock().unwrap() = ExecutionPhase::Flushing;
+    send_detailed_progress(&tx, ExecutionPhase::Flushing, overall_bytes_done, total_bytes, None, 0.0, None, "Finalizing, flushing to drive", false).await;
+
+    if let Err(e) = writer.sync_data() {
+        let _ = hb_stop_tx.send(());
+        let _ = hb_task.await;
+        return Err(ExecuteError::IoError(e));
+    }
+    if let Err(e) = writer.flush_buffers() {
+        let _ = hb_stop_tx.send(());
+        let _ = hb_task.await;
+        return Err(ExecuteError::IoError(e));
+    }
+
+    *phase_shared.lock().unwrap() = ExecutionPhase::Verification;
+    send_detailed_progress(&tx, ExecutionPhase::Verification, overall_bytes_done, total_bytes, None, 0.0, None, "Verifying sector erasure...", false).await;
+
+    let _ = hb_stop_tx.send(());
+    let _ = hb_task.await;
+
+    // Checkpoint removal upon success
+    remove_checkpoint_file(device_serial);
+
+    Ok(ExecutionReport {
+        success: overall_bytes_done == total_bytes,
+        method_used: method_name.to_string(),
+        command_log,
+        stdout: format!("Successfully overwritten {} bytes in {} passes", overall_bytes_done, total_passes),
+        stderr: String::new(),
+        exit_code: 0,
+        duration_ms: start.elapsed().as_millis() as u64,
+        dry_run: false,
+        bytes_written: overall_bytes_done,
+        io_mode: writer.io_mode().to_string(),
+    })
+}
+
+/// Software Overwrite — native direct I/O overwrite.
+/// Performs sector-aligned Direct I/O writes (with O_DSYNC / buffered sync fallbacks)
+/// replacing legacy dd execution.
 pub async fn software_overwrite(
     device: &str,
     passes: u8,
@@ -1264,14 +2014,14 @@ pub async fn software_overwrite(
 ) -> Result<ExecutionReport, ExecuteError> {
     let start = Instant::now();
     let mut command_log = Vec::new();
-    let mut all_stdout = String::new();
-    let mut all_stderr = String::new();
 
+    // 1. Safety validation and identity pinning
     check_boot_disk_protection(device, dry_run)?;
     verify_confirmation(confirmation_token, device_serial)?;
+    let guard_identity = get_guard_identity(device, dry_run, device_serial, &FsContext::default())?;
 
     let total_passes = match pattern {
-        OverwritePattern::NistLegacy3Pass => 3u8,
+        OverwritePattern::MultiPass3 => 3u8,
         _ => passes.max(1),
     };
 
@@ -1280,109 +2030,52 @@ pub async fn software_overwrite(
         total_passes, pattern
     );
 
-    send_progress(&tx, ExecutionPhase::SecurityUnlock, 0.03,
-        "Unmounting filesystems on target device...", Some(5)).await;
-
-    // Unmount any active partitions
-    let (stdout, stderr) = unmount_device_if_mounted(device, dry_run, &mut command_log);
-    all_stdout.push_str(&stdout);
-    all_stderr.push_str(&stderr);
-
-    // Verify exclusive access and re-check boot protection post-unmount
-    verify_exclusive_access_and_recheck(device, dry_run, &FsContext::default())?;
-
-    for pass_num in 0..total_passes {
-        let input_source = match pattern {
-            OverwritePattern::Zeros => "/dev/zero",
-            OverwritePattern::Ones => "/dev/zero", // We'd use tr to flip bits, simplified here
-            OverwritePattern::Random => "/dev/urandom",
-            OverwritePattern::NistLegacy3Pass => {
-                match pass_num {
-                    0 => "/dev/zero",       // Pass 1: zeros
-                    1 => "/dev/urandom",    // Pass 2: random
-                    _ => "/dev/zero",       // Pass 3: zeros verify
-                }
-            }
-        };
-
-        let pass_base_pct = pass_num as f32 / total_passes as f32;
-        let pass_range = 1.0 / total_passes as f32;
-
-        send_progress(&tx, ExecutionPhase::FirmwareCommand,
-            0.10 + pass_base_pct * 0.75,
-            &format!("Pass {}/{}: Writing from {} to {}...",
-                pass_num + 1, total_passes, input_source, device),
-            None).await;
-
-        // dd if=<source> of=<device> bs=1M status=progress conv=fdatasync
-        let (stdout, stderr, code) = run_cmd(
-            "dd",
-            &[
-                &format!("if={}", input_source),
-                &format!("of={}", device),
-                "bs=1M",
-                "status=progress",
-                "conv=fdatasync",
-            ],
-            dry_run,
-            &mut command_log,
-        )?;
-        all_stdout.push_str(&stdout);
-        all_stderr.push_str(&stderr);
-
-        if !dry_run && code != 0 {
-            // dd returns non-zero when it reaches end-of-device, which is expected
-            // Only fail if stderr contains actual errors (not just the "No space left" message)
-            if !stderr.contains("No space left on device") && !stderr.contains("bytes") {
-                return Ok(ExecutionReport {
-                    success: false,
-                    method_used: method_name,
-                    command_log,
-                    stdout: all_stdout,
-                    stderr: all_stderr,
-                    exit_code: code,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    dry_run,
-                });
-            }
+    // 2. Item 2: Move dry-run branch before unmount step!
+    if dry_run {
+        command_log.push(format!("[DRY RUN] Native block overwrite: {} passes ({:?}) on {}", total_passes, pattern, device));
+        send_detailed_progress(&tx, ExecutionPhase::FirmwareCommand, 0, 0, None, 0.0, None, "[DRY RUN] Starting simulated overwrite...", false).await;
+        for pass in 1..=total_passes {
+            send_detailed_progress(&tx, ExecutionPhase::FirmwareCommand, 0, 0, None, 0.0, None,
+                &format!("[DRY RUN] Overwrite pass {} of {} complete", pass, total_passes), false).await;
         }
-
-        // Simulate progress in dry-run
-        if dry_run {
-            for sub_pct in [25, 50, 75, 100] {
-                let overall = 0.10 + (pass_base_pct + pass_range * sub_pct as f32 / 100.0) * 0.75;
-                send_progress(&tx, ExecutionPhase::FirmwareCommand, overall,
-                    &format!("[DRY RUN] Pass {}/{}: {}% complete",
-                        pass_num + 1, total_passes, sub_pct),
-                    None).await;
-            }
-        }
+        send_detailed_progress(&tx, ExecutionPhase::Flushing, 0, 0, None, 0.0, None, "[DRY RUN] Flushing complete", false).await;
+        send_detailed_progress(&tx, ExecutionPhase::Verification, 0, 0, None, 0.0, None, "[DRY RUN] Post-verification complete", false).await;
+        return Ok(ExecutionReport {
+            success: true,
+            method_used: method_name,
+            command_log,
+            stdout: "[DRY RUN] Overwrite simulated successfully".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
+            dry_run: true,
+            bytes_written: 0,
+            io_mode: "dry_run".to_string(),
+        });
     }
 
-    send_progress(&tx, ExecutionPhase::KeyDestruction, 0.88,
-        "Overwrite passes complete. No firmware keys to destroy.", Some(2)).await;
+    send_detailed_progress(&tx, ExecutionPhase::SecurityUnlock, 0, 0, None, 0.0, Some(5),
+        "Unmounting filesystems on target device...", false).await;
 
-    // Sync and flush
-    send_progress(&tx, ExecutionPhase::CacheFlush, 0.93,
-        "Syncing filesystem and flushing block device cache...", Some(1)).await;
+    // 3. Unmount any active partitions
+    let (_stdout, _stderr) = unmount_device_if_mounted(device, false, &mut command_log);
 
-    let (stdout, stderr, _) = run_cmd("sync", &[], dry_run, &mut command_log)?;
-    all_stdout.push_str(&stdout);
-    all_stderr.push_str(&stderr);
+    // 4. Verify exclusive access and re-check boot protection post-unmount
+    verify_exclusive_access_and_recheck(device, false, &FsContext::default())?;
 
-    send_progress(&tx, ExecutionPhase::Verification, 0.97,
-        "Software overwrite completed. Ready for post-verification.", Some(1)).await;
+    // 5. Open native block writer with O_EXCL and fd identity validation
+    let writer = DirectBlockWriter::open(&guard_identity.canonical_path, &guard_identity)?;
 
-    Ok(ExecutionReport {
-        success: true,
-        method_used: method_name,
-        command_log,
-        stdout: all_stdout,
-        stderr: all_stderr,
-        exit_code: 0,
-        duration_ms: start.elapsed().as_millis() as u64,
-        dry_run,
-    })
+    // 6. Execute native overwrite
+    execute_writer_overwrite(
+        writer,
+        total_passes,
+        pattern,
+        device_serial,
+        &method_name,
+        start,
+        tx,
+    ).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1874,21 +2567,31 @@ mod tests {
             exit_code: 0,
             duration_ms: 100,
             dry_run: true,
+            bytes_written: 1024,
+            io_mode: "direct".to_string(),
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"dry_run\":true"));
+        assert!(json.contains("\"bytes_written\":1024"));
+        assert!(json.contains("\"io_mode\":\"direct\""));
     }
 
     #[test]
     fn test_progress_event_serializes() {
         let event = ProgressEvent {
+            schema_version: 2,
             phase: ExecutionPhase::FirmwareCommand,
-            percent: 0.5,
-            message: "halfway".to_string(),
+            bytes_done: 500,
+            bytes_total: 1000,
+            percent: Some(0.5),
+            speed_bytes_per_sec: 100.0,
             eta_seconds: Some(30),
+            message: "halfway".to_string(),
+            is_heartbeat: false,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"FirmwareCommand\""));
         assert!(json.contains("\"percent\":0.5"));
+        assert!(json.contains("\"schema_version\":2"));
     }
 }

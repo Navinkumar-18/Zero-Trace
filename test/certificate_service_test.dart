@@ -138,7 +138,7 @@ void main() {
         final cat2 = CertificateService.deriveSanitizationCategory(
           method: SanitizationMethod.multiPassOverwrite,
           device: nvmeDevice,
-          actualMethodExecuted: 'Software Overwrite (3-pass, NistLegacy3Pass)',
+          actualMethodExecuted: 'Software Overwrite (3-pass, MultiPass3)',
           isSuccess: true,
         );
         expect(cat2, 'Clear');
