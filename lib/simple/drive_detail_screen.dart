@@ -19,6 +19,7 @@ class DriveDetailScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final controller = context.watch<SanitizationController>();
+    final isSimulated = !controller.isRealMode;
 
     // Find device by stableId
     final device = controller.devices.cast<DeviceProfile?>().firstWhere(
@@ -27,18 +28,99 @@ class DriveDetailScreen extends StatelessWidget {
         );
 
     if (device == null) {
-      return const Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.usb_off, size: 48, color: AppTheme.textMuted),
-            SizedBox(height: 12),
-            Text('Drive not found',
-                style: TextStyle(color: AppTheme.textMuted, fontSize: 16)),
-            SizedBox(height: 4),
-            Text('It may have been unplugged.',
-                style: TextStyle(color: AppTheme.textMuted, fontSize: 13)),
-          ],
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.usb_off, size: 48, color: AppTheme.textMuted),
+              const SizedBox(height: 12),
+              const Text('Drive not found',
+                  style: TextStyle(color: AppTheme.textMuted, fontSize: 16)),
+              const SizedBox(height: 4),
+              const Text('It may have been unplugged.',
+                  style: TextStyle(color: AppTheme.textMuted, fontSize: 13)),
+              const SizedBox(height: 16),
+              ElevatedButton.icon(
+                onPressed: () => context.go('/'),
+                icon: const Icon(Icons.arrow_back),
+                label: const Text('All Drives'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    // Item 4: Refuse direct navigation to protected system drive
+    if (device.isSystemDisk) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.shield, size: 56, color: AppTheme.accentRose),
+              const SizedBox(height: 16),
+              const Text(
+                'Protected System Drive',
+                style: TextStyle(
+                  color: AppTheme.accentRose,
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '${device.name} (${device.id}) is a protected system drive containing active operating system partitions. Direct wiping is refused.',
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: AppTheme.textSecondary, fontSize: 13),
+              ),
+              const SizedBox(height: 20),
+              ElevatedButton.icon(
+                onPressed: () => context.go('/'),
+                icon: const Icon(Icons.arrow_back),
+                label: const Text('Back to Drives'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    // Refuse direct navigation to unsupported drive types
+    if (device.simpleDisabledReason != null) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.block, size: 56, color: AppTheme.textMuted),
+              const SizedBox(height: 16),
+              const Text(
+                'Unsupported Drive',
+                style: TextStyle(
+                  color: AppTheme.textMuted,
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '${device.name}: ${device.simpleDisabledReason}',
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: AppTheme.textSecondary, fontSize: 13),
+              ),
+              const SizedBox(height: 20),
+              ElevatedButton.icon(
+                onPressed: () => context.go('/'),
+                icon: const Icon(Icons.arrow_back),
+                label: const Text('Back to Drives'),
+              ),
+            ],
+          ),
         ),
       );
     }
@@ -47,11 +129,15 @@ class DriveDetailScreen extends StatelessWidget {
     final isJobForThisDevice =
         job != null && job.device.stableId == device.stableId;
     final isRunning = controller.isJobRunning && isJobForThisDevice;
+    final isVerifying = isJobForThisDevice && job.status == JobStatus.verifying;
     final isFinished = isJobForThisDevice &&
         (job.status == JobStatus.completed || job.status == JobStatus.failed);
     final isCompleted =
         isJobForThisDevice && job.status == JobStatus.completed;
     final isFailed = isJobForThisDevice && job.status == JobStatus.failed;
+    final wipeCompleted = job?.wipeCompleted ?? false;
+    final isWipeFailed = isFailed && !wipeCompleted;
+
     final supportLevel = computeSupportLevel(device);
     final isFlash = device.mediaType == MediaType.usbFlash ||
         device.mediaType == MediaType.emmc;
@@ -71,231 +157,283 @@ class DriveDetailScreen extends StatelessWidget {
       badgeColor =
           verifyPassed ? AppTheme.simpleSuccess : AppTheme.simpleDestructive;
     } else if (isFailed) {
-      // Distinguish wipe-failed vs verify-failed
-      final failedDuringVerify = isJobForThisDevice &&
-          job.currentStageDescription.toLowerCase().contains('verif');
-      badgeText =
-          failedDuringVerify ? 'Verification failed' : 'Wipe failed';
+      badgeText = isWipeFailed ? 'Wipe failed' : 'Verification failed';
       badgeColor = AppTheme.simpleDestructive;
     }
 
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(20),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          // Back link
-          TextButton.icon(
-            onPressed: () => context.go('/'),
-            icon: const Icon(Icons.arrow_back, size: 16),
-            label: const Text('All drives', style: TextStyle(fontSize: 13)),
-          ),
-          const SizedBox(height: 8),
-
-          // Device info card
-          Container(
-            padding: const EdgeInsets.all(18),
-            decoration: BoxDecoration(
-              color: AppTheme.surfaceCard,
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: AppTheme.surfaceBorder),
+    return PopScope(
+      canPop: !isRunning,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop && isRunning) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Cannot leave while a wipe is in progress!'),
+              backgroundColor: AppTheme.accentRose,
             ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Container(
-                      padding: const EdgeInsets.all(10),
-                      decoration: BoxDecoration(
-                        color: AppTheme.simplePrimary.withValues(alpha: 0.1),
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Icon(
-                        _driveIcon(device.driveType),
-                        color: AppTheme.simplePrimary,
-                        size: 28,
-                      ),
+          );
+        }
+      },
+      child: Column(
+        children: [
+          // SIMULATION banner on Screen 2
+          if (isSimulated)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              decoration: BoxDecoration(
+                color: AppTheme.accentGold.withValues(alpha: 0.15),
+                border: Border(
+                  bottom: BorderSide(
+                    color: AppTheme.accentGold.withValues(alpha: 0.5),
+                    width: 1.5,
+                  ),
+                ),
+              ),
+              child: const Row(
+                children: [
+                  Icon(Icons.science, color: AppTheme.accentGold, size: 18),
+                  SizedBox(width: 8),
+                  Text(
+                    'SIMULATION MODE — No real drives will be modified',
+                    style: TextStyle(
+                      color: AppTheme.accentGold,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
                     ),
-                    const SizedBox(width: 14),
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
+                  ),
+                ],
+              ),
+            ),
+
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Back link
+                  TextButton.icon(
+                    onPressed: isRunning ? null : () => context.go('/'),
+                    icon: const Icon(Icons.arrow_back, size: 16),
+                    label: const Text('All drives', style: TextStyle(fontSize: 13)),
+                  ),
+                  const SizedBox(height: 8),
+
+                  // Device info card
+                  Container(
+                    padding: const EdgeInsets.all(18),
+                    decoration: BoxDecoration(
+                      color: AppTheme.surfaceCard,
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(color: AppTheme.surfaceBorder),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(10),
+                              decoration: BoxDecoration(
+                                color: AppTheme.simplePrimary.withValues(alpha: 0.1),
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Icon(
+                                _driveIcon(device.driveType),
+                                color: AppTheme.simplePrimary,
+                                size: 28,
+                              ),
+                            ),
+                            const SizedBox(width: 14),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(device.name,
+                                      style: const TextStyle(
+                                          fontWeight: FontWeight.bold, fontSize: 16)),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    '${device.formattedCapacity} • ${device.busType} • S/N: ${device.serialNumber}',
+                                    style: const TextStyle(
+                                        color: AppTheme.textSecondary, fontSize: 12),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            // DriveType + support chips
+                            Column(
+                              crossAxisAlignment: CrossAxisAlignment.end,
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 8, vertical: 3),
+                                  decoration: BoxDecoration(
+                                    color:
+                                        AppTheme.simplePrimary.withValues(alpha: 0.1),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: Text(device.driveType.label,
+                                      style: const TextStyle(
+                                          color: AppTheme.simplePrimary,
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.bold)),
+                                ),
+                                const SizedBox(height: 4),
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 8, vertical: 3),
+                                  decoration: BoxDecoration(
+                                    color: supportLevel.badgeColor
+                                        .withValues(alpha: 0.1),
+                                    borderRadius: BorderRadius.circular(6),
+                                  ),
+                                  child: Text(supportLevel.badgeLabel,
+                                      style: TextStyle(
+                                          color: supportLevel.badgeColor,
+                                          fontSize: 10,
+                                          fontWeight: FontWeight.bold)),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+
+                        // Method + path
+                        _metaRow('Path:', device.id.startsWith('real_')
+                            ? '/dev/${device.id.substring(5)}'
+                            : '/dev/sdb (Simulated)'),
+                        const SizedBox(height: 4),
+                        _metaRow('Method:', 'Decided at confirmation'),
+
+                        // Flash caveat
+                        if (supportLevel == SanitizationSupportLevel.clearOnly &&
+                            isFlash) ...[
+                          const SizedBox(height: 8),
+                          Container(
+                            padding: const EdgeInsets.all(8),
+                            decoration: BoxDecoration(
+                              color: AppTheme.accentGold.withValues(alpha: 0.08),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: const Row(
+                              children: [
+                                Icon(Icons.info_outline,
+                                    color: AppTheme.accentGold, size: 14),
+                                SizedBox(width: 6),
+                                Expanded(
+                                  child: Text(
+                                    'Flash media: Clear level only. Overwrite cannot reach remapped blocks.',
+                                    style: TextStyle(
+                                        color: AppTheme.accentGold, fontSize: 11),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+
+                        // Badge (post-wipe)
+                        if (badgeText != null) ...[
+                          const SizedBox(height: 12),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 14, vertical: 8),
+                            decoration: BoxDecoration(
+                              color: badgeColor!.withValues(alpha: 0.12),
+                              borderRadius: BorderRadius.circular(20),
+                              border: Border.all(color: badgeColor, width: 1.5),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  verifyPassed && isCompleted
+                                      ? Icons.verified
+                                      : Icons.gpp_bad,
+                                  color: badgeColor,
+                                  size: 18,
+                                ),
+                                const SizedBox(width: 6),
+                                Text(badgeText,
+                                    style: TextStyle(
+                                        color: badgeColor,
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 13)),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+
+                  // Progress area (inline, not separate screen)
+                  if (isRunning && isJobForThisDevice) ...[
+                    _buildProgressSection(context, controller, job, isSimulated),
+                    const SizedBox(height: 20),
+                  ],
+
+                  // Error message
+                  if (isFailed && isJobForThisDevice) ...[
+                    Container(
+                      padding: const EdgeInsets.all(14),
+                      decoration: BoxDecoration(
+                        color: AppTheme.accentRose.withValues(alpha: 0.1),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                            color: AppTheme.accentRose.withValues(alpha: 0.3)),
+                      ),
+                      child: Row(
                         children: [
-                          Text(device.name,
+                          const Icon(Icons.error_outline,
+                              color: AppTheme.accentRose, size: 20),
+                          const SizedBox(width: 10),
+                          Expanded(
+                            child: Text(
+                              SimpleErrorMessages.fromError(
+                                  job.currentStageDescription),
                               style: const TextStyle(
-                                  fontWeight: FontWeight.bold, fontSize: 16)),
-                          const SizedBox(height: 2),
-                          Text(
-                            '${device.formattedCapacity} • ${device.busType} • S/N: ${device.serialNumber}',
-                            style: const TextStyle(
-                                color: AppTheme.textSecondary, fontSize: 12),
+                                  color: AppTheme.accentRose, fontSize: 13),
+                            ),
                           ),
                         ],
                       ),
                     ),
-                    // DriveType + support chips
-                    Column(
-                      crossAxisAlignment: CrossAxisAlignment.end,
-                      children: [
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 8, vertical: 3),
-                          decoration: BoxDecoration(
-                            color:
-                                AppTheme.simplePrimary.withValues(alpha: 0.1),
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          child: Text(device.driveType.label,
-                              style: const TextStyle(
-                                  color: AppTheme.simplePrimary,
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.bold)),
-                        ),
-                        const SizedBox(height: 4),
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 8, vertical: 3),
-                          decoration: BoxDecoration(
-                            color: supportLevel.badgeColor
-                                .withValues(alpha: 0.1),
-                            borderRadius: BorderRadius.circular(6),
-                          ),
-                          child: Text(supportLevel.badgeLabel,
-                              style: TextStyle(
-                                  color: supportLevel.badgeColor,
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.bold)),
-                        ),
-                      ],
-                    ),
+                    const SizedBox(height: 20),
                   ],
-                ),
-                const SizedBox(height: 12),
 
-                // Method + path
-                _metaRow('Path:', device.id.startsWith('real_')
-                    ? '/dev/${device.id.substring(5)}'
-                    : '/dev/sdb (Simulated)'),
-                const SizedBox(height: 4),
-                _metaRow('Method:', 'Decided at confirmation'),
-
-                // Flash caveat
-                if (supportLevel == SanitizationSupportLevel.clearOnly &&
-                    isFlash) ...[
-                  const SizedBox(height: 8),
-                  Container(
-                    padding: const EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: AppTheme.accentGold.withValues(alpha: 0.08),
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: const Row(
-                      children: [
-                        Icon(Icons.info_outline,
-                            color: AppTheme.accentGold, size: 14),
-                        SizedBox(width: 6),
-                        Expanded(
-                          child: Text(
-                            'Flash media: Clear level only. Overwrite cannot reach remapped blocks.',
-                            style: TextStyle(
-                                color: AppTheme.accentGold, fontSize: 11),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-
-                // Badge (post-wipe)
-                if (badgeText != null) ...[
-                  const SizedBox(height: 12),
-                  Container(
-                    padding: const EdgeInsets.symmetric(
-                        horizontal: 14, vertical: 8),
-                    decoration: BoxDecoration(
-                      color: badgeColor!.withValues(alpha: 0.12),
-                      borderRadius: BorderRadius.circular(20),
-                      border: Border.all(color: badgeColor, width: 1.5),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          verifyPassed && isCompleted
-                              ? Icons.verified
-                              : Icons.gpp_bad,
-                          color: badgeColor,
-                          size: 18,
-                        ),
-                        const SizedBox(width: 6),
-                        Text(badgeText,
-                            style: TextStyle(
-                                color: badgeColor,
-                                fontWeight: FontWeight.bold,
-                                fontSize: 13)),
-                      ],
-                    ),
-                  ),
-                ],
-              ],
-            ),
-          ),
-          const SizedBox(height: 20),
-
-          // Progress area (inline, not separate screen)
-          if (isRunning && isJobForThisDevice) ...[
-            _buildProgressSection(job),
-            const SizedBox(height: 20),
-          ],
-
-          // Error message
-          if (isFailed && isJobForThisDevice) ...[
-            Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: AppTheme.accentRose.withValues(alpha: 0.1),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(
-                    color: AppTheme.accentRose.withValues(alpha: 0.3)),
-              ),
-              child: Row(
-                children: [
-                  const Icon(Icons.error_outline,
-                      color: AppTheme.accentRose, size: 20),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      SimpleErrorMessages.fromError(
-                          job.currentStageDescription),
-                      style: const TextStyle(
-                          color: AppTheme.accentRose, fontSize: 13),
-                    ),
+                  // 3 action buttons
+                  _buildActionButtons(
+                    context: context,
+                    controller: controller,
+                    device: device,
+                    isRunning: isRunning,
+                    isVerifying: isVerifying,
+                    isFinished: isFinished,
+                    isCompleted: isCompleted,
+                    isFailed: isFailed,
+                    wipeCompleted: wipeCompleted,
+                    hasCert: hasCert,
+                    verifyPassed: verifyPassed,
                   ),
                 ],
               ),
             ),
-            const SizedBox(height: 20),
-          ],
-
-          // 3 action buttons
-          _buildActionButtons(
-            context: context,
-            controller: controller,
-            device: device,
-            isRunning: isRunning,
-            isFinished: isFinished,
-            isCompleted: isCompleted,
-            isFailed: isFailed,
-            hasCert: hasCert,
-            verifyPassed: verifyPassed,
           ),
         ],
       ),
     );
   }
 
-  Widget _buildProgressSection(SanitizationJob job) {
+  Widget _buildProgressSection(
+    BuildContext context,
+    SanitizationController controller,
+    SanitizationJob job,
+    bool isSimulated,
+  ) {
     return Container(
       padding: const EdgeInsets.all(18),
       decoration: BoxDecoration(
@@ -305,6 +443,34 @@ class DriveDetailScreen extends StatelessWidget {
       ),
       child: Column(
         children: [
+          // SIMULATION chip inside progress container
+          if (isSimulated) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: AppTheme.accentGold.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: AppTheme.accentGold.withValues(alpha: 0.4)),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.science, color: AppTheme.accentGold, size: 14),
+                  SizedBox(width: 6),
+                  Text(
+                    'SIMULATION MODE',
+                    style: TextStyle(
+                      color: AppTheme.accentGold,
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 12),
+          ],
+
           // Circular progress
           SizedBox(
             width: 100,
@@ -345,9 +511,64 @@ class DriveDetailScreen extends StatelessWidget {
             'Do not unplug the drive',
             style: TextStyle(color: AppTheme.accentGold, fontSize: 11),
           ),
+          const SizedBox(height: 14),
+
+          // Cancel Wipe button or hardware notice
+          if (controller.canCancelJob)
+            OutlinedButton.icon(
+              icon: const Icon(Icons.cancel_outlined, size: 16),
+              label: const Text('Cancel Wipe', style: TextStyle(fontSize: 12)),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: AppTheme.accentRose,
+                side: BorderSide(color: AppTheme.accentRose.withValues(alpha: 0.5)),
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              ),
+              onPressed: () => _handleCancel(context, controller),
+            )
+          else
+            const Text(
+              'Hardware firmware wipe in progress — cannot be cancelled safely',
+              style: TextStyle(color: AppTheme.textMuted, fontSize: 11),
+            ),
         ],
       ),
     );
+  }
+
+  Future<void> _handleCancel(BuildContext context, SanitizationController controller) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppTheme.surfaceDark,
+        title: const Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: AppTheme.accentGold),
+            SizedBox(width: 8),
+            Text('Cancel Sanitization?'),
+          ],
+        ),
+        content: const Text(
+          'Warning: Cancelling an active overwrite will leave the drive partially wiped. '
+          'Existing filesystems and partition tables may already be destroyed.\n\n'
+          'Are you sure you want to stop?',
+          style: TextStyle(color: AppTheme.textSecondary, fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Continue Wipe'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: AppTheme.accentRose),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Stop & Mark Partially Wiped'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await controller.cancelCurrentJob();
+    }
   }
 
   Widget _buildActionButtons({
@@ -355,15 +576,18 @@ class DriveDetailScreen extends StatelessWidget {
     required SanitizationController controller,
     required DeviceProfile device,
     required bool isRunning,
+    required bool isVerifying,
     required bool isFinished,
     required bool isCompleted,
     required bool isFailed,
+    required bool wipeCompleted,
     required bool hasCert,
     required bool verifyPassed,
   }) {
     // State machine for button enable/disable
     final canWipe = !isRunning && (!isFinished || isFailed);
-    final canVerify = isFinished;
+    // Verify is enabled ONLY when the wipe itself completed
+    final canVerify = !isRunning && (isCompleted || (isFailed && wipeCompleted));
     final canCert = hasCert;
 
     return Column(
@@ -378,7 +602,7 @@ class DriveDetailScreen extends StatelessWidget {
             ),
             label: Text(
               isRunning
-                  ? 'Wiping...'
+                  ? (isVerifying ? 'Verifying...' : 'Wiping...')
                   : (isFailed ? 'Retry Wipe' : 'Secure Wipe'),
               style: const TextStyle(
                   fontWeight: FontWeight.bold, fontSize: 15),

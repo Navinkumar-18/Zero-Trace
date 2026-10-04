@@ -89,4 +89,110 @@ void main() {
 
     expect(find.text('Dispose / recycle'), findsOneWidget);
   });
+
+  testWidgets('Fallback confirmation match with path + size succeeds for unique drive', (tester) async {
+    tester.view.physicalSize = const Size(1920, 1080);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    const genericDevice = DeviceProfile(
+      id: 'sdb',
+      name: 'Generic Flash Disk',
+      serialNumber: 'S/N-sdb', // Generic serial triggers fallback match
+      mediaType: MediaType.usbFlash,
+      busType: 'USB',
+      capacityBytes: 8000000000,
+      isRemovable: true,
+    );
+
+    final controller = SanitizationController(enableAutoPolling: false);
+    addTearDown(() => controller.dispose());
+    controller.setMockDevices([genericDevice]);
+
+    await tester.pumpWidget(
+      ChangeNotifierProvider<SanitizationController>.value(
+        value: controller,
+        child: const MaterialApp(
+          home: Scaffold(
+            body: SimpleConfirmDialog(device: genericDevice),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // Prompts for device path and size
+    expect(find.textContaining('Type device path and size to confirm'), findsOneWidget);
+
+    final wipeButtonFinder = find.widgetWithText(ElevatedButton, 'SECURE WIPE');
+    expect(tester.widget<ElevatedButton>(wipeButtonFinder).onPressed, isNull);
+
+    // Enter matching fallback token: 'sdb 8000000000'
+    final textFieldFinder = find.byType(TextField);
+    await tester.enterText(textFieldFinder, 'sdb 8000000000');
+    await tester.pumpAndSettle();
+
+    expect(tester.widget<ElevatedButton>(wipeButtonFinder).onPressed, isNotNull);
+  });
+
+  testWidgets('Fallback confirmation match blocks wipe when two drives share device path and size', (tester) async {
+    tester.view.physicalSize = const Size(1920, 1080);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    const driveA = DeviceProfile(
+      id: 'sdb',
+      name: 'Drive A',
+      serialNumber: 'S/N-sdb',
+      mediaType: MediaType.usbFlash,
+      busType: 'USB',
+      capacityBytes: 8000000000,
+      isRemovable: true,
+    );
+
+    const driveB = DeviceProfile(
+      id: 'sdb',
+      name: 'Drive B',
+      serialNumber: 'S/N-sdb-dup',
+      mediaType: MediaType.usbFlash,
+      busType: 'USB',
+      capacityBytes: 8000000000,
+      isRemovable: true,
+    );
+
+    final controller = SanitizationController(enableAutoPolling: false);
+    addTearDown(() => controller.dispose());
+    // Both drives have identical id ('sdb') and size (8000000000)
+    controller.setMockDevices([driveA, driveB]);
+
+    await tester.pumpWidget(
+      ChangeNotifierProvider<SanitizationController>.value(
+        value: controller,
+        child: const MaterialApp(
+          home: Scaffold(
+            body: SimpleConfirmDialog(device: driveA),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // Ambiguous match warning banner is displayed
+    expect(find.textContaining('Ambiguous device match: Multiple drives match this fallback signature'), findsOneWidget);
+
+    // Even if user types exact fallback match, button MUST remain disabled
+    final textFieldFinder = find.byType(TextField);
+    await tester.enterText(textFieldFinder, 'sdb 8000000000');
+    await tester.pumpAndSettle();
+
+    final wipeButtonFinder = find.widgetWithText(ElevatedButton, 'SECURE WIPE');
+    expect(tester.widget<ElevatedButton>(wipeButtonFinder).onPressed, isNull);
+  });
 }
+

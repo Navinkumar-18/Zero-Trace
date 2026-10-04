@@ -148,12 +148,12 @@ class DeviceProfile {
       case MediaType.usbFlash:
         return DriveType.usb;
       case MediaType.emmc:
-        // SD cards detected via SD/MMC bus; internal eMMC stays as unknown
-        // unless specifically identified as removable.
+        // SD cards detected via SD/MMC bus; internal eMMC is NOT removable/SD.
+        // It maps to DriveType.unknown and is never mapped to ssd.
         if (isRemovable || busType.toUpperCase().contains('SD')) {
           return DriveType.sd;
         }
-        return DriveType.ssd; // internal eMMC treated as SSD for UI purposes
+        return DriveType.unknown;
       case MediaType.hdd:
         return DriveType.hdd;
       case MediaType.sataSsd:
@@ -179,7 +179,12 @@ class DeviceProfile {
   String? get simpleDisabledReason {
     if (isSystemDisk) return 'System drive – protected';
     if (disabledReason != null) return disabledReason;
-    if (mediaType == MediaType.unknown) return 'Unknown device type – cannot wipe safely';
+    if (mediaType == MediaType.emmc && !isRemovable && !busType.toUpperCase().contains('SD')) {
+      return 'Internal eMMC storage – not supported';
+    }
+    if (driveType == DriveType.unknown || mediaType == MediaType.unknown) {
+      return 'Unknown or unsupported device type – cannot wipe safely';
+    }
     return null;
   }
 

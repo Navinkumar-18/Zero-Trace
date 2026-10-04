@@ -52,8 +52,23 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
 
   bool get _useFallbackMatch => _expectedToken.isEmpty;
 
+  bool _checkAmbiguousFallback(SanitizationController controller) {
+    if (!_useFallbackMatch) return false;
+    final targetKey = '${widget.device.id}${widget.device.capacityBytes}'.toLowerCase().replaceAll(RegExp(r'\s+'), '');
+    final matchingDrives = controller.devices.where((d) {
+      final key = '${d.id}${d.capacityBytes}'.toLowerCase().replaceAll(RegExp(r'\s+'), '');
+      return key == targetKey;
+    }).toList();
+    return matchingDrives.length > 1;
+  }
+
   void _onTextChanged() {
     final input = _serialController.text.trim().toLowerCase().replaceAll(RegExp(r'\s+'), '');
+    final controller = context.read<SanitizationController>();
+    if (_checkAmbiguousFallback(controller)) {
+      setState(() => _isMatch = false);
+      return;
+    }
 
     if (_useFallbackMatch) {
       // Match device path + formatted size
@@ -83,6 +98,8 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
   @override
   Widget build(BuildContext context) {
     final controller = context.watch<SanitizationController>();
+    final isSimulated = !controller.isRealMode;
+    final hasAmbiguousFallback = _checkAmbiguousFallback(controller);
     final rec = controller.getAutoMethod(widget.device, _intent);
     final method = rec.method;
     final supportLevel = computeSupportLevel(widget.device);
@@ -107,6 +124,38 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              // Simulation banner
+              if (isSimulated) ...[
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: AppTheme.accentGold.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(
+                      color: AppTheme.accentGold.withValues(alpha: 0.5),
+                    ),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.science, color: AppTheme.accentGold, size: 16),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'SIMULATION MODE — Virtual Wipe',
+                          style: TextStyle(
+                            color: AppTheme.accentGold,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 11,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 14),
+              ],
+
               // Warning header
               Row(
                 children: [
@@ -132,6 +181,35 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
               const SizedBox(height: 16),
               const Divider(color: AppTheme.surfaceBorder),
               const SizedBox(height: 12),
+
+              // Ambiguous match warning
+              if (hasAmbiguousFallback) ...[
+                Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: AppTheme.accentRose.withValues(alpha: 0.15),
+                    borderRadius: BorderRadius.circular(10),
+                    border: Border.all(color: AppTheme.accentRose.withValues(alpha: 0.5)),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.block, color: AppTheme.accentRose, size: 20),
+                      SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'Ambiguous device match: Multiple drives match this fallback signature. Wiping is blocked for safety.',
+                          style: TextStyle(
+                            color: AppTheme.accentRose,
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+              ],
 
               // Drive info
               _infoRow('Drive:', widget.device.name),
@@ -234,7 +312,7 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                       TextButton(
                         onPressed: () {
                           // The override method will be singlePassOverwrite (Clear only)
-                          if (!_isMatch) return;
+                          if (!_isMatch || hasAmbiguousFallback) return;
                           Navigator.of(context).pop(ConfirmWipeResult(
                             intent: _intent,
                             overrideMethod: SanitizationMethod.singlePassOverwrite,
@@ -243,7 +321,7 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                         child: Text(
                           'Wipe anyway (Clear only)',
                           style: TextStyle(
-                            color: _isMatch ? AppTheme.accentGold : AppTheme.textMuted,
+                            color: (_isMatch && !hasAmbiguousFallback) ? AppTheme.accentGold : AppTheme.textMuted,
                             fontWeight: FontWeight.w600,
                             fontSize: 12,
                           ),
@@ -259,7 +337,7 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
               // Serial confirmation
               Text(
                 _useFallbackMatch
-                    ? 'Type the device path and size to confirm:'
+                    ? 'Type device path and size to confirm (${widget.device.id} ${widget.device.capacityBytes}):'
                     : 'Type the last 4 characters of the serial to confirm:',
                 style: const TextStyle(fontSize: 12, color: AppTheme.textSecondary),
               ),
@@ -273,7 +351,7 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                   fontWeight: FontWeight.bold,
                 ),
                 decoration: InputDecoration(
-                  hintText: _useFallbackMatch ? 'device_id + size' : '****',
+                  hintText: _useFallbackMatch ? '${widget.device.id}${widget.device.capacityBytes}' : '****',
                   hintStyle: TextStyle(
                     color: AppTheme.textMuted.withValues(alpha: 0.5),
                     fontWeight: FontWeight.normal,
@@ -320,10 +398,28 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                       icon: const Icon(Icons.delete_forever, size: 20),
                       label: const Text('SECURE WIPE',
                           style: TextStyle(fontWeight: FontWeight.bold)),
-                      onPressed: (!_isMatch || isDestroyRecommended)
+                      onPressed: (!_isMatch || isDestroyRecommended || hasAmbiguousFallback)
                           ? null
-                          : () => Navigator.of(context).pop(
-                              ConfirmWipeResult(intent: _intent)),
+                          : () {
+                              // Re-check pinned identity in controller.devices
+                              final current = controller.devices.cast<DeviceProfile?>().firstWhere(
+                                (d) => d!.stableId == widget.device.stableId,
+                                orElse: () => null,
+                              );
+                              if (current == null ||
+                                  current.serialNumber != widget.device.serialNumber ||
+                                  current.capacityBytes != widget.device.capacityBytes) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(
+                                    content: Text('Drive identity changed or disconnected.'),
+                                    backgroundColor: AppTheme.accentRose,
+                                  ),
+                                );
+                                Navigator.of(context).pop(null);
+                                return;
+                              }
+                              Navigator.of(context).pop(ConfirmWipeResult(intent: _intent));
+                            },
                       style: ElevatedButton.styleFrom(
                         backgroundColor: AppTheme.simpleDestructive,
                         foregroundColor: Colors.white,

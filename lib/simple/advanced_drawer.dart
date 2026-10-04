@@ -65,7 +65,7 @@ class SimpleAdvancedDrawer extends StatelessWidget {
                     activeThumbColor: AppTheme.accentGold,
                     onChanged: controller.isJobRunning
                         ? null
-                        : (val) => controller.toggleRealMode(!val),
+                        : (val) => _handleModeToggle(context, controller, val),
                   ),
 
                   // --- Display section ---
@@ -181,5 +181,62 @@ class SimpleAdvancedDrawer extends StatelessWidget {
         context.go(route);
       },
     );
+  }
+
+  Future<void> _handleModeToggle(
+    BuildContext context,
+    SanitizationController controller,
+    bool switchToSimulated,
+  ) async {
+    if (controller.isJobRunning) return;
+    if (switchToSimulated) {
+      // Switching to simulated is always safe
+      await controller.toggleRealMode(false);
+      return;
+    }
+
+    // Switching to Real Mode: warn with confirmation dialog
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppTheme.surfaceDark,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: const BorderSide(color: AppTheme.accentRose, width: 1.5),
+        ),
+        title: const Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: AppTheme.accentRose, size: 24),
+            SizedBox(width: 10),
+            Text('Enable Real Hardware Mode?',
+                style: TextStyle(color: AppTheme.textPrimary, fontSize: 16)),
+          ],
+        ),
+        content: const Text(
+          'Warning: Real Mode enables destructive commands against physical connected storage hardware.\n\n'
+          'All wipe operations in Real Mode permanently destroy data with NO possibility of recovery.\n\n'
+          'Are you sure you want to switch to Real Mode?',
+          style: TextStyle(color: AppTheme.textSecondary, fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Keep Simulated'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppTheme.accentRose,
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Switch to Real'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      await controller.toggleRealMode(true);
+    }
   }
 }

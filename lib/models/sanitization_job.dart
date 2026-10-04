@@ -163,6 +163,7 @@ class SanitizationJob {
   bool shouldSimulateFailure;
   SanitizationMethod? overriddenMethod;
   bool destroyAcknowledged;
+  bool wipeCompleted;
 
   SanitizationJob({
     required this.jobId,
@@ -184,6 +185,7 @@ class SanitizationJob {
     this.shouldSimulateFailure = false,
     this.overriddenMethod,
     this.destroyAcknowledged = false,
+    this.wipeCompleted = false,
   }) : logs = logs ?? [];
 
   /// The method that will actually be executed (overridden if user selected an alternative).

@@ -52,8 +52,12 @@ class SanitizationController extends ChangeNotifier {
   // Simple Mode shared state (reset on every launch)
   bool _showInternalDrives = false;
 
-  SanitizationController({bool enableAutoPolling = true}) {
-    refreshDevices();
+  bool _isDisposed = false;
+
+  SanitizationController({bool enableAutoPolling = true, bool deferInitialDiscovery = false}) {
+    if (!deferInitialDiscovery) {
+      refreshDevices();
+    }
     if (enableAutoPolling) {
       _startAutoPolling();
     }
@@ -75,23 +79,20 @@ class SanitizationController extends ChangeNotifier {
 
   /// Auto-select the strongest supported method for a device.
   /// Used by Simple Mode to show the method in the confirm dialog.
+  /// The disposal intent only affects warnings and the Destroy recommendation.
   RecommendationResult getAutoMethod(DeviceProfile device, DisposalIntent intent) {
     final sensitivity = intent.mappedSensitivity;
-    final riskResult = _riskScoringService.scoreRisk(
-      dataSensitivity: sensitivity,
-      deviceCondition: DeviceCondition.functional,
-      disposalPath: intent.mappedDisposalPath,
-    );
     return _recommendationService.selectMethod(
       device,
-      riskResult.score,
-      riskResult.targetCategory,
+      0.5,
+      NistCategory.purge,
       sensitivity: sensitivity,
     );
   }
 
   /// Start sanitization in Simple Mode with auto-selected method.
-  /// The disposal intent only affects warnings and Destroy recommendation.
+  /// The disposal intent only affects warnings and Destroy recommendation,
+  /// never downgrading to a weaker method.
   Future<void> startSimpleWipe(DeviceProfile device, DisposalIntent intent, {SanitizationMethod? overrideMethod}) async {
     if (isJobRunning) return;
 
@@ -111,12 +112,7 @@ class SanitizationController extends ChangeNotifier {
       disposalPath: disposalPath,
     );
 
-    final recResult = _recommendationService.selectMethod(
-      device,
-      riskResult.score,
-      riskResult.targetCategory,
-      sensitivity: sensitivity,
-    );
+    final recResult = getAutoMethod(device, intent);
 
     final jobId = 'JOB-${DateTime.now().millisecondsSinceEpoch.toString().substring(6)}';
 
@@ -150,8 +146,137 @@ class SanitizationController extends ChangeNotifier {
   }
 
   void acknowledgeOrphan() {
+    if (_orphanResult?.activeJobState != null) {
+      final active = _orphanResult!.activeJobState!;
+      _auditLogService.appendEntry(
+        AuditLogEntry(
+          timestamp: DateTime.now().toIso8601String(),
+          jobId: active.jobId,
+          deviceSerial: active.deviceSerial,
+          devicePath: active.devicePath,
+          method: active.method,
+          standardReference: 'NIST SP 800-88 Rev. 1',
+          nistCategory: 'INTERRUPTED',
+          success: false,
+          fingerprintHash: 'INTERRUPTED_ACKNOWLEDGED',
+          entropyScore: 0.0,
+          sampleCount: 0,
+          commandLog: [
+            'Interrupted sanitization run dismissed by user.',
+            'Warning: Drive marked as potentially partially wiped.',
+          ],
+        ),
+      );
+      // Mark the device note in _devices
+      _devices = _devices.map((d) {
+        if (d.serialNumber == active.deviceSerial || d.id == active.devicePath || d.name == active.deviceName) {
+          return DeviceProfile(
+            id: d.id,
+            name: d.name,
+            serialNumber: d.serialNumber,
+            mediaType: d.mediaType,
+            busType: d.busType,
+            capacityBytes: d.capacityBytes,
+            rotationalRpm: d.rotationalRpm,
+            isHardwareEncrypted: d.isHardwareEncrypted,
+            supportsAtaSecureErase: d.supportsAtaSecureErase,
+            supportsAtaSanitize: d.supportsAtaSanitize,
+            supportsNvmeSanitize: d.supportsNvmeSanitize,
+            supportsEmmcSanitize: d.supportsEmmcSanitize,
+            supportsTrim: d.supportsTrim,
+            hpaDcoPresent: d.hpaDcoPresent,
+            mountPoint: d.mountPoint,
+            isSystemDisk: d.isSystemDisk,
+            hasFilesystem: d.hasFilesystem,
+            fsType: d.fsType,
+            isWipedNoFilesystem: d.isWipedNoFilesystem,
+            notes: 'May be partially wiped (interrupted wipe)',
+            isRemovable: d.isRemovable,
+            disabledReason: d.disabledReason,
+          );
+        }
+        return d;
+      }).toList();
+    }
     _orphanResult = null;
     JobStateFile.clearActiveJob();
+    notifyListeners();
+  }
+
+  /// Whether the currently running job can be safely cancelled.
+  /// Firmware sanitize commands (ATA, NVMe, eMMC, Crypto Erase) CANNOT be cancelled safely.
+  bool get canCancelJob {
+    if (!isJobRunning || _currentJob == null) return false;
+    final method = _currentJob!.effectiveMethod;
+    if (method == SanitizationMethod.ataSecureErase ||
+        method == SanitizationMethod.ataSanitizeBlockErase ||
+        method == SanitizationMethod.nvmeSanitize ||
+        method == SanitizationMethod.emmcSanitize ||
+        method == SanitizationMethod.cryptographicErase) {
+      return false;
+    }
+    return true;
+  }
+
+  /// Cancel an in-progress software overwrite job.
+  /// Leaves the target drive marked as partially wiped.
+  Future<void> cancelCurrentJob() async {
+    if (!canCancelJob || _currentJob == null) return;
+    final job = _currentJob!;
+    job.status = JobStatus.failed;
+    job.endTime = DateTime.now();
+    job.currentStageDescription = 'Sanitization Cancelled: Partially Wiped';
+    _addLog('USER CANCEL: Job cancelled by user. Warning: Drive may be partially wiped.');
+
+    await _auditLogService.appendEntry(
+      AuditLogEntry(
+        timestamp: DateTime.now().toIso8601String(),
+        jobId: job.jobId,
+        deviceSerial: job.device.serialNumber,
+        devicePath: job.device.id,
+        method: job.effectiveMethod.displayName,
+        standardReference: job.standardReference,
+        nistCategory: job.effectiveNistCategoryDisplayName,
+        success: false,
+        fingerprintHash: 'CANCELLED_PARTIALLY_WIPED',
+        entropyScore: 0.0,
+        sampleCount: 0,
+        commandLog: List<String>.from(job.logs)
+          ..add('User cancelled sanitization - drive may be partially wiped.'),
+      ),
+    );
+
+    _devices = _devices.map((d) {
+      if (d.stableId == job.device.stableId) {
+        return DeviceProfile(
+          id: d.id,
+          name: d.name,
+          serialNumber: d.serialNumber,
+          mediaType: d.mediaType,
+          busType: d.busType,
+          capacityBytes: d.capacityBytes,
+          rotationalRpm: d.rotationalRpm,
+          isHardwareEncrypted: d.isHardwareEncrypted,
+          supportsAtaSecureErase: d.supportsAtaSecureErase,
+          supportsAtaSanitize: d.supportsAtaSanitize,
+          supportsNvmeSanitize: d.supportsNvmeSanitize,
+          supportsEmmcSanitize: d.supportsEmmcSanitize,
+          supportsTrim: d.supportsTrim,
+          hpaDcoPresent: d.hpaDcoPresent,
+          mountPoint: d.mountPoint,
+          isSystemDisk: d.isSystemDisk,
+          hasFilesystem: d.hasFilesystem,
+          fsType: d.fsType,
+          isWipedNoFilesystem: d.isWipedNoFilesystem,
+          notes: 'May be partially wiped (operation cancelled)',
+          isRemovable: d.isRemovable,
+          disabledReason: d.disabledReason,
+        );
+      }
+      return d;
+    }).toList();
+
+    await JobStateFile.clearActiveJob();
     notifyListeners();
   }
 
@@ -243,6 +368,7 @@ class SanitizationController extends ChangeNotifier {
   }
 
   Future<void> toggleRealMode(bool value) async {
+    if (isJobRunning) return;
     _isRealMode = value;
     if (_isRealMode) {
       _startAutoPolling();
@@ -255,8 +381,9 @@ class SanitizationController extends ChangeNotifier {
   bool _isMockingDevices = false;
 
   Future<void> refreshDevices({bool silent = false}) async {
-    if (_isMockingDevices) return;
+    if (_isMockingDevices || _isDisposed) return;
     final freshDevices = await _intelligenceService.discoverDevices(realMode: _isRealMode);
+    if (_isMockingDevices || _isDisposed) return;
 
     // Check if device list changed
     bool hasChanged = freshDevices.length != _devices.length;
@@ -275,6 +402,38 @@ class SanitizationController extends ChangeNotifier {
 
     if (hasChanged || _devices.isEmpty) {
       _devices = freshDevices;
+      if (isJobRunning && _currentJob != null) {
+        final target = _currentJob!.device;
+        final stillPresent = _devices.any((d) =>
+            d.stableId == target.stableId ||
+            (d.id == target.id && d.capacityBytes == target.capacityBytes));
+        if (!stillPresent) {
+          // Mid-job disappearance = "interrupted"
+          final job = _currentJob!;
+          job.status = JobStatus.failed;
+          job.endTime = DateTime.now();
+          job.currentStageDescription = 'Drive Disconnected: Sanitization Interrupted';
+          _addLog('ERROR: Drive ${target.name} (${target.id}) was disconnected during operation.');
+          _auditLogService.appendEntry(
+            AuditLogEntry(
+              timestamp: DateTime.now().toIso8601String(),
+              jobId: job.jobId,
+              deviceSerial: target.serialNumber,
+              devicePath: target.id,
+              method: job.effectiveMethod.displayName,
+              standardReference: job.standardReference,
+              nistCategory: job.effectiveNistCategoryDisplayName,
+              success: false,
+              fingerprintHash: 'DISCONNECTED_INTERRUPTED',
+              entropyScore: 0.0,
+              sampleCount: 0,
+              commandLog: List<String>.from(job.logs)
+                ..add('Drive disconnected during operation.'),
+            ),
+          );
+          JobStateFile.clearActiveJob();
+        }
+      }
       if (!isJobRunning) {
         if (_devices.isNotEmpty) {
           if (_selectedDevice == null || !_devices.any((d) => d.id == _selectedDevice!.id)) {
@@ -288,12 +447,15 @@ class SanitizationController extends ChangeNotifier {
         }
         _updateJobRecommendation();
       }
-      notifyListeners();
+      if (!_isDisposed) {
+        notifyListeners();
+      }
     }
   }
 
   @override
   void dispose() {
+    _isDisposed = true;
     _stopAutoPolling();
     super.dispose();
   }
@@ -484,6 +646,7 @@ class SanitizationController extends ChangeNotifier {
         // From this point forward, any exception is a post-processing failure
         // (certificate signing, audit log), NOT a disk operation failure.
         final bool diskWipeSucceeded = true;
+        job.wipeCompleted = true;
 
         // Stage 3: Verification LBA sampling
         job.status = JobStatus.verifying;
@@ -689,6 +852,7 @@ class SanitizationController extends ChangeNotifier {
     }
 
     // Stage 3: Verification (Simulated Mode)
+    job.wipeCompleted = true;
     await Future.delayed(const Duration(milliseconds: 600));
     job.status = JobStatus.verifying;
     job.progress = 0.90;
