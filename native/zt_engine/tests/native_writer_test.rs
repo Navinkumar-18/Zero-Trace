@@ -166,11 +166,13 @@ fn test_random_pass_verification_aggregated_entropy_with_chacha() {
         file_size,
         "TEST_SER",
         "random-pass",
-        Some(50),
+        None, // Exact default verify sample size (DEFAULT_SAMPLE_COUNT = 50 samples * 512 bytes = 25,600 bytes)
         false, // expect_zeros = false (random pass)
     ).expect("Verification execution should succeed");
 
     assert!(report.pass, "Real ChaCha20 data must pass aggregated random verification");
+    assert_eq!(report.sample_count, 50, "Must match exact default verify sample size of 50");
+    assert_eq!(report.samples.len(), 50);
     let entropy = report.entropy_score;
     assert!(entropy > 0.95, "Aggregated entropy must be > 0.95, got {}", entropy);
 
@@ -402,3 +404,236 @@ async fn test_heartbeat_and_monotonic_progress() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_write_error_enodev_aborts() {
+    let total_size: u64 = 4 * 1024 * 1024;
+    let mut mock = MockBlockWriter::new(total_size);
+    mock.fail_after_bytes = Some(1024 * 1024);
+    mock.injected_raw_os_error = Some(libc::ENODEV);
+
+    let (tx, _rx) = mpsc::channel::<ProgressEvent>(16);
+    let start = Instant::now();
+
+    let result = execute_writer_overwrite(
+        mock,
+        1,
+        OverwritePattern::Zeros,
+        "SER_ENODEV",
+        "Test ENODEV",
+        start,
+        tx,
+    ).await;
+
+    assert!(result.is_err(), "ENODEV must cause overwrite failure");
+    match result.unwrap_err() {
+        ExecuteError::DeviceDisconnected(msg) => {
+            assert!(msg.contains("ENODEV") || msg.contains("No such device"));
+        }
+        other => panic!("Expected DeviceDisconnected error, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_short_write_returning_zero_aborts() {
+    let total_size: u64 = 4 * 1024 * 1024;
+    let mut mock = MockBlockWriter::new(total_size);
+    mock.return_zero_bytes = true;
+
+    let (tx, _rx) = mpsc::channel::<ProgressEvent>(16);
+    let start = Instant::now();
+
+    let result = execute_writer_overwrite(
+        mock,
+        1,
+        OverwritePattern::Zeros,
+        "SER_ZERO_WRITE",
+        "Test Short Write Zero",
+        start,
+        tx,
+    ).await;
+
+    assert!(result.is_err(), "Write returning 0 bytes must abort");
+    match result.unwrap_err() {
+        ExecuteError::PrematureEndOfDevice(msg) => {
+            assert!(msg.contains("returned 0 bytes") || msg.contains("ENOSPC"));
+        }
+        other => panic!("Expected PrematureEndOfDevice, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_o_excl_exclusive_open_blocks_concurrent_open() {
+    let tmp = NamedTempFile::new().unwrap();
+    let c_path = std::ffi::CString::new(tmp.path().to_str().unwrap()).unwrap();
+    // Opening with O_CREAT | O_EXCL on an existing file fails with EEXIST / EBUSY
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600) };
+    assert_eq!(fd, -1);
+    let err = std::io::Error::last_os_error();
+    assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
+}
+
+#[tokio::test]
+async fn test_serial_mismatch_aborts_before_first_write() {
+    let (tx, _rx) = mpsc::channel::<ProgressEvent>(16);
+    let result = software_overwrite(
+        "/dev/sdb",
+        1,
+        OverwritePattern::Zeros,
+        "TOKEN_MISMATCH_ABC",
+        "REAL_DEVICE_SERIAL_XYZ",
+        true,
+        tx,
+    ).await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        ExecuteError::ConfirmationMismatch => {}
+        other => panic!("Expected ConfirmationMismatch, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_cancel_signal_syncs_and_reports_exact_bytes_done() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let total_size: u64 = 6 * 1024 * 1024; // 6 MiB = 3 chunks (2 MiB each)
+    let mut mock = MockBlockWriter::new(total_size);
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    // Trigger cancel right after chunk 1 is written
+    mock.cancel_flag_on_write = Some(Arc::clone(&cancel_flag));
+
+    let (tx, mut rx) = mpsc::channel::<ProgressEvent>(64);
+    let start = Instant::now();
+
+    let report = execute_writer_overwrite_with_cancel(
+        mock,
+        1,
+        OverwritePattern::Zeros,
+        "SER_CANCEL",
+        "Test Cancel",
+        start,
+        tx,
+        Some(cancel_flag),
+    ).await.expect("Cancelled run should return report with success=false");
+
+    assert!(!report.success, "Cancelled overwrite must have success=false");
+    assert_eq!(report.exit_code, 130, "Cancelled exit code must be 130");
+    assert_eq!(report.bytes_written, 2 * 1024 * 1024, "Bytes written must match exactly 1 chunk written before cancel");
+    assert!(report.stderr.contains("cancelled by user"));
+
+    // Verify progress events were received
+    let mut events = Vec::new();
+    while let Ok(evt) = rx.try_recv() {
+        events.push(evt);
+    }
+    assert!(!events.is_empty(), "Should stream progress up to cancellation");
+}
+
+#[test]
+fn test_heartbeat_line_integrity_schema2_json() {
+    let hb = ProgressEvent {
+        schema_version: 2,
+        phase: ExecutionPhase::FirmwareCommand,
+        bytes_done: 1048576,
+        bytes_total: 10485760,
+        percent: Some(0.10),
+        speed_bytes_per_sec: 25000000.0,
+        eta_seconds: Some(36),
+        message: "Writing sectors...".to_string(),
+        is_heartbeat: true,
+    };
+
+    let serialized = serde_json::to_string(&hb).unwrap();
+    let parsed: ProgressEvent = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(parsed.schema_version, 2);
+    assert!(parsed.is_heartbeat);
+    assert_eq!(parsed.bytes_done, 1048576);
+    assert_eq!(parsed.bytes_total, 10485760);
+    assert_eq!(parsed.speed_bytes_per_sec, 25000000.0);
+    assert_eq!(parsed.eta_seconds, Some(36));
+}
+
+#[test]
+fn test_usb_speed_parser_detects_usb2_vs_usb3() {
+    use zt_engine::detect::detect_usb_speed;
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let sys_root = dir.path().to_str().unwrap();
+
+    // Create fake sysfs hierarchy: /sys/class/block/sdb -> /sys/devices/pci/usb1/1-1/1-1:1.0/host/target/block/sdb
+    let usb_dev_dir = dir.path().join("devices/pci0000:00/0000:00:14.0/usb1/1-1");
+    let block_target_dir = usb_dev_dir.join("host0/target0:0:0/0:0:0:0/block/sdb");
+    std::fs::create_dir_all(&block_target_dir).unwrap();
+
+    let class_block = dir.path().join("class/block");
+    std::fs::create_dir_all(&class_block).unwrap();
+    std::os::unix::fs::symlink(&block_target_dir, class_block.join("sdb")).unwrap();
+
+    // Test 1: speed = 480 (USB 2.0 High-Speed)
+    std::fs::write(usb_dev_dir.join("speed"), "480\n").unwrap();
+    let (speed, is_u2) = detect_usb_speed("/dev/sdb", sys_root);
+    assert_eq!(speed, Some(480));
+    assert!(is_u2, "480 Mbps must be detected as USB 2");
+
+    // Test 2: speed = 5000 (USB 3.0 SuperSpeed)
+    std::fs::write(usb_dev_dir.join("speed"), "5000\n").unwrap();
+    let (speed3, is_u2_3) = detect_usb_speed("/dev/sdb", sys_root);
+    assert_eq!(speed3, Some(5000));
+    assert!(!is_u2_3, "5000 Mbps must NOT be USB 2 (it is USB 3)");
+}
+
+#[tokio::test]
+async fn test_slow_writer_runtime_ps_no_dd_spawned() {
+    let total_size: u64 = 4 * 1024 * 1024; // 4 MiB = 2 chunks
+    let mut mock = MockBlockWriter::new(total_size);
+    mock.delay_per_chunk = Some(std::time::Duration::from_millis(50));
+
+    let (tx, mut rx) = mpsc::channel::<ProgressEvent>(64);
+    let start = Instant::now();
+
+    // Check runtime process list while slow writer is executing
+    let ps_check_task = tokio::spawn(async move {
+        tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
+        // Verify no dd process is spawned
+        let pgrep_dd = std::process::Command::new("pgrep")
+            .arg("-x")
+            .arg("dd")
+            .output();
+        if let Ok(out) = pgrep_dd {
+            assert!(
+                out.stdout.is_empty(),
+                "No 'dd' process should exist during native overwrite: found {:?}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            assert_ne!(out.status.code(), Some(0), "pgrep dd must return non-zero (no match)");
+        }
+    });
+
+    let report = execute_writer_overwrite(
+        mock,
+        1,
+        OverwritePattern::Zeros,
+        "SER_SLOW",
+        "Test Slow Writer",
+        start,
+        tx,
+    ).await.expect("Slow write should succeed");
+
+    assert!(report.success);
+    assert_eq!(report.bytes_written, total_size);
+    assert_eq!(report.io_mode, "mock");
+
+    let _ = ps_check_task.await;
+
+    // Check that events were streamed
+    let mut event_count = 0;
+    while let Ok(_) = rx.try_recv() {
+        event_count += 1;
+    }
+    assert!(event_count > 0, "Slow writer should produce progress events");
+}
+

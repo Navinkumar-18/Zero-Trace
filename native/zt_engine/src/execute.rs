@@ -1671,8 +1671,11 @@ pub struct MockBlockWriter {
     pub fail_after_bytes: Option<u64>,
     pub injected_error: Option<io::ErrorKind>,
     pub injected_raw_os_error: Option<i32>,
+    pub return_zero_bytes: bool,
     pub sync_fail: bool,
+    pub sync_called: bool,
     pub delay_per_chunk: Option<std::time::Duration>,
+    pub cancel_flag_on_write: Option<Arc<AtomicBool>>,
 }
 
 impl MockBlockWriter {
@@ -1683,14 +1686,20 @@ impl MockBlockWriter {
             fail_after_bytes: None,
             injected_error: None,
             injected_raw_os_error: None,
+            return_zero_bytes: false,
             sync_fail: false,
+            sync_called: false,
             delay_per_chunk: None,
+            cancel_flag_on_write: None,
         }
     }
 }
 
 impl BlockWriter for MockBlockWriter {
     fn write_chunk(&mut self, _offset: u64, data: &[u8]) -> Result<usize, io::Error> {
+        if self.return_zero_bytes {
+            return Ok(0);
+        }
         if let Some(delay) = self.delay_per_chunk {
             std::thread::sleep(delay);
         }
@@ -1704,10 +1713,14 @@ impl BlockWriter for MockBlockWriter {
             }
         }
         self.written_bytes += data.len() as u64;
+        if let Some(flag) = &self.cancel_flag_on_write {
+            flag.store(true, Ordering::SeqCst);
+        }
         Ok(data.len())
     }
 
     fn sync_data(&mut self) -> Result<(), io::Error> {
+        self.sync_called = true;
         if self.sync_fail {
             return Err(io::Error::other("Injected mock sync error"));
         }
@@ -1787,7 +1800,7 @@ pub fn remove_checkpoint_file(serial: &str) {
 }
 
 pub async fn execute_writer_overwrite<W: BlockWriter>(
-    mut writer: W,
+    writer: W,
     total_passes: u8,
     pattern: OverwritePattern,
     device_serial: &str,
@@ -1795,11 +1808,33 @@ pub async fn execute_writer_overwrite<W: BlockWriter>(
     start: Instant,
     tx: mpsc::Sender<ProgressEvent>,
 ) -> Result<ExecutionReport, ExecuteError> {
+    execute_writer_overwrite_with_cancel(
+        writer,
+        total_passes,
+        pattern,
+        device_serial,
+        method_name,
+        start,
+        tx,
+        None,
+    ).await
+}
+
+pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
+    mut writer: W,
+    total_passes: u8,
+    pattern: OverwritePattern,
+    device_serial: &str,
+    method_name: &str,
+    start: Instant,
+    tx: mpsc::Sender<ProgressEvent>,
+    external_cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<ExecutionReport, ExecuteError> {
     let command_log = vec![format!("Native block overwrite ({} passes, mode: {})", total_passes, writer.io_mode())];
     let device_size = writer.total_size().map_err(ExecuteError::IoError)?;
     let total_bytes = total_passes as u64 * device_size;
 
-    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let cancel_flag = external_cancel_flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let _term_hook = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&cancel_flag));
     let _int_hook = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&cancel_flag));
 
@@ -1875,6 +1910,17 @@ pub async fn execute_writer_overwrite<W: BlockWriter>(
                 write_checkpoint_file(device_serial, overall_bytes_done, total_bytes);
                 let _ = hb_stop_tx.send(());
                 let _ = hb_task.await;
+                let _ = tx.send(ProgressEvent {
+                    schema_version: 2,
+                    phase: ExecutionPhase::FirmwareCommand,
+                    bytes_done: overall_bytes_done,
+                    bytes_total: total_bytes,
+                    percent: if total_bytes > 0 { Some(overall_bytes_done as f32 / total_bytes as f32) } else { None },
+                    speed_bytes_per_sec: 0.0,
+                    eta_seconds: None,
+                    message: "Sanitization cancelled by user".to_string(),
+                    is_heartbeat: false,
+                }).await;
                 return Ok(ExecutionReport {
                     success: false,
                     method_used: method_name.to_string(),
@@ -1897,7 +1943,33 @@ pub async fn execute_writer_overwrite<W: BlockWriter>(
             let mut written_for_chunk = 0;
             while written_for_chunk < write_len {
                 if cancel_flag.load(Ordering::SeqCst) {
-                    break;
+                    let _ = writer.sync_data();
+                    write_checkpoint_file(device_serial, overall_bytes_done, total_bytes);
+                    let _ = hb_stop_tx.send(());
+                    let _ = hb_task.await;
+                    let _ = tx.send(ProgressEvent {
+                        schema_version: 2,
+                        phase: ExecutionPhase::FirmwareCommand,
+                        bytes_done: overall_bytes_done,
+                        bytes_total: total_bytes,
+                        percent: if total_bytes > 0 { Some(overall_bytes_done as f32 / total_bytes as f32) } else { None },
+                        speed_bytes_per_sec: 0.0,
+                        eta_seconds: None,
+                        message: "Sanitization cancelled by user".to_string(),
+                        is_heartbeat: false,
+                    }).await;
+                    return Ok(ExecutionReport {
+                        success: false,
+                        method_used: method_name.to_string(),
+                        command_log,
+                        stdout: String::new(),
+                        stderr: "Sanitization cancelled by user: partially wiped".to_string(),
+                        exit_code: 130,
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        dry_run: false,
+                        bytes_written: overall_bytes_done,
+                        io_mode: writer.io_mode().to_string(),
+                    });
                 }
 
                 let slice = &aligned_buf.as_slice()[written_for_chunk..write_len];
