@@ -3,6 +3,7 @@ import '../models/assistant_context.dart';
 import '../models/device_profile.dart';
 import '../models/sanitization_error_code.dart';
 import '../models/sanitization_job.dart';
+import '../models/untrusted_text.dart';
 import 'sanitization_controller.dart';
 
 import '../models/sanitization_support_level.dart';
@@ -94,7 +95,7 @@ class AssistantContextBuilder {
                     : Platform.operatingSystem);
 
     return AssistantContext(
-      deviceName: device?.name,
+      deviceName: device != null ? UntrustedText(device.name) : null,
       driveType: device?.driveType,
       mediaType: device?.mediaType,
       busType: device?.busType,
@@ -117,9 +118,9 @@ class AssistantContextBuilder {
       verificationEntropyScore: verificationEntropyScore,
       verificationMethod: verificationMethod,
       lastErrorCode: lastErrorCode,
-      lastErrorMessage: rawErrorMessage,
+      lastErrorMessage: rawErrorMessage != null ? UntrustedText(rawErrorMessage) : null,
       hasCertificate: hasCert,
-      certificateId: cert?.certificateId,
+      certificateId: cert?.certificateId != null ? UntrustedText(cert!.certificateId) : null,
       isCertificateSimulated: cert?.executionMode == 'simulated',
       isSimulated: !controller.isRealMode,
       platform: currentPlatform,

@@ -129,9 +129,15 @@ enum SanitizationErrorCode {
       case SanitizationErrorCode.securityFrozen:
         return 'Drive is locked/frozen. Power-cycle the drive and try again.';
       case SanitizationErrorCode.permissionDenied:
-        return platform == 'Windows'
-            ? 'Administrator permission required. Approve the User Account Control prompt.'
-            : 'Administrator permission required. Approve the elevation prompt or verify account permissions.';
+        if (platform == 'Windows') {
+          return 'Administrator permission required. Approve the User Account Control prompt.';
+        } else if (platform == 'Android') {
+          return 'Root or Device Administrator permission required.';
+        } else if (platform == 'Linux') {
+          return 'Administrator permission required. Approve the elevation prompt (Polkit).';
+        } else {
+          return 'Administrator permission required. Approve the elevation prompt or verify account permissions.';
+        }
       case SanitizationErrorCode.deviceBusy:
         return 'Drive is in use. Close open files/programs and unmount all partitions.';
       case SanitizationErrorCode.timeout:
@@ -151,7 +157,7 @@ enum SanitizationErrorCode {
 
   /// Detailed plain-language explanation and next steps for the AI Assistant.
   ErrorExplanation explain({
-    String platform = 'Linux',
+    String platform = 'unknown',
     bool jobStarted = true,
     bool isSimulated = false,
   }) {
@@ -194,9 +200,15 @@ enum SanitizationErrorCode {
       case SanitizationErrorCode.permissionDenied:
         summary = 'Insufficient System Privileges';
         rootCause = 'Direct block-device I/O and low-level firmware sanitize commands require elevated administrative authority.';
-        nextStep = platform == 'Windows'
-            ? 'Approve the User Account Control (UAC) prompt or ensure your user account has administrative privileges.'
-            : 'Approve the administrator authorization prompt (Polkit) or ensure your account has direct storage device access privileges.';
+        if (platform == 'Windows') {
+          nextStep = 'Approve the User Account Control (UAC) prompt or ensure your user account has administrative privileges.';
+        } else if (platform == 'Android') {
+          nextStep = 'Root or Device Administrator permission required to perform direct storage operations.';
+        } else if (platform == 'Linux') {
+          nextStep = 'Approve the administrator authorization prompt (Polkit) or ensure your account has direct storage device access privileges.';
+        } else {
+          nextStep = 'Approve the administrator elevation prompt or ensure your account has direct storage device access privileges.';
+        }
         dataMayRemain = false; // Blocked before write
         break;
 

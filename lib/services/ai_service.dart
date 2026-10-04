@@ -39,6 +39,7 @@ class AiResponse {
   final String? researchBasis;
   final String? targetSummary;
   final bool isSimulated;
+  final bool isFallback;
 
   const AiResponse({
     required this.answer,
@@ -49,6 +50,7 @@ class AiResponse {
     this.researchBasis,
     this.targetSummary,
     this.isSimulated = false,
+    this.isFallback = false,
   });
 }
 
@@ -56,7 +58,7 @@ class AiService {
   /// Explain an error code using structured root cause and next steps.
   AiResponse explainError(SanitizationErrorCode code, {AssistantContext? context}) {
     final explanation = code.explain(
-      platform: context?.platform ?? 'Linux',
+      platform: context?.platform ?? 'unknown',
       jobStarted: context?.jobStarted ?? false,
       isSimulated: context?.isSimulated ?? false,
     );
@@ -95,7 +97,7 @@ class AiService {
         (context?.hasDevice == true
             ? DeviceProfile(
                 id: 'context_device',
-                name: context!.deviceName!,
+                name: context!.deviceName!.sanitized,
                 serialNumber: 'CONTEXT',
                 mediaType: context.mediaType ??
                     (context.isFlash
@@ -162,6 +164,7 @@ class AiService {
           'AI responses are advisory only.',
           'All sanitization operations require explicit user confirmation and policy validation.',
         ],
+        isFallback: true,
       );
     }
 
@@ -184,6 +187,7 @@ class AiService {
         researchBasis: response.researchBasis,
         targetSummary: context?.targetSummary,
         isSimulated: true,
+        isFallback: response.isFallback,
       );
     }
 
@@ -197,6 +201,7 @@ class AiService {
         researchBasis: response.researchBasis,
         targetSummary: context?.targetSummary,
         isSimulated: false,
+        isFallback: response.isFallback,
       );
     }
 

@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
@@ -7,15 +8,37 @@ import 'package:zero_trace/models/device_profile.dart';
 import 'package:zero_trace/models/sanitization_error_code.dart';
 import 'package:zero_trace/models/sanitization_job.dart';
 import 'package:zero_trace/models/sanitization_support_level.dart';
+import 'package:zero_trace/models/untrusted_text.dart';
 import 'package:zero_trace/services/ai_service.dart';
 import 'package:zero_trace/services/assistant_context_builder.dart';
 import 'package:zero_trace/services/sanitization_controller.dart';
 
 void main() {
-  group('AssistantContext Model Constraints', () {
+  group('UntrustedText Sanitization (Amendment 5)', () {
+    test('strips control characters and collapses whitespace', () {
+      const untrusted = UntrustedText('Drive\x00\x07Name\x1B   with \r\n multiple   spaces');
+      expect(untrusted.sanitized, 'Drive Name with multiple spaces');
+      expect(untrusted.rawValue, 'Drive\x00\x07Name\x1B   with \r\n multiple   spaces');
+    });
+
+    test('enforces 120-character maximum length cap', () {
+      final longString = 'A' * 200;
+      final untrusted = UntrustedText(longString);
+      expect(untrusted.sanitized.length, 120);
+      expect(untrusted.sanitized, 'A' * 120);
+    });
+
+    test('handles empty or blank string gracefully', () {
+      const empty = UntrustedText('');
+      expect(empty.sanitized, '');
+      expect(empty.toString(), '');
+    });
+  });
+
+  group('AssistantContext Model Constraints & Platform (Amendments 4, 5, 8)', () {
     test('contains no physical serial, path, or WWN fields', () {
       const context = AssistantContext(
-        deviceName: 'Kingston DataTraveler',
+        deviceName: UntrustedText('Kingston DataTraveler'),
         driveType: DriveType.usb,
         mediaType: MediaType.usbFlash,
         busType: 'USB',
@@ -24,30 +47,44 @@ void main() {
         supportLevel: SanitizationSupportLevel.clearOnly,
         isFlash: true,
         isRemovable: true,
-        platform: 'Linux',
       );
 
       // Verify accessible coarse facts
-      expect(context.deviceName, 'Kingston DataTraveler');
+      expect(context.deviceNameText, 'Kingston DataTraveler');
       expect(context.driveType, DriveType.usb);
       expect(context.isFlash, true);
-      expect(context.platform, 'Linux');
+      expect(context.platform, 'unknown'); // Default is unknown (Amendment 4)
       expect(context.targetSummary, 'Kingston DataTraveler');
     });
 
-    test('platform string is injected and not tied to host OS', () {
-      const winContext = AssistantContext(platform: 'Windows');
-      const linContext = AssistantContext(platform: 'Linux');
-      const macContext = AssistantContext(platform: 'macOS');
+    test('platform defaults to unknown with platform-neutral wording', () {
+      const defaultContext = AssistantContext();
+      expect(defaultContext.platform, 'unknown');
 
-      expect(winContext.platform, 'Windows');
-      expect(linContext.platform, 'Linux');
-      expect(macContext.platform, 'macOS');
+      final neutralExplain = SanitizationErrorCode.permissionDenied.explain(platform: defaultContext.platform);
+      expect(neutralExplain.nextStep, contains('Approve the administrator elevation prompt'));
+      expect(neutralExplain.nextStep.toLowerCase().contains('polkit'), false);
+      expect(neutralExplain.nextStep.toLowerCase().contains('uac'), false);
+    });
+
+    test('platform supports Windows, Android, and Linux strings', () {
+      const winContext = AssistantContext(platform: 'Windows');
+      const androidContext = AssistantContext(platform: 'Android');
+      const linContext = AssistantContext(platform: 'Linux');
+
+      final winExplain = SanitizationErrorCode.permissionDenied.explain(platform: winContext.platform);
+      expect(winExplain.nextStep, contains('User Account Control (UAC)'));
+
+      final androidExplain = SanitizationErrorCode.permissionDenied.explain(platform: androidContext.platform);
+      expect(androidExplain.nextStep, contains('Device Administrator'));
+
+      final linExplain = SanitizationErrorCode.permissionDenied.explain(platform: linContext.platform);
+      expect(linExplain.nextStep, contains('Polkit'));
     });
 
     test('targetSummary reflects disconnected state', () {
       const context = AssistantContext(
-        deviceName: 'SanDisk Ultra',
+        deviceName: UntrustedText('SanDisk Ultra'),
         isDisconnected: true,
       );
       expect(context.targetSummary, 'SanDisk Ultra (disconnected)');
@@ -62,7 +99,7 @@ void main() {
   group('AssistantContext Quick Questions (Amendment 6)', () {
     test('caps quick questions at 6 maximum', () {
       const context = AssistantContext(
-        deviceName: 'Flash Drive',
+        deviceName: UntrustedText('Flash Drive'),
         isFlash: true,
         isSecurityFrozen: true,
         hasHpaDco: true,
@@ -77,7 +114,7 @@ void main() {
 
     test('prioritizes errors and failures first', () {
       const context = AssistantContext(
-        deviceName: 'Samsung 980',
+        deviceName: UntrustedText('Samsung 980'),
         isFlash: true,
         verificationPassed: false,
         lastErrorCode: SanitizationErrorCode.verificationFailed,
@@ -90,13 +127,13 @@ void main() {
 
     test('shows HPA/DCO question ONLY when device has HpaDco', () {
       const withoutHpa = AssistantContext(
-        deviceName: 'Drive A',
+        deviceName: UntrustedText('Drive A'),
         hasHpaDco: false,
       );
       expect(withoutHpa.quickQuestions.contains('What are HPA/DCO hidden sectors?'), false);
 
       const withHpa = AssistantContext(
-        deviceName: 'Drive B',
+        deviceName: UntrustedText('Drive B'),
         hasHpaDco: true,
       );
       expect(withHpa.quickQuestions.contains('What are HPA/DCO hidden sectors?'), true);
@@ -104,13 +141,13 @@ void main() {
 
     test('shows security frozen question ONLY when device is security frozen', () {
       const notFrozen = AssistantContext(
-        deviceName: 'Drive A',
+        deviceName: UntrustedText('Drive A'),
         isSecurityFrozen: false,
       );
       expect(notFrozen.quickQuestions.contains('What does security frozen mean?'), false);
 
       const frozen = AssistantContext(
-        deviceName: 'Drive B',
+        deviceName: UntrustedText('Drive B'),
         isSecurityFrozen: true,
       );
       expect(frozen.quickQuestions.contains('What does security frozen mean?'), true);
@@ -125,16 +162,27 @@ void main() {
       expect(withCert.quickQuestions.contains('What does the cryptographic signature prove?'), true);
     });
 
-    test('every generated quick question returns a non-fallback answer from AiService', () {
+    test('fallback detection works: unknown query produces isFallback == true', () {
+      final aiService = AiService();
+      final unknownResponse = aiService.processQuery('xyzzy totally unmapped query string 12345');
+      expect(
+        unknownResponse.isFallback,
+        true,
+        reason: 'Unknown queries must be flagged with isFallback = true.',
+      );
+      expect(unknownResponse.answer, contains('I can help with questions about storage sanitization methods'));
+    });
+
+    test('every generated quick question returns a non-fallback answer (isFallback == false)', () {
       final aiService = AiService();
 
       // Test across multiple state permutations
       final testContexts = [
         const AssistantContext(), // Generic
         const AssistantContext(hasCertificate: true),
-        const AssistantContext(deviceName: 'USB', isFlash: true),
-        const AssistantContext(deviceName: 'HDD', isRotational: true),
-        const AssistantContext(deviceName: 'SSD', hasHpaDco: true, isSecurityFrozen: true),
+        const AssistantContext(deviceName: UntrustedText('USB'), isFlash: true),
+        const AssistantContext(deviceName: UntrustedText('HDD'), isRotational: true),
+        const AssistantContext(deviceName: UntrustedText('SSD'), hasHpaDco: true, isSecurityFrozen: true),
         const AssistantContext(verificationPassed: false, lastErrorCode: SanitizationErrorCode.timeout),
         const AssistantContext(jobStatus: JobStatus.failed, lastErrorCode: SanitizationErrorCode.deviceNotFound),
       ];
@@ -146,11 +194,10 @@ void main() {
 
       for (final question in allQuestions) {
         final response = aiService.processQuery(question);
-        // Fallback response contains "I can help with questions about storage sanitization"
         expect(
-          response.answer.contains('I can help with questions about storage sanitization methods, risk assessment'),
+          response.isFallback,
           false,
-          reason: 'Question "$question" returned generic fallback instead of a specific answer.',
+          reason: 'Generated question "$question" returned fallback response instead of a specialized handler.',
         );
         expect(response.answer.isNotEmpty, true);
       }
@@ -161,7 +208,7 @@ void main() {
     test('states nothing was actually erased when isSimulated is true', () {
       final aiService = AiService();
       const simContext = AssistantContext(
-        deviceName: 'Simulated Drive',
+        deviceName: UntrustedText('Simulated Drive'),
         isSimulated: true,
       );
 
@@ -232,7 +279,7 @@ void main() {
     test('HDD answers stay at Clear-level and never claim unrecoverable', () {
       final aiService = AiService();
       const hddContext = AssistantContext(
-        deviceName: 'Seagate Barracuda',
+        deviceName: UntrustedText('Seagate Barracuda'),
         isRotational: true,
       );
 
@@ -284,7 +331,7 @@ void main() {
       final initialSelected = controller.selectedDevice;
       final snapshot = AssistantContextBuilder.fromController(controller);
 
-      expect(snapshot.deviceName, 'USB Pen Drive');
+      expect(snapshot.deviceNameText, 'USB Pen Drive');
       expect(snapshot.isFlash, true);
       expect(snapshot.isDisconnected, false);
       expect(controller.selectedDevice, equals(initialSelected));
@@ -359,6 +406,51 @@ void main() {
 
       // Chip now displays "No device selected"
       expect(find.text('No device selected'), findsOneWidget);
+    });
+  });
+
+  group('Architectural Import Isolation (Item 7)', () {
+    test('ai_service.dart and assistant_context.dart import no controller, execution, or process code', () {
+      final forbiddenImports = [
+        'sanitization_controller.dart',
+        'real_sanitization_service.dart',
+        'certificate_service.dart',
+        'orphaned_process_checker.dart',
+        'device_simulator.dart',
+        'execute.rs',
+      ];
+
+      final filesToCheck = [
+        File('lib/models/assistant_context.dart'),
+        File('lib/services/ai_service.dart'),
+        File('lib/models/untrusted_text.dart'),
+        File('lib/models/sanitization_error_code.dart'),
+      ];
+
+      for (final file in filesToCheck) {
+        expect(file.existsSync(), true, reason: 'File ${file.path} must exist');
+        final content = file.readAsStringSync();
+        final lines = content.split('\n');
+
+        for (final line in lines) {
+          final trimmed = line.trim();
+          if (trimmed.startsWith('import ') || trimmed.startsWith('export ')) {
+            for (final forbidden in forbiddenImports) {
+              expect(
+                trimmed.contains(forbidden),
+                false,
+                reason: 'Architecture violation: ${file.path} imports $forbidden in line: "$trimmed"',
+              );
+            }
+            // Also ensure no dart:io Process imports
+            expect(
+              trimmed.contains('dart:io') && trimmed.contains('Process'),
+              false,
+              reason: 'Architecture violation: ${file.path} imports Process from dart:io',
+            );
+          }
+        }
+      }
     });
   });
 }
