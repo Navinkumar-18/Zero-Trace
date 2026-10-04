@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 
 import '../models/device_profile.dart';
 import 'device_simulator.dart';
+import 'policy_layer.dart';
 
 class DeviceIntelligenceService {
   final DeviceSimulator _simulator;
@@ -108,9 +109,13 @@ class DeviceIntelligenceService {
             for (final child in children) {
               final mp = (child['mountpoint'] as String?)?.trim();
               final childFs = (child['fstype'] as String?)?.trim();
-              if (mp == '/' || mp == '/boot' || mp == '/boot/efi') {
+              if (mp != null && mp.isNotEmpty && !PolicyLayer.isMountUnmountable(mp)) {
                 isSys = true;
                 systemMountPoint = mp;
+              }
+              if (childFs == 'swap') {
+                isSys = true;
+                systemMountPoint = '[SWAP]';
               }
               if ((childFs != null && childFs.isNotEmpty) || (mp != null && mp.isNotEmpty)) {
                 hasFilesystem = true;
