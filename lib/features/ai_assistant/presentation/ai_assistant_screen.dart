@@ -237,11 +237,11 @@ class _AiAssistantScreenState extends State<AiAssistantScreen> {
     IconData chipIcon;
 
     if (isDisconnected) {
-      chipLabel = '${contextSnapshot.deviceName} (disconnected)';
+      chipLabel = '${contextSnapshot.deviceNameText} (disconnected)';
       chipColor = AppTheme.accentRose;
       chipIcon = Icons.link_off;
     } else if (hasDevice) {
-      final name = contextSnapshot.deviceName!;
+      final name = contextSnapshot.deviceNameText!;
       chipLabel = name.length > 20 ? '${name.substring(0, 20)}...' : name;
       chipColor = AppTheme.accentGold;
       chipIcon = Icons.storage;

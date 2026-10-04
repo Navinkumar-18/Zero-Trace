@@ -188,6 +188,13 @@ class SanitizationJob {
     this.wipeCompleted = false,
   }) : logs = logs ?? [];
 
+  /// Whether this job is actively running an operation.
+  bool get isRunning =>
+      status == JobStatus.detecting ||
+      status == JobStatus.unmounting ||
+      status == JobStatus.sanitizing ||
+      status == JobStatus.verifying;
+
   /// The method that will actually be executed (overridden if user selected an alternative).
   SanitizationMethod get effectiveMethod => overriddenMethod ?? recommendedMethod;
 

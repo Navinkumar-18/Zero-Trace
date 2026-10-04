@@ -9,6 +9,8 @@ library;
 import '../models/assistant_context.dart';
 import '../models/device_profile.dart';
 import '../models/sanitization_error_code.dart';
+import 'knowledge/bm25_retriever.dart';
+import 'knowledge/knowledge_entry.dart';
 
 class AiContext {
   final String? mediaType;
@@ -39,6 +41,9 @@ class AiResponse {
   final String? researchBasis;
   final String? targetSummary;
   final bool isSimulated;
+  final bool isFallback;
+  final String handlerId;
+  final List<String> kbEntryIds;
 
   const AiResponse({
     required this.answer,
@@ -49,14 +54,21 @@ class AiResponse {
     this.researchBasis,
     this.targetSummary,
     this.isSimulated = false,
+    this.isFallback = false,
+    this.handlerId = 'fallback',
+    this.kbEntryIds = const [],
   });
 }
 
 class AiService {
+  final BM25Retriever? retriever;
+
+  const AiService({this.retriever});
+
   /// Explain an error code using structured root cause and next steps.
   AiResponse explainError(SanitizationErrorCode code, {AssistantContext? context}) {
     final explanation = code.explain(
-      platform: context?.platform ?? 'Linux',
+      platform: context?.platform ?? 'unknown',
       jobStarted: context?.jobStarted ?? false,
       isSimulated: context?.isSimulated ?? false,
     );
@@ -76,11 +88,20 @@ class AiService {
       warnings: warnings,
       isSimulated: context?.isSimulated ?? explanation.isSimulated,
       targetSummary: context?.targetSummary,
+      handlerId: 'error_explanation',
     );
   }
 
   /// Process a user question with optional context or device profile.
   /// Returns a structured advisory response.
+  ///
+  /// PRECEDENCE (Item 10):
+  /// 1. State handlers always answer from AssistantContext (KB adds explanation only).
+  /// 2. Conceptual handlers use a KB entry only if a reviewed entry matches;
+  ///    otherwise the legacy handler answers with no "Based on" line.
+  /// 3. Exactly one answer is returned.
+  /// 4. KB answers get handlerId 'kb' and the entry ids used.
+  /// 5. Simulated-mode disclaimers still apply to KB answers.
   ///
   /// SAFETY: This method NEVER generates executable commands or mutates state.
   AiResponse processQuery(
@@ -95,7 +116,7 @@ class AiService {
         (context?.hasDevice == true
             ? DeviceProfile(
                 id: 'context_device',
-                name: context!.deviceName!,
+                name: context!.deviceName!.sanitized,
                 serialNumber: 'CONTEXT',
                 mediaType: context.mediaType ??
                     (context.isFlash
@@ -115,7 +136,7 @@ class AiService {
 
     AiResponse response;
 
-    // 1. Error and failure queries
+    // 1. State handlers: always answer from AssistantContext (highest precedence)
     if (q.contains('explain this error') ||
         q.contains('why did the sanitization fail') ||
         q.contains('what should i do after this error')) {
@@ -123,10 +144,12 @@ class AiService {
       response = explainError(code, context: context);
     } else if (q.contains('why did verification fail') || (q.contains('verification') && q.contains('fail'))) {
       response = _verificationFailureResponse();
-    } else if (q.contains('cryptographic signature prove') || (q.contains('signature') && q.contains('prove'))) {
-      response = _signatureExplanation();
     } else if (q.contains('security frozen')) {
       response = _securityFrozenResponse();
+    } else if (q.contains('cryptographic signature prove') || (q.contains('signature') && q.contains('prove'))) {
+      response = _signatureExplanation();
+    } else if (q.contains('certificate') || (q.contains('explain') && q.contains('cert'))) {
+      response = _certificateExplanation();
     } else if (q.contains('how does overwrite work for hdd') || (q.contains('overwrite') && q.contains('hdd'))) {
       response = _hddOverwriteResponse(effectiveDevice);
     } else if (q.contains('overwrite') && (q.contains('ssd') || q.contains('flash') || q.contains('nvme'))) {
@@ -135,34 +158,53 @@ class AiService {
       response = _recommendMethodResponse(effectiveDevice);
     } else if (q.contains('high risk') || (q.contains('why') && q.contains('risk'))) {
       response = _riskExplanationResponse(effectiveDevice);
-    } else if (q.contains('cryptographic erase') || q.contains('crypto erase')) {
-      response = _cryptoEraseExplanation();
-    } else if (q.contains('certificate') || (q.contains('explain') && q.contains('cert'))) {
-      response = _certificateExplanation();
-    } else if (q.contains('nist') || q.contains('800-88')) {
-      response = _nistExplanation();
-    } else if (q.contains('pales') || q.contains('ftl') || q.contains('flash translation')) {
-      response = _palesExplanation();
-    } else if (q.contains('clear') && q.contains('purge')) {
-      response = _clearVsPurgeExplanation();
-    } else if (q.contains('destroy') || q.contains('physical destruction')) {
-      response = _destroyExplanation();
-    } else if (q.contains('hpa') || q.contains('dco') || q.contains('hidden')) {
-      response = _hpaDcoExplanation();
-    } else if (q.contains('wear level') || q.contains('garbage collection') || q.contains('spare block')) {
-      response = _flashInternalsExplanation();
     } else {
-      // Generic fallback
-      response = const AiResponse(
-        answer: 'I can help with questions about storage sanitization methods, '
-            'risk assessment, verification procedures, NIST standards, and device capabilities. '
-            'Try asking about specific topics like "Why is overwrite not recommended for SSDs?" '
-            'or "What does cryptographic erase mean?"',
-        warnings: [
-          'AI responses are advisory only.',
-          'All sanitization operations require explicit user confirmation and policy validation.',
-        ],
-      );
+      // 2. Conceptual handlers: check KB first only if a reviewed entry matches
+      SearchMatch? kbMatch;
+      if (retriever != null) {
+        final match = retriever!.findBestMatch(question, context: context);
+        if (match != null && match.entry.reviewStatus == KnowledgeReviewStatus.reviewed) {
+          kbMatch = match;
+        }
+      }
+
+      if (kbMatch != null) {
+        // KB reviewed answer with 'kb' handlerId and entry id
+        response = AiResponse(
+          answer: kbMatch.entry.content,
+          researchBasis: 'Based on: ${kbMatch.entry.title}',
+          handlerId: 'kb',
+          kbEntryIds: [kbMatch.entry.id],
+        );
+      } else if (q.contains('cryptographic erase') || q.contains('crypto erase')) {
+        response = _cryptoEraseExplanation();
+      } else if (q.contains('nist') || q.contains('800-88')) {
+        response = _nistExplanation();
+      } else if (q.contains('pales') || q.contains('ftl') || q.contains('flash translation')) {
+        response = _palesExplanation();
+      } else if (q.contains('clear') && q.contains('purge')) {
+        response = _clearVsPurgeExplanation();
+      } else if (q.contains('destroy') || q.contains('physical destruction')) {
+        response = _destroyExplanation();
+      } else if (q.contains('hpa') || q.contains('dco') || q.contains('hidden')) {
+        response = _hpaDcoExplanation();
+      } else if (q.contains('wear level') || q.contains('garbage collection') || q.contains('spare block')) {
+        response = _flashInternalsExplanation();
+      } else {
+        // Generic fallback
+        response = const AiResponse(
+          answer: 'I can help with questions about storage sanitization methods, '
+              'risk assessment, verification procedures, NIST standards, and device capabilities. '
+              'Try asking about specific topics like "Why is overwrite not recommended for SSDs?" '
+              'or "What does cryptographic erase mean?"',
+          warnings: [
+            'AI responses are advisory only.',
+            'All sanitization operations require explicit user confirmation and policy validation.',
+          ],
+          isFallback: true,
+          handlerId: 'fallback',
+        );
+      }
     }
 
     // Apply simulation disclaimer if isSimulated is true (Amendment 7)
@@ -184,6 +226,9 @@ class AiService {
         researchBasis: response.researchBasis,
         targetSummary: context?.targetSummary,
         isSimulated: true,
+        isFallback: response.isFallback,
+        handlerId: response.handlerId,
+        kbEntryIds: response.kbEntryIds,
       );
     }
 
@@ -197,6 +242,9 @@ class AiService {
         researchBasis: response.researchBasis,
         targetSummary: context?.targetSummary,
         isSimulated: false,
+        isFallback: response.isFallback,
+        handlerId: response.handlerId,
+        kbEntryIds: response.kbEntryIds,
       );
     }
 
@@ -235,6 +283,7 @@ class AiService {
       researchBasis: 'PALES research (SSD secure deletion via page group management) '
           'demonstrates that SSD internal architecture fundamentally differs from HDD. '
           'NIST SP 800-88 Rev. 2 recommends device-supported mechanisms for flash media.',
+      handlerId: 'ssd_overwrite',
     );
   }
 
@@ -256,6 +305,7 @@ class AiService {
         'Retired and reallocated bad sectors may still contain remnant data.',
       ],
       researchBasis: 'NIST SP 800-88 Rev. 2 Table A-1: Magnetic Media Sanitization',
+      handlerId: 'hdd_overwrite',
     );
   }
 
@@ -272,6 +322,7 @@ class AiService {
       warnings: [
         'Hardware sanitize and ATA Secure Erase cannot proceed while the drive is in a frozen state.',
       ],
+      handlerId: 'security_frozen',
     );
   }
 
@@ -284,6 +335,7 @@ class AiService {
           '**What it does NOT prove:**\n'
           'A signature proves that the recorded evidence has not been tampered with since issuance. It does not physically guarantee that data cannot be recovered by laboratory techniques if an inadequate method was used.',
       researchBasis: 'Zero Trace Cryptographic Proof System / RFC 8032 Ed25519',
+      handlerId: 'signature_explanation',
     );
   }
 
@@ -293,6 +345,7 @@ class AiService {
         answer: 'Please select a device first so I can analyze its capabilities '
             'and recommend an appropriate sanitization method.',
         warnings: ['No device context provided.'],
+        handlerId: 'recommend_method',
       );
     }
 
@@ -339,6 +392,7 @@ class AiService {
         'This recommendation is advisory. Final method selection requires policy validation.',
         'AI does not execute sanitization operations.',
       ],
+      handlerId: 'recommend_method',
     );
   }
 
@@ -348,6 +402,7 @@ class AiService {
         answer: 'Risk level depends on media type, device capabilities, '
             'encryption state, data sensitivity, and intended disposal path. '
             'Select a device for a specific risk analysis.',
+        handlerId: 'risk_explanation',
       );
     }
 
@@ -372,6 +427,7 @@ class AiService {
       riskLevel: factors.length >= 3 ? 'CRITICAL' : factors.length >= 2 ? 'HIGH' : 'MEDIUM',
       warnings: factors,
       researchBasis: 'NIST SP 800-88 Rev. 2 defines risk-based media sanitization categories.',
+      handlerId: 'risk_explanation',
     );
   }
 
@@ -389,6 +445,7 @@ class AiService {
         'Failed verification means sanitization assurance is insufficient. Data may remain.',
         'Consider physical destruction for failed devices handling sensitive data.',
       ],
+      handlerId: 'verification_failure',
     );
   }
 
@@ -410,6 +467,7 @@ class AiService {
           '• Cannot be verified by reading sectors (encrypted data remains, key is gone).',
       recommendedMethod: 'Cryptographic Erase',
       researchBasis: 'NIST SP 800-88 Rev. 2 Purge / IEEE 2883:2022 Cryptographic Erase',
+      handlerId: 'crypto_erase',
     );
   }
 
@@ -434,6 +492,7 @@ class AiService {
         'The certificate records what was observed, not absolute physical state.',
         'Hash integrity ≠ physical erasure proof.',
       ],
+      handlerId: 'certificate_explanation',
     );
   }
 
@@ -452,6 +511,7 @@ class AiService {
           '• **Cryptographic Erase** — Destruction of encryption keys on self-encrypting devices. '
           'Can satisfy Purge requirements when properly implemented.',
       researchBasis: 'NIST SP 800-88 Rev. 2 / IEEE 2883:2022',
+      handlerId: 'nist_standards',
     );
   }
 
@@ -475,6 +535,7 @@ class AiService {
           'Device-supported sanitization commands that operate below the FTL are preferred.',
       researchBasis: 'PALES: Optimizing Secure Data Deletion in SSDs via Page Group and '
           'Reprogram Speedup',
+      handlerId: 'pales_research',
     );
   }
 
@@ -493,6 +554,7 @@ class AiService {
           '• Appropriate for: Confidential data, assets leaving organizational control.\n'
           '• Advantage: Operates at the controller/firmware level, addressing physical storage.',
       researchBasis: 'NIST SP 800-88 Rev. 2',
+      handlerId: 'clear_vs_purge',
     );
   }
 
@@ -514,6 +576,7 @@ class AiService {
           'Zero Trace flags devices for destruction when software sanitization cannot '
           'provide sufficient assurance. The application does not perform physical destruction.',
       riskLevel: 'CRITICAL',
+      handlerId: 'physical_destruction',
     );
   }
 
@@ -537,6 +600,7 @@ class AiService {
         'HPA/DCO regions are not addressed by standard overwrite.',
         'Device-level sanitize commands may or may not address HPA/DCO.',
       ],
+      handlerId: 'hpa_dco',
     );
   }
 
@@ -559,6 +623,7 @@ class AiService {
           'Additional capacity (typically 7-28% beyond advertised) reserved by the controller '
           'for performance and endurance management. Not accessible via standard I/O.',
       researchBasis: 'PALES research / General flash storage architecture',
+      handlerId: 'flash_internals',
     );
   }
 }

@@ -6,17 +6,18 @@
 /// 2. It NEVER contains physical device paths (e.g. /dev/sda), physical serial numbers,
 ///    or WWNs. Coarse facts only.
 /// 3. Fields derived from hardware or user input (deviceName, lastErrorMessage, certificateId)
-///    are marked as untrusted and must pass through redaction before any external model call.
+///    are wrapped in [UntrustedText] to prevent raw prompt injection or logging without sanitation.
 library;
 
 import 'device_profile.dart';
 import 'sanitization_error_code.dart';
 import 'sanitization_job.dart';
 import 'sanitization_support_level.dart';
+import 'untrusted_text.dart';
 
 class AssistantContext {
-  /// Untrusted hardware/user string. Must be sanitized before prompt injection.
-  final String? deviceName;
+  /// Untrusted hardware/user string wrapped in [UntrustedText].
+  final UntrustedText? deviceName;
 
   final DriveType? driveType;
   final MediaType? mediaType;
@@ -25,6 +26,7 @@ class AssistantContext {
   final String? formattedSize;
   final SanitizationSupportLevel? supportLevel;
 
+  final MediaTechnology mediaTechnology;
   final bool isRotational;
   final bool isFlash;
   final bool isRemovable;
@@ -47,16 +49,18 @@ class AssistantContext {
 
   final SanitizationErrorCode? lastErrorCode;
 
-  /// Untrusted error text. Must be sanitized before prompt injection.
-  final String? lastErrorMessage;
+  /// Untrusted error text wrapped in [UntrustedText].
+  final UntrustedText? lastErrorMessage;
 
   final bool hasCertificate;
 
-  /// Untrusted certificate identifier. Must be sanitized before prompt injection.
-  final String? certificateId;
+  /// Untrusted certificate identifier wrapped in [UntrustedText].
+  final UntrustedText? certificateId;
 
   final bool? isCertificateSimulated;
   final bool isSimulated;
+
+  /// Injected operating system name. Defaults to 'unknown' with platform-neutral wording.
   final String platform;
 
   const AssistantContext({
@@ -67,6 +71,7 @@ class AssistantContext {
     this.sizeBytes,
     this.formattedSize,
     this.supportLevel,
+    this.mediaTechnology = MediaTechnology.unknown,
     this.isRotational = false,
     this.isFlash = false,
     this.isRemovable = false,
@@ -88,17 +93,20 @@ class AssistantContext {
     this.certificateId,
     this.isCertificateSimulated,
     this.isSimulated = true,
-    this.platform = 'Linux',
+    this.platform = 'unknown',
   });
 
   /// True if a device is currently selected in this context.
-  bool get hasDevice => deviceName != null && deviceName!.isNotEmpty;
+  bool get hasDevice => deviceName != null && deviceName!.sanitized.isNotEmpty;
+
+  /// Sanitized device name string, or null if no device selected.
+  String? get deviceNameText => deviceName?.sanitized;
 
   /// Human-readable target summary for message cards (e.g. "Answered for: Samsung SSD 980").
   String get targetSummary {
     if (!hasDevice) return 'None (general knowledge)';
-    if (isDisconnected) return '$deviceName (disconnected)';
-    return deviceName!;
+    if (isDisconnected) return '${deviceName!.sanitized} (disconnected)';
+    return deviceName!.sanitized;
   }
 
   /// Generates dynamic, context-aware quick questions capped at ~6.
