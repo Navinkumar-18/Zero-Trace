@@ -4,6 +4,49 @@ enum DataSensitivity { public, internal, confidential, restricted }
 enum DeviceCondition { functional, degraded, endOfLife }
 enum DisposalPath { internalReuse, externalResale, recycling, physicalDestruction }
 
+/// Simple Mode single-question disposal intent.
+/// Maps to DataSensitivity + DisposalPath with sensible defaults.
+enum DisposalIntent {
+  reuseMyself,
+  giveAwayOrSell,
+  dispose,
+}
+
+extension DisposalIntentExtension on DisposalIntent {
+  String get label {
+    switch (this) {
+      case DisposalIntent.reuseMyself:
+        return 'Reuse myself';
+      case DisposalIntent.giveAwayOrSell:
+        return 'Give away or sell';
+      case DisposalIntent.dispose:
+        return 'Dispose / recycle';
+    }
+  }
+
+  DataSensitivity get mappedSensitivity {
+    switch (this) {
+      case DisposalIntent.reuseMyself:
+        return DataSensitivity.internal;
+      case DisposalIntent.giveAwayOrSell:
+        return DataSensitivity.confidential;
+      case DisposalIntent.dispose:
+        return DataSensitivity.confidential;
+    }
+  }
+
+  DisposalPath get mappedDisposalPath {
+    switch (this) {
+      case DisposalIntent.reuseMyself:
+        return DisposalPath.internalReuse;
+      case DisposalIntent.giveAwayOrSell:
+        return DisposalPath.externalResale;
+      case DisposalIntent.dispose:
+        return DisposalPath.recycling;
+    }
+  }
+}
+
 enum NistCategory { clear, purge, destroy }
 
 extension NistCategoryExtension on NistCategory {

@@ -100,6 +100,7 @@ class DeviceIntelligenceService {
           final children = dev['children'] as List<dynamic>?;
 
           bool isSys = false;
+          bool isLiveMedia = false;
           String? systemMountPoint;
           bool hasFilesystem = (mainFsType != null && mainFsType.isNotEmpty) ||
               (mainMountPoint != null && mainMountPoint.isNotEmpty);
@@ -109,9 +110,16 @@ class DeviceIntelligenceService {
             for (final child in children) {
               final mp = (child['mountpoint'] as String?)?.trim();
               final childFs = (child['fstype'] as String?)?.trim();
-              if (mp != null && mp.isNotEmpty && !PolicyLayer.isMountUnmountable(mp)) {
-                isSys = true;
-                systemMountPoint = mp;
+              if (mp != null && mp.isNotEmpty) {
+                // Phase 1 boot-guard: detect live-USB/live-media mounts
+                if (_isLiveMediaMount(mp)) {
+                  isLiveMedia = true;
+                  isSys = true;
+                  systemMountPoint = mp;
+                } else if (!PolicyLayer.isMountUnmountable(mp)) {
+                  isSys = true;
+                  systemMountPoint = mp;
+                }
               }
               if (childFs == 'swap') {
                 isSys = true;
@@ -127,6 +135,10 @@ class DeviceIntelligenceService {
           }
 
           final bool isWipedNoFilesystem = !hasFilesystem && (children == null || children.isEmpty);
+
+          // Removable = sysfs RM flag OR hotplug flag OR USB bus.
+          // Internal eMMC is NOT removable (RM=false, hotplug=false, tran=MMC).
+          final bool removable = isRm || isHotplug || tran.contains('USB');
 
           MediaType mediaType = MediaType.unknown;
           if (tran.contains('USB') || isRm || isHotplug) {
@@ -166,13 +178,16 @@ class DeviceIntelligenceService {
               hasFilesystem: hasFilesystem,
               fsType: detectedFsType,
               isWipedNoFilesystem: isWipedNoFilesystem,
+              isRemovable: removable,
               notes: isWipedNoFilesystem
                   ? 'SANITIZED / NO FILESYSTEM (Raw Block Device)'
-                  : (isSys
-                      ? 'REAL SYSTEM DISK (Protected against destruction)'
-                      : (isRm || mediaType == MediaType.usbFlash
-                          ? 'REAL REMOVABLE STORAGE DEVICE'
-                          : 'REAL CONNECTED STORAGE DEVICE')),
+                  : (isLiveMedia
+                      ? 'LIVE MEDIA DISK (Protected against destruction)'
+                      : (isSys
+                          ? 'REAL SYSTEM DISK (Protected against destruction)'
+                          : (removable
+                              ? 'REAL REMOVABLE STORAGE DEVICE'
+                              : 'REAL CONNECTED STORAGE DEVICE'))),
             ),
           );
         }
@@ -180,4 +195,14 @@ class DeviceIntelligenceService {
 
       return detectedProfiles;
     }
+
+  /// Check for live-media mount paths (Phase 1 boot-guard matching).
+  static bool _isLiveMediaMount(String mountPoint) {
+    final mp = mountPoint.trim();
+    return mp.startsWith('/run/live') ||
+        mp.startsWith('/run/archiso') ||
+        mp.startsWith('/run/initramfs') ||
+        mp.contains('/live/medium') ||
+        mp.contains('/casper/');
+  }
   }

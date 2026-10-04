@@ -49,10 +49,96 @@ class SanitizationController extends ChangeNotifier {
   // Global dev simulator controls
   bool _simulateFailureMode = false;
 
-  SanitizationController() {
+  // Simple Mode shared state (reset on every launch)
+  bool _showInternalDrives = false;
+
+  SanitizationController({bool enableAutoPolling = true}) {
     refreshDevices();
-    _startAutoPolling();
+    if (enableAutoPolling) {
+      _startAutoPolling();
+    }
     _checkForOrphansOnStartup();
+  }
+
+  bool get showInternalDrives => _showInternalDrives;
+  void setShowInternalDrives(bool value) {
+    _showInternalDrives = value;
+    notifyListeners();
+  }
+
+  void resetShowInternalDrives() {
+    if (_showInternalDrives) {
+      _showInternalDrives = false;
+      notifyListeners();
+    }
+  }
+
+  /// Auto-select the strongest supported method for a device.
+  /// Used by Simple Mode to show the method in the confirm dialog.
+  RecommendationResult getAutoMethod(DeviceProfile device, DisposalIntent intent) {
+    final sensitivity = intent.mappedSensitivity;
+    final riskResult = _riskScoringService.scoreRisk(
+      dataSensitivity: sensitivity,
+      deviceCondition: DeviceCondition.functional,
+      disposalPath: intent.mappedDisposalPath,
+    );
+    return _recommendationService.selectMethod(
+      device,
+      riskResult.score,
+      riskResult.targetCategory,
+      sensitivity: sensitivity,
+    );
+  }
+
+  /// Start sanitization in Simple Mode with auto-selected method.
+  /// The disposal intent only affects warnings and Destroy recommendation.
+  Future<void> startSimpleWipe(DeviceProfile device, DisposalIntent intent, {SanitizationMethod? overrideMethod}) async {
+    if (isJobRunning) return;
+
+    // Pin serial + size at selection
+    _selectedDevice = device;
+
+    final sensitivity = intent.mappedSensitivity;
+    final disposalPath = intent.mappedDisposalPath;
+
+    _dataSensitivity = sensitivity;
+    _deviceCondition = DeviceCondition.functional;
+    _disposalPath = disposalPath;
+
+    final riskResult = _riskScoringService.scoreRisk(
+      dataSensitivity: sensitivity,
+      deviceCondition: DeviceCondition.functional,
+      disposalPath: disposalPath,
+    );
+
+    final recResult = _recommendationService.selectMethod(
+      device,
+      riskResult.score,
+      riskResult.targetCategory,
+      sensitivity: sensitivity,
+    );
+
+    final jobId = 'JOB-${DateTime.now().millisecondsSinceEpoch.toString().substring(6)}';
+
+    _currentJob = SanitizationJob(
+      jobId: jobId,
+      device: device,
+      dataSensitivity: sensitivity,
+      deviceCondition: DeviceCondition.functional,
+      disposalPath: disposalPath,
+      riskScore: riskResult.score,
+      targetCategory: riskResult.targetCategory,
+      recommendedMethod: recResult.method,
+      standardReference: recResult.standardReference,
+      explanationText: recResult.explanation,
+      shouldSimulateFailure: _simulateFailureMode,
+      overriddenMethod: overrideMethod,
+    );
+
+    _lastPolicyResult = _policyLayer.validateOperation(_currentJob!);
+    notifyListeners();
+
+    await runSanitizationPipeline();
   }
 
   Future<void> _checkForOrphansOnStartup() async {
@@ -67,6 +153,45 @@ class SanitizationController extends ChangeNotifier {
     _orphanResult = null;
     JobStateFile.clearActiveJob();
     notifyListeners();
+  }
+
+  DeviceProfile? attachOrphan() {
+    if (_orphanResult?.activeJobState != null) {
+      final active = _orphanResult!.activeJobState!;
+      DeviceProfile? targetDevice = _devices.cast<DeviceProfile?>().firstWhere(
+        (d) => d!.serialNumber == active.deviceSerial || d.id == active.devicePath || d.name == active.deviceName,
+        orElse: () => null,
+      );
+      targetDevice ??= DeviceProfile(
+        id: active.devicePath,
+        name: active.deviceName,
+        serialNumber: active.deviceSerial,
+        mediaType: MediaType.unknown,
+        busType: 'Unknown',
+        capacityBytes: 0,
+      );
+      _selectedDevice = targetDevice;
+      _currentJob = SanitizationJob(
+        jobId: active.jobId,
+        device: targetDevice,
+        dataSensitivity: DataSensitivity.confidential,
+        deviceCondition: DeviceCondition.functional,
+        disposalPath: DisposalPath.recycling,
+        riskScore: 50,
+        targetCategory: NistCategory.clear,
+        recommendedMethod: SanitizationMethod.singlePassOverwrite,
+        standardReference: 'NIST SP 800-88 Rev. 1 (Clear)',
+        explanationText: 'Observing in-progress sanitization pipeline',
+        status: JobStatus.sanitizing,
+        startTime: DateTime.tryParse(active.startedAt) ?? DateTime.now(),
+        progress: 0.5,
+        currentStageDescription: 'Observing in-progress wipe (attached to PID ${_orphanResult?.pid ?? "active"})...',
+      );
+      _orphanResult = null;
+      notifyListeners();
+      return targetDevice;
+    }
+    return null;
   }
 
   void clearCompletedJob() {
@@ -127,7 +252,10 @@ class SanitizationController extends ChangeNotifier {
     await refreshDevices();
   }
 
+  bool _isMockingDevices = false;
+
   Future<void> refreshDevices({bool silent = false}) async {
+    if (_isMockingDevices) return;
     final freshDevices = await _intelligenceService.discoverDevices(realMode: _isRealMode);
 
     // Check if device list changed
@@ -598,5 +726,33 @@ class SanitizationController extends ChangeNotifier {
   Future<Uint8List?> getPdfCertificateBytes() async {
     if (_completedCertificate == null) return null;
     return await _certificateService.generatePdfBytes(_completedCertificate!);
+  }
+
+  @visibleForTesting
+  void setMockDevices(List<DeviceProfile> devices) {
+    _isMockingDevices = true;
+    _devices = devices;
+    if (_devices.isNotEmpty) {
+      _selectedDevice = _devices.first;
+    }
+    notifyListeners();
+  }
+
+  @visibleForTesting
+  void setMockOrphanResult(OrphanCheckResult? result) {
+    _orphanResult = result;
+    notifyListeners();
+  }
+
+  @visibleForTesting
+  void setMockJob(SanitizationJob? job) {
+    _currentJob = job;
+    notifyListeners();
+  }
+
+  @visibleForTesting
+  void setMockCompletedCertificate(SanitizationCertificate? cert) {
+    _completedCertificate = cert;
+    notifyListeners();
   }
 }
