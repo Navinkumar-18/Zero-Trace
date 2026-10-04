@@ -174,6 +174,20 @@ class DeviceProfile {
     return id;
   }
 
+  /// Whether this device uses NAND flash memory (SSD, NVMe, USB flash, SD, eMMC).
+  bool get isFlashMedia =>
+      mediaType == MediaType.sataSsd ||
+      mediaType == MediaType.nvmeSsd ||
+      mediaType == MediaType.usbFlash ||
+      mediaType == MediaType.emmc ||
+      driveType == DriveType.usb ||
+      driveType == DriveType.sd ||
+      driveType == DriveType.ssd ||
+      driveType == DriveType.nvme;
+
+  /// Whether this device is a rotational magnetic hard drive (HDD).
+  bool get isRotational => mediaType == MediaType.hdd || (rotationalRpm != null && rotationalRpm! > 0);
+
   /// Whether this device is selectable in Simple Mode.
   /// Returns null if selectable, or a human-readable reason if disabled.
   String? get simpleDisabledReason {

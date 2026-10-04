@@ -6,7 +6,9 @@
 /// All output is advisory and must pass through the policy layer before any action.
 library;
 
+import '../models/assistant_context.dart';
 import '../models/device_profile.dart';
+import '../models/sanitization_error_code.dart';
 
 class AiContext {
   final String? mediaType;
@@ -35,6 +37,8 @@ class AiResponse {
   final String? riskLevel;
   final List<String> warnings;
   final String? researchBasis;
+  final String? targetSummary;
+  final bool isSimulated;
 
   const AiResponse({
     required this.answer,
@@ -43,77 +47,160 @@ class AiResponse {
     this.riskLevel,
     this.warnings = const [],
     this.researchBasis,
+    this.targetSummary,
+    this.isSimulated = false,
   });
 }
 
 class AiService {
-  /// Process a user question with optional device context.
+  /// Explain an error code using structured root cause and next steps.
+  AiResponse explainError(SanitizationErrorCode code, {AssistantContext? context}) {
+    final explanation = code.explain(
+      platform: context?.platform ?? 'Linux',
+      jobStarted: context?.jobStarted ?? false,
+      isSimulated: context?.isSimulated ?? false,
+    );
+
+    final warnings = <String>[];
+    if (explanation.dataMayRemain) {
+      warnings.add('Data may remain or be partially wiped on the device.');
+    }
+    if (context?.isSimulated == true || explanation.isSimulated) {
+      warnings.add('[SIMULATION MODE] No data was actually written or erased; nothing was actually erased.');
+    }
+
+    return AiResponse(
+      answer: explanation.toFormattedText(),
+      reason: explanation.rootCause,
+      riskLevel: explanation.dataMayRemain ? 'HIGH' : 'LOW',
+      warnings: warnings,
+      isSimulated: context?.isSimulated ?? explanation.isSimulated,
+      targetSummary: context?.targetSummary,
+    );
+  }
+
+  /// Process a user question with optional context or device profile.
   /// Returns a structured advisory response.
   ///
-  /// SAFETY: This method NEVER generates executable commands.
-  AiResponse processQuery(String question, {DeviceProfile? device}) {
+  /// SAFETY: This method NEVER generates executable commands or mutates state.
+  AiResponse processQuery(
+    String question, {
+    AssistantContext? context,
+    DeviceProfile? device,
+  }) {
     final q = question.toLowerCase().trim();
 
-    // Pattern-match common questions
-    if (q.contains('overwrite') && (q.contains('ssd') || q.contains('flash') || q.contains('nvme'))) {
-      return _ssdOverwriteResponse(device);
+    // Resolve effective device
+    final effectiveDevice = device ??
+        (context?.hasDevice == true
+            ? DeviceProfile(
+                id: 'context_device',
+                name: context!.deviceName!,
+                serialNumber: 'CONTEXT',
+                mediaType: context.mediaType ??
+                    (context.isFlash
+                        ? MediaType.nvmeSsd
+                        : context.isRotational
+                            ? MediaType.hdd
+                            : MediaType.unknown),
+                busType: context.busType ?? 'Unknown',
+                capacityBytes: context.sizeBytes ?? 0,
+                supportsNvmeSanitize: context.mediaType == MediaType.nvmeSsd,
+                supportsAtaSanitize: context.mediaType == MediaType.sataSsd,
+                supportsAtaSecureErase: context.isRotational,
+                supportsEmmcSanitize: context.mediaType == MediaType.emmc,
+                hpaDcoPresent: context.hasHpaDco,
+              )
+            : null);
+
+    AiResponse response;
+
+    // 1. Error and failure queries
+    if (q.contains('explain this error') ||
+        q.contains('why did the sanitization fail') ||
+        q.contains('what should i do after this error')) {
+      final code = context?.lastErrorCode ?? SanitizationErrorCode.unknown;
+      response = explainError(code, context: context);
+    } else if (q.contains('why did verification fail') || (q.contains('verification') && q.contains('fail'))) {
+      response = _verificationFailureResponse();
+    } else if (q.contains('cryptographic signature prove') || (q.contains('signature') && q.contains('prove'))) {
+      response = _signatureExplanation();
+    } else if (q.contains('security frozen')) {
+      response = _securityFrozenResponse();
+    } else if (q.contains('how does overwrite work for hdd') || (q.contains('overwrite') && q.contains('hdd'))) {
+      response = _hddOverwriteResponse(effectiveDevice);
+    } else if (q.contains('overwrite') && (q.contains('ssd') || q.contains('flash') || q.contains('nvme'))) {
+      response = _ssdOverwriteResponse(effectiveDevice);
+    } else if (q.contains('recommend') || q.contains('which method') || q.contains('what method')) {
+      response = _recommendMethodResponse(effectiveDevice);
+    } else if (q.contains('high risk') || (q.contains('why') && q.contains('risk'))) {
+      response = _riskExplanationResponse(effectiveDevice);
+    } else if (q.contains('cryptographic erase') || q.contains('crypto erase')) {
+      response = _cryptoEraseExplanation();
+    } else if (q.contains('certificate') || (q.contains('explain') && q.contains('cert'))) {
+      response = _certificateExplanation();
+    } else if (q.contains('nist') || q.contains('800-88')) {
+      response = _nistExplanation();
+    } else if (q.contains('pales') || q.contains('ftl') || q.contains('flash translation')) {
+      response = _palesExplanation();
+    } else if (q.contains('clear') && q.contains('purge')) {
+      response = _clearVsPurgeExplanation();
+    } else if (q.contains('destroy') || q.contains('physical destruction')) {
+      response = _destroyExplanation();
+    } else if (q.contains('hpa') || q.contains('dco') || q.contains('hidden')) {
+      response = _hpaDcoExplanation();
+    } else if (q.contains('wear level') || q.contains('garbage collection') || q.contains('spare block')) {
+      response = _flashInternalsExplanation();
+    } else {
+      // Generic fallback
+      response = const AiResponse(
+        answer: 'I can help with questions about storage sanitization methods, '
+            'risk assessment, verification procedures, NIST standards, and device capabilities. '
+            'Try asking about specific topics like "Why is overwrite not recommended for SSDs?" '
+            'or "What does cryptographic erase mean?"',
+        warnings: [
+          'AI responses are advisory only.',
+          'All sanitization operations require explicit user confirmation and policy validation.',
+        ],
+      );
     }
 
-    if (q.contains('recommend') || q.contains('which method') || q.contains('what method')) {
-      return _recommendMethodResponse(device);
+    // Apply simulation disclaimer if isSimulated is true (Amendment 7)
+    if (context?.isSimulated == true) {
+      final simWarnings = List<String>.from(response.warnings);
+      if (!simWarnings.any((w) => w.contains('[SIMULATION MODE]'))) {
+        simWarnings.add('[SIMULATION MODE] No physical storage was modified; nothing was actually erased.');
+      }
+      final simAnswer = response.answer.contains('[SIMULATION MODE]')
+          ? response.answer
+          : '${response.answer}\n\n*[SIMULATION MODE] Note: No physical storage was modified; nothing was actually erased during simulation.*';
+
+      return AiResponse(
+        answer: simAnswer,
+        recommendedMethod: response.recommendedMethod,
+        reason: response.reason,
+        riskLevel: response.riskLevel,
+        warnings: simWarnings,
+        researchBasis: response.researchBasis,
+        targetSummary: context?.targetSummary,
+        isSimulated: true,
+      );
     }
 
-    if (q.contains('high risk') || q.contains('why') && q.contains('risk')) {
-      return _riskExplanationResponse(device);
+    if (context?.targetSummary != null) {
+      return AiResponse(
+        answer: response.answer,
+        recommendedMethod: response.recommendedMethod,
+        reason: response.reason,
+        riskLevel: response.riskLevel,
+        warnings: response.warnings,
+        researchBasis: response.researchBasis,
+        targetSummary: context?.targetSummary,
+        isSimulated: false,
+      );
     }
 
-    if (q.contains('verification') && q.contains('fail')) {
-      return _verificationFailureResponse();
-    }
-
-    if (q.contains('cryptographic erase') || q.contains('crypto erase')) {
-      return _cryptoEraseExplanation();
-    }
-
-    if (q.contains('certificate') || q.contains('explain') && q.contains('cert')) {
-      return _certificateExplanation();
-    }
-
-    if (q.contains('nist') || q.contains('800-88')) {
-      return _nistExplanation();
-    }
-
-    if (q.contains('pales') || q.contains('ftl') || q.contains('flash translation')) {
-      return _palesExplanation();
-    }
-
-    if (q.contains('clear') && q.contains('purge')) {
-      return _clearVsPurgeExplanation();
-    }
-
-    if (q.contains('destroy') || q.contains('physical destruction')) {
-      return _destroyExplanation();
-    }
-
-    if (q.contains('hpa') || q.contains('dco') || q.contains('hidden')) {
-      return _hpaDcoExplanation();
-    }
-
-    if (q.contains('wear level') || q.contains('garbage collection') || q.contains('spare block')) {
-      return _flashInternalsExplanation();
-    }
-
-    // Generic fallback
-    return AiResponse(
-      answer: 'I can help with questions about storage sanitization methods, '
-          'risk assessment, verification procedures, NIST standards, and device capabilities. '
-          'Try asking about specific topics like "Why is overwrite not recommended for SSDs?" '
-          'or "What does cryptographic erase mean?"',
-      warnings: [
-        'AI responses are advisory only.',
-        'All sanitization operations require explicit user confirmation and policy validation.',
-      ],
-    );
+    return response;
   }
 
   AiResponse _ssdOverwriteResponse(DeviceProfile? device) {
@@ -151,6 +238,55 @@ class AiService {
     );
   }
 
+  AiResponse _hddOverwriteResponse(DeviceProfile? device) {
+    final name = device != null ? ' for ${device.name}' : '';
+    return AiResponse(
+      answer: 'For magnetic hard disk drives (HDDs)$name, logical overwriting writes zeros or patterns across addressable Logical Block Addresses (LBAs).\n\n'
+          '**NIST SP 800-88 Rev. 2 Assurance:**\n'
+          '• **Clear Level**: A full-disk single-pass overwrite satisfies NIST Clear requirements. It protects against simple, non-invasive software data recovery attempts on magnetic media.\n'
+          '• **Limitations**: Logical overwriting only reaches addressable sectors. It cannot overwrite bad or reallocated sectors retired by the disk controller, or hidden HPA/DCO sectors.\n'
+          '• **Purge Requirement**: For magnetic media containing confidential data leaving organizational control, firmware ATA Secure Erase or physical destruction is required to achieve Purge assurance.',
+      recommendedMethod: device?.supportsAtaSecureErase == true
+          ? 'ATA Secure Erase (Purge)'
+          : 'Single-Pass Zero Overwrite (Clear)',
+      reason: 'Logical overwrite provides Clear-level assurance on magnetic media; reallocated sectors remain unaddressed without firmware commands.',
+      riskLevel: 'MEDIUM',
+      warnings: [
+        'Overwriting magnetic media achieves NIST Clear level, not guaranteed physical destruction.',
+        'Retired and reallocated bad sectors may still contain remnant data.',
+      ],
+      researchBasis: 'NIST SP 800-88 Rev. 2 Table A-1: Magnetic Media Sanitization',
+    );
+  }
+
+  AiResponse _securityFrozenResponse() {
+    return const AiResponse(
+      answer: 'A "Security Frozen" state indicates that your computer BIOS/UEFI locked the drive\'s ATA security registers during system boot.\n\n'
+          '**Why the BIOS freezes the drive:**\n'
+          'This is a standard PC motherboard security measure designed to prevent rogue software or malware from setting a hardware lock password on your hard drive.\n\n'
+          '**How to resolve:**\n'
+          '• **External USB drives**: Unplug the USB cable and reconnect it. Power-cycling resets the drive controller and clears the freeze lock.\n'
+          '• **Internal drives**: Put the computer to sleep/suspend for a few seconds and wake it up, or reboot into BIOS/UEFI to review storage security settings.',
+      reason: 'BIOS freeze lock blocks hardware sanitize commands until power-cycled.',
+      riskLevel: 'LOW',
+      warnings: [
+        'Hardware sanitize and ATA Secure Erase cannot proceed while the drive is in a frozen state.',
+      ],
+    );
+  }
+
+  AiResponse _signatureExplanation() {
+    return const AiResponse(
+      answer: 'The cryptographic digital signature on a Zero Trace certificate provides mathematical proof of certificate authenticity and tamper-resistance.\n\n'
+          '**What it proves:**\n'
+          '• **Origin Authenticity**: The certificate was generated and signed by the Zero Trace engine using an asymmetric cryptographic key (Ed25519 or ECDSA P-256).\n'
+          '• **Tamper Detection**: If any field in the certificate (serial number, timestamp, method, or verification results) is modified, the signature check fails immediately.\n\n'
+          '**What it does NOT prove:**\n'
+          'A signature proves that the recorded evidence has not been tampered with since issuance. It does not physically guarantee that data cannot be recovered by laboratory techniques if an inadequate method was used.',
+      researchBasis: 'Zero Trace Cryptographic Proof System / RFC 8032 Ed25519',
+    );
+  }
+
   AiResponse _recommendMethodResponse(DeviceProfile? device) {
     if (device == null) {
       return const AiResponse(
@@ -167,7 +303,7 @@ class AiService {
       method = device.supportsAtaSecureErase
           ? 'ATA Secure Erase'
           : 'Single-Pass Zero Overwrite';
-      reason = 'Magnetic platter HDDs are effectively sanitized via ${device.supportsAtaSecureErase ? "controller-level ATA Secure Erase which covers reallocated sectors" : "full LBA zero-fill overwrite across all addressable sectors"}.';
+      reason = 'Magnetic platter HDDs are effectively sanitized via ${device.supportsAtaSecureErase ? "controller-level ATA Secure Erase which covers reallocated sectors (Purge level)" : "full LBA zero-fill overwrite across all addressable sectors (achieving NIST Clear level)"}.';
     } else if (device.mediaType == MediaType.nvmeSsd) {
       method = device.supportsNvmeSanitize
           ? 'NVMe Sanitize'
@@ -242,15 +378,15 @@ class AiService {
   AiResponse _verificationFailureResponse() {
     return const AiResponse(
       answer: 'Verification can fail for several reasons:\n\n'
-          '• **Controller timeout**: The device did not respond within the expected timeframe.\n'
-          '• **Non-zero data detected**: Sample readback found non-zero bytes at sampled LBA offsets.\n'
-          '• **Device disconnection**: The device was removed during the operation.\n'
-          '• **Permission denied**: Insufficient privileges to read device sectors.\n\n'
-          'A failed verification means the sanitization assurance level is insufficient. '
-          'The device should be re-evaluated and potentially flagged for physical destruction.',
+          '• **Dirty or non-zero sectors**: Sector readback found residual non-zero bytes at sampled LBA offsets.\n'
+          '• **Controller timeout**: The device did not respond within the expected timeframe during sampling.\n'
+          '• **Device disconnection**: The device was removed or lost power during readback.\n'
+          '• **I/O Read error**: Bad physical blocks prevented reading sampled sectors.\n\n'
+          'A failed verification means sanitization assurance was not achieved. '
+          'Data may remain on the disk. Re-evaluate the drive or flag it for physical destruction.',
       riskLevel: 'CRITICAL',
       warnings: [
-        'Failed verification does NOT mean data is accessible — it means assurance is insufficient.',
+        'Failed verification means sanitization assurance is insufficient. Data may remain.',
         'Consider physical destruction for failed devices handling sensitive data.',
       ],
     );
@@ -287,12 +423,12 @@ class AiService {
           '• Execution timestamps\n'
           '• Verification evidence (sector sample readback results)\n'
           '• Master evidence SHA-256 hash\n'
-          '• ECDSA P-256 digital signature\n\n'
+          '• Ed25519 or ECDSA digital signature\n\n'
           '**What the hash proves:**\n'
           'The SHA-256 hash protects the integrity of the evidence record. '
           'It does NOT prove physical erasure — it proves the certificate data has not been modified.\n\n'
           '**What the signature proves:**\n'
-          'The ECDSA signature proves the certificate was issued by Zero Trace software '
+          'The digital signature proves the certificate was issued by Zero Trace '
           'and has not been tampered with since issuance.',
       warnings: [
         'The certificate records what was observed, not absolute physical state.',
@@ -304,10 +440,10 @@ class AiService {
   AiResponse _nistExplanation() {
     return const AiResponse(
       answer: 'NIST Special Publication 800-88 Revision 2 defines media sanitization '
-          'guidance for federal information systems.\n\n'
+          'guidance for information systems.\n\n'
           '**Sanitization Categories:**\n\n'
           '• **CLEAR** — Logical techniques that protect against simple, non-invasive '
-          'data recovery (e.g., overwrite). Appropriate for low-sensitivity data or internal reuse.\n\n'
+          'data recovery (e.g., overwrite). Appropriate for internal reuse or low-sensitivity data.\n\n'
           '• **PURGE** — Physical or logical techniques that render data recovery infeasible '
           'using state-of-the-art laboratory techniques (e.g., device-level sanitize commands, '
           'cryptographic erase). Required for confidential data leaving organizational control.\n\n'
@@ -370,10 +506,10 @@ class AiService {
           '• **Pulverization**: Mechanical crushing to destroy platters or NAND chips.\n'
           '• **Chemical dissolution**: For specialized scenarios.\n\n'
           '**When to use DESTROY:**\n'
-          '• Highest classification data (restricted, top secret).\n'
-          '• Device has no verified sanitization mechanism.\n'
-          '• Device is degraded or non-functional (cannot execute sanitize commands).\n'
-          '• Regulatory or policy requirement mandates physical destruction.\n\n'
+          '• Highest classification data (restricted, confidential leaving organization).\n'
+          '• Device has no verified sanitization mechanism or failed verification.\n'
+          '• Flash storage (USB/SD/SSD) leaving organizational control where purge is unavailable.\n'
+          '• Device is degraded or non-functional (cannot execute sanitize commands).\n\n'
           '**Zero Trace role:**\n'
           'Zero Trace flags devices for destruction when software sanitization cannot '
           'provide sufficient assurance. The application does not perform physical destruction.',
