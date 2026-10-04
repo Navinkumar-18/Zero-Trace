@@ -26,6 +26,7 @@ class AssistantContext {
   final String? formattedSize;
   final SanitizationSupportLevel? supportLevel;
 
+  final MediaTechnology mediaTechnology;
   final bool isRotational;
   final bool isFlash;
   final bool isRemovable;
@@ -70,6 +71,7 @@ class AssistantContext {
     this.sizeBytes,
     this.formattedSize,
     this.supportLevel,
+    this.mediaTechnology = MediaTechnology.unknown,
     this.isRotational = false,
     this.isFlash = false,
     this.isRemovable = false,

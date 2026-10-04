@@ -102,6 +102,7 @@ class AssistantContextBuilder {
       sizeBytes: device?.capacityBytes,
       formattedSize: device?.formattedCapacity,
       supportLevel: device != null ? computeSupportLevel(device) : null,
+      mediaTechnology: device?.mediaTechnology ?? MediaTechnology.unknown,
       isRotational: device?.isRotational ?? false,
       isFlash: device?.isFlashMedia ?? false,
       isRemovable: device?.isRemovable ?? false,

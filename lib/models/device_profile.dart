@@ -18,6 +18,13 @@ enum DriveType {
   unknown,
 }
 
+/// Tri-state storage media technology classification.
+enum MediaTechnology {
+  flash,
+  rotational,
+  unknown,
+}
+
 extension DriveTypeExtension on DriveType {
   String get label {
     switch (this) {
@@ -174,29 +181,79 @@ class DeviceProfile {
     return id;
   }
 
+  /// Tri-state storage media technology (flash, rotational, or unknown).
+  MediaTechnology get mediaTechnology {
+    final hasPositiveRpm = rotationalRpm != null && rotationalRpm! > 0;
+    final isExplicitFlash = mediaType == MediaType.nvmeSsd ||
+        mediaType == MediaType.sataSsd ||
+        mediaType == MediaType.emmc ||
+        mediaType == MediaType.usbFlash ||
+        driveType == DriveType.sd ||
+        driveType == DriveType.nvme ||
+        driveType == DriveType.ssd;
+
+    final isExplicitHdd = mediaType == MediaType.hdd || driveType == DriveType.hdd;
+
+    // Conflicting signals
+    // 1) Positive RPM reported alongside explicit flash media
+    if (hasPositiveRpm && isExplicitFlash) {
+      return MediaTechnology.unknown;
+    }
+    // 2) Explicit HDD reported with explicit flash media or bus
+    if (isExplicitHdd &&
+        (driveType == DriveType.nvme ||
+            driveType == DriveType.sd ||
+            mediaType == MediaType.nvmeSsd ||
+            mediaType == MediaType.emmc)) {
+      return MediaTechnology.unknown;
+    }
+    // 3) Contradictory: reported as HDD but RPM is explicitly 0 (not rotational)
+    if (mediaType == MediaType.hdd && rotationalRpm == 0) {
+      return MediaTechnology.unknown;
+    }
+
+    // Positive RPM decides rotational (USB HDD, SATA HDD, etc.)
+    if (hasPositiveRpm) {
+      return MediaTechnology.rotational;
+    }
+
+    // If reported as HDD but no positive RPM (null or 0):
+    // "Remove the 'reported as HDD but RPM 0' case. NVMe, SD, eMMC = flash; positive RPM = rotational;
+    //  USB or SATA with unknown media and no RPM = unknown"
+    if (mediaType == MediaType.hdd) {
+      return MediaTechnology.unknown;
+    }
+
+    // Explicit flash media or dedicated flash buses
+    // NVMe, SD, eMMC = flash
+    if (mediaType == MediaType.nvmeSsd ||
+        mediaType == MediaType.emmc ||
+        mediaType == MediaType.usbFlash ||
+        mediaType == MediaType.sataSsd ||
+        driveType == DriveType.sd ||
+        driveType == DriveType.nvme ||
+        driveType == DriveType.ssd) {
+      return MediaTechnology.flash;
+    }
+
+    // USB or SATA with unknown media and no RPM = unknown
+    // (cautious Clear-only wording, no flash or HDD claims)
+    return MediaTechnology.unknown;
+  }
+
   /// Whether this device uses NAND flash memory (SSD, NVMe, USB flash, SD, eMMC).
-  bool get isFlashMedia =>
-      mediaType == MediaType.sataSsd ||
-      mediaType == MediaType.nvmeSsd ||
-      mediaType == MediaType.usbFlash ||
-      mediaType == MediaType.emmc ||
-      driveType == DriveType.usb ||
-      driveType == DriveType.sd ||
-      driveType == DriveType.ssd ||
-      driveType == DriveType.nvme;
+  bool get isFlashMedia => mediaTechnology == MediaTechnology.flash;
 
   /// Whether this device is a rotational magnetic hard drive (HDD).
-  bool get isRotational => mediaType == MediaType.hdd || (rotationalRpm != null && rotationalRpm! > 0);
+  bool get isRotational => mediaTechnology == MediaTechnology.rotational;
 
   /// Whether this device is selectable in Simple Mode.
   /// Returns null if selectable, or a human-readable reason if disabled.
   String? get simpleDisabledReason {
     if (isSystemDisk) return 'System drive – protected';
     if (disabledReason != null) return disabledReason;
-    if (mediaType == MediaType.emmc && !isRemovable && !busType.toUpperCase().contains('SD')) {
-      return 'Internal eMMC storage – not supported';
-    }
-    if (driveType == DriveType.unknown || mediaType == MediaType.unknown) {
+    // Internal eMMC is NOT disabled by default (only if system drive or unsupported)
+    if (mediaType == MediaType.unknown || (driveType == DriveType.unknown && mediaType != MediaType.emmc)) {
       return 'Unknown or unsupported device type – cannot wipe safely';
     }
     return null;

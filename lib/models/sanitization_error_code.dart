@@ -132,7 +132,7 @@ enum SanitizationErrorCode {
         if (platform == 'Windows') {
           return 'Administrator permission required. Approve the User Account Control prompt.';
         } else if (platform == 'Android') {
-          return 'Root or Device Administrator permission required.';
+          return 'USB permission required. Allow USB access when Android asks.';
         } else if (platform == 'Linux') {
           return 'Administrator permission required. Approve the elevation prompt (Polkit).';
         } else {
@@ -203,7 +203,7 @@ enum SanitizationErrorCode {
         if (platform == 'Windows') {
           nextStep = 'Approve the User Account Control (UAC) prompt or ensure your user account has administrative privileges.';
         } else if (platform == 'Android') {
-          nextStep = 'Root or Device Administrator permission required to perform direct storage operations.';
+          nextStep = 'USB permission required. Allow USB access when Android asks.';
         } else if (platform == 'Linux') {
           nextStep = 'Approve the administrator authorization prompt (Polkit) or ensure your account has direct storage device access privileges.';
         } else {

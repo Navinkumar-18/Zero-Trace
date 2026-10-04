@@ -40,6 +40,7 @@ class AiResponse {
   final String? targetSummary;
   final bool isSimulated;
   final bool isFallback;
+  final String handlerId;
 
   const AiResponse({
     required this.answer,
@@ -51,6 +52,7 @@ class AiResponse {
     this.targetSummary,
     this.isSimulated = false,
     this.isFallback = false,
+    this.handlerId = 'fallback',
   });
 }
 
@@ -78,6 +80,7 @@ class AiService {
       warnings: warnings,
       isSimulated: context?.isSimulated ?? explanation.isSimulated,
       targetSummary: context?.targetSummary,
+      handlerId: 'error_explanation',
     );
   }
 
@@ -165,6 +168,7 @@ class AiService {
           'All sanitization operations require explicit user confirmation and policy validation.',
         ],
         isFallback: true,
+        handlerId: 'fallback',
       );
     }
 
@@ -188,6 +192,7 @@ class AiService {
         targetSummary: context?.targetSummary,
         isSimulated: true,
         isFallback: response.isFallback,
+        handlerId: response.handlerId,
       );
     }
 
@@ -202,6 +207,7 @@ class AiService {
         targetSummary: context?.targetSummary,
         isSimulated: false,
         isFallback: response.isFallback,
+        handlerId: response.handlerId,
       );
     }
 
@@ -240,6 +246,7 @@ class AiService {
       researchBasis: 'PALES research (SSD secure deletion via page group management) '
           'demonstrates that SSD internal architecture fundamentally differs from HDD. '
           'NIST SP 800-88 Rev. 2 recommends device-supported mechanisms for flash media.',
+      handlerId: 'ssd_overwrite',
     );
   }
 
@@ -261,6 +268,7 @@ class AiService {
         'Retired and reallocated bad sectors may still contain remnant data.',
       ],
       researchBasis: 'NIST SP 800-88 Rev. 2 Table A-1: Magnetic Media Sanitization',
+      handlerId: 'hdd_overwrite',
     );
   }
 
@@ -277,6 +285,7 @@ class AiService {
       warnings: [
         'Hardware sanitize and ATA Secure Erase cannot proceed while the drive is in a frozen state.',
       ],
+      handlerId: 'security_frozen',
     );
   }
 
@@ -289,6 +298,7 @@ class AiService {
           '**What it does NOT prove:**\n'
           'A signature proves that the recorded evidence has not been tampered with since issuance. It does not physically guarantee that data cannot be recovered by laboratory techniques if an inadequate method was used.',
       researchBasis: 'Zero Trace Cryptographic Proof System / RFC 8032 Ed25519',
+      handlerId: 'signature_explanation',
     );
   }
 
@@ -298,6 +308,7 @@ class AiService {
         answer: 'Please select a device first so I can analyze its capabilities '
             'and recommend an appropriate sanitization method.',
         warnings: ['No device context provided.'],
+        handlerId: 'recommend_method',
       );
     }
 
@@ -344,6 +355,7 @@ class AiService {
         'This recommendation is advisory. Final method selection requires policy validation.',
         'AI does not execute sanitization operations.',
       ],
+      handlerId: 'recommend_method',
     );
   }
 
@@ -353,6 +365,7 @@ class AiService {
         answer: 'Risk level depends on media type, device capabilities, '
             'encryption state, data sensitivity, and intended disposal path. '
             'Select a device for a specific risk analysis.',
+        handlerId: 'risk_explanation',
       );
     }
 
@@ -377,6 +390,7 @@ class AiService {
       riskLevel: factors.length >= 3 ? 'CRITICAL' : factors.length >= 2 ? 'HIGH' : 'MEDIUM',
       warnings: factors,
       researchBasis: 'NIST SP 800-88 Rev. 2 defines risk-based media sanitization categories.',
+      handlerId: 'risk_explanation',
     );
   }
 
@@ -394,6 +408,7 @@ class AiService {
         'Failed verification means sanitization assurance is insufficient. Data may remain.',
         'Consider physical destruction for failed devices handling sensitive data.',
       ],
+      handlerId: 'verification_failure',
     );
   }
 
@@ -415,6 +430,7 @@ class AiService {
           '• Cannot be verified by reading sectors (encrypted data remains, key is gone).',
       recommendedMethod: 'Cryptographic Erase',
       researchBasis: 'NIST SP 800-88 Rev. 2 Purge / IEEE 2883:2022 Cryptographic Erase',
+      handlerId: 'crypto_erase',
     );
   }
 
@@ -439,6 +455,7 @@ class AiService {
         'The certificate records what was observed, not absolute physical state.',
         'Hash integrity ≠ physical erasure proof.',
       ],
+      handlerId: 'certificate_explanation',
     );
   }
 
@@ -457,6 +474,7 @@ class AiService {
           '• **Cryptographic Erase** — Destruction of encryption keys on self-encrypting devices. '
           'Can satisfy Purge requirements when properly implemented.',
       researchBasis: 'NIST SP 800-88 Rev. 2 / IEEE 2883:2022',
+      handlerId: 'nist_standards',
     );
   }
 
@@ -480,6 +498,7 @@ class AiService {
           'Device-supported sanitization commands that operate below the FTL are preferred.',
       researchBasis: 'PALES: Optimizing Secure Data Deletion in SSDs via Page Group and '
           'Reprogram Speedup',
+      handlerId: 'pales_research',
     );
   }
 
@@ -498,6 +517,7 @@ class AiService {
           '• Appropriate for: Confidential data, assets leaving organizational control.\n'
           '• Advantage: Operates at the controller/firmware level, addressing physical storage.',
       researchBasis: 'NIST SP 800-88 Rev. 2',
+      handlerId: 'clear_vs_purge',
     );
   }
 
@@ -519,6 +539,7 @@ class AiService {
           'Zero Trace flags devices for destruction when software sanitization cannot '
           'provide sufficient assurance. The application does not perform physical destruction.',
       riskLevel: 'CRITICAL',
+      handlerId: 'physical_destruction',
     );
   }
 
@@ -542,6 +563,7 @@ class AiService {
         'HPA/DCO regions are not addressed by standard overwrite.',
         'Device-level sanitize commands may or may not address HPA/DCO.',
       ],
+      handlerId: 'hpa_dco',
     );
   }
 
@@ -564,6 +586,7 @@ class AiService {
           'Additional capacity (typically 7-28% beyond advertised) reserved by the controller '
           'for performance and endurance management. Not accessible via standard I/O.',
       researchBasis: 'PALES research / General flash storage architecture',
+      handlerId: 'flash_internals',
     );
   }
 }
