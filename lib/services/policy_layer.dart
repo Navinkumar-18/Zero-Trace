@@ -70,6 +70,33 @@ class PolicyLayer {
       );
     }
 
+    // Safety Rule 4: Partition mode method allowlist & target protection
+    if (job.isPartitionScope) {
+      if (method != SanitizationMethod.singlePassOverwrite &&
+          method != SanitizationMethod.multiPassOverwrite) {
+        return PolicyValidationResult(
+          isAllowed: false,
+          policyMessage: 'POLICY VIOLATION: Partition mode only allows overwrite methods (Single-Pass Zero or 3-Pass Overwrite). Controller-level firmware erase cannot target a single partition.',
+        );
+      }
+
+      final part = job.targetPartition;
+      if (part != null) {
+        if (part.isProtected || part.isActiveSwap) {
+          return PolicyValidationResult(
+            isAllowed: false,
+            policyMessage: 'POLICY VIOLATION: Target partition (${part.name}) is protected (system mount, active swap, or live media).',
+          );
+        }
+        if (part.isMounted && !part.isMountAllowed) {
+          return PolicyValidationResult(
+            isAllowed: false,
+            policyMessage: 'POLICY VIOLATION: Target partition (${part.name}) has protected mount (${part.mountPoint}).',
+          );
+        }
+      }
+    }
+
     return PolicyValidationResult(
       isAllowed: true,
       policyMessage: 'POLICY PASSED: Method ${method.displayName} matches static execution whitelist.',

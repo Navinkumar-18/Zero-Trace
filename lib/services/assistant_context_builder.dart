@@ -94,6 +94,8 @@ class AssistantContextBuilder {
                     ? 'macOS'
                     : Platform.operatingSystem);
 
+    final partition = job?.targetPartition ?? controller.selectedPartition;
+
     return AssistantContext(
       deviceName: device != null ? UntrustedText(device.name) : null,
       driveType: device?.driveType,
@@ -124,6 +126,13 @@ class AssistantContextBuilder {
       certificateId: cert?.certificateId != null ? UntrustedText(cert!.certificateId) : null,
       isCertificateSimulated: cert?.executionMode == 'simulated',
       isSimulated: !controller.isRealMode,
+      isPartitionScope: partition != null,
+      partitionNumber: partition?.partitionNumber,
+      partitionLabel: partition?.label,
+      partitionFsType: partition?.fsType,
+      partitionSizeBytes: partition?.sizeBytes,
+      partitionFormattedSize: partition?.formattedSize,
+      totalDeviceSizeBytes: device?.capacityBytes,
       platform: currentPlatform,
     );
   }

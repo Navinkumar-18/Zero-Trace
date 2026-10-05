@@ -4,7 +4,10 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 
 import '../models/device_profile.dart';
+import '../models/partition_info.dart';
+import '../models/untrusted_text.dart';
 import 'device_simulator.dart';
+import 'partition_table_service.dart';
 import 'policy_layer.dart';
 
 class DeviceIntelligenceService {
@@ -40,12 +43,12 @@ class DeviceIntelligenceService {
     }
 
     try {
-      debugPrint('[DISCOVERY] Running: lsblk -J -b -o NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG,FSTYPE');
+      debugPrint('[DISCOVERY] Running: lsblk -J -b -o NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG,FSTYPE,LABEL,PARTUUID,START,PARTN');
       final result = await Process.run('lsblk', [
         '-J',
         '-b',
         '-o',
-        'NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG,FSTYPE'
+        'NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG,FSTYPE,LABEL,PARTUUID,START,PARTN'
       ]);
 
       if (result.exitCode != 0) {
@@ -114,17 +117,35 @@ class DeviceIntelligenceService {
           (mainMountPoint != null && mainMountPoint.isNotEmpty);
       String? detectedFsType = mainFsType;
 
+      final List<PartitionInfo> childPartitions = [];
+
       if (children != null && children.isNotEmpty) {
         for (final child in children) {
+          final childType = (child['type'] as String?)?.toLowerCase();
+          final childName = (child['name'] as String?)?.trim() ?? '';
           final mp = (child['mountpoint'] as String?)?.trim();
           final childFs = (child['fstype'] as String?)?.trim();
+          final childSize = (child['size'] as num?)?.toInt() ?? 0;
+          final childStart = (child['start'] as num?)?.toInt() ?? 0;
+          final childPartn = (child['partn'] as num?)?.toInt() ?? _extractPartNumber(childName);
+          final rawLabel = (child['label'] as String?)?.trim() ?? '';
+          final childPartUuid = (child['partuuid'] as String?)?.trim();
+
+          final bool isMounted = mp != null && mp.isNotEmpty;
+          final bool isMountAllowed = isMounted && PolicyLayer.isMountUnmountable(mp);
+          final bool isLive = mp != null && _isLiveMediaMount(mp);
+          final bool isProtected = isLive ||
+              (isMounted && !PolicyLayer.isMountUnmountable(mp)) ||
+              childFs == 'swap';
+          final bool isActiveSwap = childFs == 'swap';
+
           if (mp != null && mp.isNotEmpty) {
             // Phase 1 boot-guard: detect live-USB/live-media mounts
-            if (_isLiveMediaMount(mp)) {
+            if (isLive) {
               isLiveMedia = true;
               isSys = true;
               systemMountPoint = mp;
-            } else if (!PolicyLayer.isMountUnmountable(mp)) {
+            } else if (!isMountAllowed) {
               isSys = true;
               systemMountPoint = mp;
             }
@@ -133,11 +154,34 @@ class DeviceIntelligenceService {
             isSys = true;
             systemMountPoint = '[SWAP]';
           }
-          if ((childFs != null && childFs.isNotEmpty) || (mp != null && mp.isNotEmpty)) {
+          if ((childFs != null && childFs.isNotEmpty) || isMounted) {
             hasFilesystem = true;
             if (childFs != null && childFs.isNotEmpty && (detectedFsType == null || detectedFsType.isEmpty)) {
               detectedFsType = childFs;
             }
+          }
+
+          // Build PartitionInfo if child represents a partition or disk slice
+          if (childName.isNotEmpty && (childType == null || childType == 'part' || childType.isEmpty)) {
+            final devPath = childName.startsWith('/') ? childName : '/dev/$childName';
+            final sizeSectors = childSize ~/ 512;
+
+            childPartitions.add(PartitionInfo(
+              partitionNumber: childPartn,
+              name: childName,
+              devicePath: devPath,
+              startSector: childStart,
+              sizeSectors: sizeSectors,
+              sizeBytes: childSize,
+              label: UntrustedText(rawLabel),
+              partUuid: (childPartUuid != null && childPartUuid.isNotEmpty) ? childPartUuid : null,
+              fsType: (childFs != null && childFs.isNotEmpty) ? childFs : null,
+              mountPoint: (mp != null && mp.isNotEmpty) ? mp : null,
+              isMounted: isMounted,
+              isMountAllowed: isMountAllowed,
+              isProtected: isProtected,
+              isActiveSwap: isActiveSwap,
+            ));
           }
         }
       }
@@ -167,6 +211,10 @@ class DeviceIntelligenceService {
           ? tran
           : (isRm || isHotplug ? 'USB / Removable' : 'SATA/PCIe');
 
+      final tableFingerprint = childPartitions.isNotEmpty
+          ? PartitionTableService.computeFingerprint(childPartitions)
+          : null;
+
       detectedProfiles.add(
         DeviceProfile(
           id: 'real_$rawName',
@@ -190,6 +238,8 @@ class DeviceIntelligenceService {
           isWipedNoFilesystem: isWipedNoFilesystem,
           isRemovable: removable,
           disabledReason: unsupportedReason,
+          partitions: childPartitions,
+          partitionTableFingerprint: tableFingerprint,
           notes: isWipedNoFilesystem
               ? 'SANITIZED / NO FILESYSTEM (Raw Block Device)'
               : (isLiveMedia
@@ -203,8 +253,8 @@ class DeviceIntelligenceService {
       );
     }
 
-      return detectedProfiles;
-    }
+    return detectedProfiles;
+  }
 
   /// Check for live-media mount paths (Phase 1 boot-guard matching).
   static bool _isLiveMediaMount(String mountPoint) {
@@ -215,4 +265,13 @@ class DeviceIntelligenceService {
         mp.contains('/live/medium') ||
         mp.contains('/casper/');
   }
+
+  /// Extracts trailing integer digits from a partition name (e.g. "sda1" -> 1, "nvme0n1p2" -> 2).
+  static int _extractPartNumber(String name) {
+    final match = RegExp(r'(\d+)$').firstMatch(name);
+    if (match != null) {
+      return int.tryParse(match.group(1)!) ?? 1;
+    }
+    return 1;
   }
+}

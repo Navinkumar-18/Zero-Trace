@@ -2,7 +2,9 @@ import 'dart:convert';
 import 'dart:io';
 
 import '../models/device_profile.dart';
+import '../models/partition_info.dart';
 import '../models/sanitization_job.dart';
+import 'partition_table_service.dart';
 
 class RealExecutionReport {
   final bool success;
@@ -15,6 +17,9 @@ class RealExecutionReport {
   final bool dryRun;
   final int bytesWritten;
   final String ioMode;
+  final String? scope;
+  final int? targetPartition;
+  final String? limitation;
 
   RealExecutionReport({
     required this.success,
@@ -27,6 +32,9 @@ class RealExecutionReport {
     required this.dryRun,
     this.bytesWritten = 0,
     this.ioMode = '',
+    this.scope,
+    this.targetPartition,
+    this.limitation,
   });
 
   factory RealExecutionReport.fromJson(Map<String, dynamic> json) {
@@ -41,6 +49,9 @@ class RealExecutionReport {
       dryRun: json['dry_run'] as bool? ?? false,
       bytesWritten: (json['bytes_written'] as num? ?? 0).toInt(),
       ioMode: json['io_mode'] as String? ?? '',
+      scope: json['scope'] as String?,
+      targetPartition: (json['target_partition'] as num?)?.toInt(),
+      limitation: json['limitation'] as String?,
     );
   }
 }
@@ -91,6 +102,10 @@ class RealVerificationReport {
   final double entropyScore;
   final String fingerprintHash;
   final int rngSeed;
+  final int? totalDeviceSize;
+  final int? partitionSize;
+  final String? scope;
+  final String? limitation;
 
   RealVerificationReport({
     required this.pass,
@@ -99,6 +114,10 @@ class RealVerificationReport {
     required this.entropyScore,
     required this.fingerprintHash,
     required this.rngSeed,
+    this.totalDeviceSize,
+    this.partitionSize,
+    this.scope,
+    this.limitation,
   });
 
   factory RealVerificationReport.fromJson(Map<String, dynamic> json) {
@@ -109,6 +128,10 @@ class RealVerificationReport {
       entropyScore: (json['entropy_score'] as num? ?? 0.0).toDouble(),
       fingerprintHash: json['fingerprint_hash'] as String? ?? '',
       rngSeed: json['rng_seed'] as int? ?? 0,
+      totalDeviceSize: (json['total_device_size'] as num?)?.toInt(),
+      partitionSize: (json['partition_size'] as num?)?.toInt(),
+      scope: json['scope'] as String?,
+      limitation: json['limitation'] as String?,
     );
   }
 }
@@ -208,6 +231,7 @@ class RealSanitizationService {
     required SanitizationMethod method,
     required String confirmationToken,
     required String deviceSerial,
+    PartitionInfo? targetPartition,
     bool dryRun = false,
     String? psid,
     required Function(RealProgressEvent) onProgress,
@@ -216,10 +240,12 @@ class RealSanitizationService {
     final binary = await getBinaryPath();
     final cliMethod = mapMethodToCliArg(method, device);
     
-    // Map device name to a linux path (e.g. /dev/sdb).
-    String devPath = device.id.startsWith('real_') 
-        ? '/dev/${device.id.substring(5)}' 
-        : '/dev/null'; // safe fallback for simulator/dry run
+    // Map device or partition name to a linux path (e.g. /dev/sdb or /dev/sdb1).
+    final String devPath = targetPartition != null
+        ? targetPartition.devicePath
+        : (device.id.startsWith('real_') 
+            ? '/dev/${device.id.substring(5)}' 
+            : '/dev/null'); // safe fallback for simulator/dry run
 
     final List<String> args = [
       'sanitize',
@@ -235,6 +261,25 @@ class RealSanitizationService {
     if (psid != null && psid.isNotEmpty) {
       args.add('--psid');
       args.add(psid);
+    }
+    if (targetPartition != null) {
+      final fingerprint = device.partitionTableFingerprint ??
+          PartitionTableService.computeFingerprint(device.partitions);
+      args.addAll([
+        '--mode',
+        'partition',
+        '--expected-part-num',
+        targetPartition.partitionNumber.toString(),
+        '--expected-start-sector',
+        targetPartition.startSector.toString(),
+        '--expected-size-sectors',
+        targetPartition.sizeSectors.toString(),
+        '--expected-table-fingerprint',
+        fingerprint,
+      ]);
+      if (targetPartition.partUuid != null && targetPartition.partUuid!.isNotEmpty) {
+        args.addAll(['--expected-partuuid', targetPartition.partUuid!]);
+      }
     }
 
     onRawLog('EXECUTION: Launching $binary ${args.join(' ')}');
@@ -308,23 +353,33 @@ class RealSanitizationService {
     required DeviceProfile device,
     required String method,
     required String deviceSerial,
+    PartitionInfo? targetPartition,
     int sampleCount = 50,
     bool expectZeros = true,
   }) async {
     final binary = await getBinaryPath();
-    String devPath = device.id.startsWith('real_') 
-        ? '/dev/${device.id.substring(5)}' 
-        : '/dev/null';
+    final String devPath = targetPartition != null
+        ? targetPartition.devicePath
+        : (device.id.startsWith('real_') 
+            ? '/dev/${device.id.substring(5)}' 
+            : '/dev/null');
+    final String targetSize = targetPartition != null
+        ? targetPartition.sizeBytes.toString()
+        : device.capacityBytes.toString();
 
     final args = [
       'verify',
       devPath,
-      device.capacityBytes.toString(),
+      targetSize,
       deviceSerial,
       method,
       sampleCount.toString(),
       expectZeros.toString(),
     ];
+
+    if (targetPartition != null) {
+      args.addAll(['--total-device-size', device.capacityBytes.toString()]);
+    }
 
     final result = await Process.run(binary, args);
 

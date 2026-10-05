@@ -83,6 +83,11 @@ class CertificateService {
     String? sanitizationCategory,
     String? executionMode,
     String? warningLine,
+    String? scope,
+    String? limitation,
+    List<Map<String, dynamic>>? partitionsWiped,
+    int? bytesOverwritten,
+    int? totalDeviceBytes,
   }) {
     if (certVersion == 1) {
       return {
@@ -93,6 +98,26 @@ class CertificateService {
         'evidenceHash': evidenceHash,
         'result': result,
         'timestamp': timestamp,
+      };
+    }
+    if (certVersion == 3) {
+      return {
+        'certVersion': 3,
+        'certificateId': certificateId,
+        'jobId': jobId,
+        'deviceSerial': deviceSerial,
+        'method': method,
+        'sanitizationCategory': sanitizationCategory ?? 'Clear',
+        'executionMode': executionMode ?? 'simulated',
+        'scope': scope ?? 'partial',
+        'limitation': limitation ?? 'Partition wipe: partition table and unselected sectors are not overwritten',
+        if (partitionsWiped != null) 'partitionsWiped': partitionsWiped,
+        if (bytesOverwritten != null) 'bytesOverwritten': bytesOverwritten,
+        if (totalDeviceBytes != null) 'totalDeviceBytes': totalDeviceBytes,
+        'evidenceHash': evidenceHash,
+        'result': result,
+        'timestamp': timestamp,
+        if (warningLine != null) 'warningLine': warningLine,
       };
     }
     return {
@@ -106,7 +131,7 @@ class CertificateService {
       'evidenceHash': evidenceHash,
       'result': result,
       'timestamp': timestamp,
-      'warningLine': ?warningLine,
+      if (warningLine != null) 'warningLine': warningLine,
     };
   }
 
@@ -224,8 +249,26 @@ class CertificateService {
     final busType = job.device.busType;
     final timestampStr = (job.endTime ?? now).toIso8601String();
 
+    final bool isPartition = job.isPartitionScope;
+    final int version = isPartition ? 3 : 2;
+    final String? scope = isPartition ? 'partial' : 'full';
+    final String? limitation = isPartition
+        ? 'Partition wipe: partition table and unselected sectors are not overwritten'
+        : null;
+    final List<Map<String, dynamic>>? partitionsWiped = isPartition && job.targetPartition != null
+        ? [
+            {
+              'partition_number': job.targetPartition!.partitionNumber,
+              'start_sector': job.targetPartition!.startSector,
+              'size_bytes': job.targetPartition!.sizeBytes,
+            }
+          ]
+        : null;
+    final int? bytesOverwritten = isPartition ? job.targetPartition?.sizeBytes : null;
+    final int? totalDeviceBytes = job.device.capacityBytes;
+
     final Map<String, dynamic> payloadToSign = buildSigningPayload(
-      certVersion: 2,
+      certVersion: version,
       certificateId: certId,
       jobId: job.jobId,
       deviceSerial: job.device.serialNumber,
@@ -236,13 +279,18 @@ class CertificateService {
       result: resultStr,
       timestamp: timestampStr,
       warningLine: finalWarningLine,
+      scope: scope,
+      limitation: limitation,
+      partitionsWiped: partitionsWiped,
+      bytesOverwritten: bytesOverwritten,
+      totalDeviceBytes: totalDeviceBytes,
     );
 
     final String payloadJson = jsonEncode(payloadToSign);
     final String signatureHex = _signData(payloadJson);
 
     return SanitizationCertificate(
-      certVersion: 2,
+      certVersion: version,
       certificateId: certId,
       jobId: job.jobId,
       deviceModel: job.device.name,
@@ -267,6 +315,11 @@ class CertificateService {
       softwareVersion: 'Zero Trace v2.0 (SIH25070 Build)',
       signature: signatureHex,
       publicKeyPem: _getPublicKeyPem(),
+      scope: scope,
+      limitation: limitation,
+      partitionsWiped: partitionsWiped,
+      bytesOverwritten: bytesOverwritten,
+      totalDeviceBytes: totalDeviceBytes,
     );
   }
 
@@ -282,6 +335,12 @@ class CertificateService {
     final warningLine = certJson['warningLine'] as String?;
     final sanitizationCategory = certJson['sanitizationCategory'] as String? ?? 'Clear';
     final executionMode = certJson['executionMode'] as String? ?? 'simulated';
+    final scope = certJson['scope'] as String?;
+    final limitation = certJson['limitation'] as String?;
+    final rawWiped = certJson['partitionsWiped'] as List<dynamic>?;
+    final partitionsWiped = rawWiped?.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    final bytesOverwritten = (certJson['bytesOverwritten'] as num?)?.toInt();
+    final totalDeviceBytes = (certJson['totalDeviceBytes'] as num?)?.toInt();
 
     final evidenceHash = (certJson['evidence'] is Map)
         ? certJson['evidence']['evidenceHash'] as String? ?? ''
@@ -304,6 +363,11 @@ class CertificateService {
       result: result,
       timestamp: timestamp,
       warningLine: warningLine,
+      scope: scope,
+      limitation: limitation,
+      partitionsWiped: partitionsWiped,
+      bytesOverwritten: bytesOverwritten,
+      totalDeviceBytes: totalDeviceBytes,
     );
 
     return _verifySignature(jsonEncode(payload), signature);
@@ -409,6 +473,27 @@ class CertificateService {
                     style: pw.TextStyle(
                       fontSize: 8.5,
                       color: PdfColors.red900,
+                      fontWeight: pw.FontWeight.bold,
+                    ),
+                  ),
+                ),
+
+              // Scope Limitation Box (if present, e.g. partition wipe)
+              if (cert.limitation != null)
+                pw.Container(
+                  width: double.infinity,
+                  padding: const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  margin: const pw.EdgeInsets.only(bottom: 12),
+                  decoration: pw.BoxDecoration(
+                    color: PdfColors.orange50,
+                    borderRadius: pw.BorderRadius.circular(4),
+                    border: pw.Border.all(color: PdfColors.orange400),
+                  ),
+                  child: pw.Text(
+                    'SCOPE LIMITATION: ${cert.limitation!}',
+                    style: pw.TextStyle(
+                      fontSize: 8.5,
+                      color: PdfColors.orange900,
                       fontWeight: pw.FontWeight.bold,
                     ),
                   ),

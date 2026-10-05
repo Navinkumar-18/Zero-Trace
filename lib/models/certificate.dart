@@ -75,6 +75,11 @@ class SanitizationCertificate {
   final String softwareVersion;
   final String signature; // ECDSA Signature Hex string
   final String publicKeyPem;
+  final String? scope; // "full" or "partial"
+  final String? limitation;
+  final List<Map<String, dynamic>>? partitionsWiped;
+  final int? bytesOverwritten;
+  final int? totalDeviceBytes;
 
   SanitizationCertificate({
     this.certVersion = 2,
@@ -103,6 +108,11 @@ class SanitizationCertificate {
     required this.softwareVersion,
     required this.signature,
     required this.publicKeyPem,
+    this.scope,
+    this.limitation,
+    this.partitionsWiped,
+    this.bytesOverwritten,
+    this.totalDeviceBytes,
   }) : simulationDisclaimer = simulationDisclaimer ??
             (executionMode == 'simulated'
                 ? 'SIMULATED, not a valid sanitization record'
@@ -122,6 +132,9 @@ class SanitizationCertificate {
             limitations: '',
             verifiedPassed: json['result'] == 'SUCCESS',
           );
+
+    final rawWiped = json['partitionsWiped'] as List<dynamic>?;
+    final partitionsWiped = rawWiped?.map((e) => Map<String, dynamic>.from(e as Map)).toList();
 
     return SanitizationCertificate(
       certVersion: certVer,
@@ -159,6 +172,11 @@ class SanitizationCertificate {
       softwareVersion: json['softwareVersion'] as String? ?? 'Zero Trace v2.0',
       signature: json['signature'] as String? ?? '',
       publicKeyPem: json['publicKeyPem'] as String? ?? '',
+      scope: json['scope'] as String?,
+      limitation: json['limitation'] as String?,
+      partitionsWiped: partitionsWiped,
+      bytesOverwritten: (json['bytesOverwritten'] as num?)?.toInt(),
+      totalDeviceBytes: (json['totalDeviceBytes'] as num?)?.toInt(),
     );
   }
 
@@ -184,6 +202,11 @@ class SanitizationCertificate {
           'verificationSampleCount': verificationSampleCount,
         if (verificationEntropyScore != null)
           'verificationEntropyScore': verificationEntropyScore,
+        if (scope != null) 'scope': scope,
+        if (limitation != null) 'limitation': limitation,
+        if (partitionsWiped != null) 'partitionsWiped': partitionsWiped,
+        if (bytesOverwritten != null) 'bytesOverwritten': bytesOverwritten,
+        if (totalDeviceBytes != null) 'totalDeviceBytes': totalDeviceBytes,
         'startTime': startTime.toIso8601String(),
         'endTime': endTime.toIso8601String(),
         'timestamp': endTime.toIso8601String(),

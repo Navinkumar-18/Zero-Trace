@@ -9,6 +9,11 @@ class ActiveJobState {
   final String method;
   final String startedAt;
   final String status;
+  final int? partitionNumber;
+  final int? partitionStartSector;
+  final int? partitionSizeSectors;
+  final String? scope;
+  final String? limitation;
 
   ActiveJobState({
     required this.jobId,
@@ -18,6 +23,11 @@ class ActiveJobState {
     required this.method,
     required this.startedAt,
     this.status = 'running',
+    this.partitionNumber,
+    this.partitionStartSector,
+    this.partitionSizeSectors,
+    this.scope,
+    this.limitation,
   });
 
   Map<String, dynamic> toJson() => {
@@ -28,6 +38,11 @@ class ActiveJobState {
         'method': method,
         'startedAt': startedAt,
         'status': status,
+        if (partitionNumber != null) 'partitionNumber': partitionNumber,
+        if (partitionStartSector != null) 'partitionStartSector': partitionStartSector,
+        if (partitionSizeSectors != null) 'partitionSizeSectors': partitionSizeSectors,
+        if (scope != null) 'scope': scope,
+        if (limitation != null) 'limitation': limitation,
       };
 
   factory ActiveJobState.fromJson(Map<String, dynamic> json) {
@@ -39,6 +54,11 @@ class ActiveJobState {
       method: json['method'] as String? ?? '',
       startedAt: json['startedAt'] as String? ?? '',
       status: json['status'] as String? ?? 'running',
+      partitionNumber: json['partitionNumber'] as int?,
+      partitionStartSector: (json['partitionStartSector'] as num?)?.toInt(),
+      partitionSizeSectors: (json['partitionSizeSectors'] as num?)?.toInt(),
+      scope: json['scope'] as String?,
+      limitation: json['limitation'] as String?,
     );
   }
 }
@@ -70,6 +90,11 @@ class JobStateFile {
       method: state.method,
       startedAt: state.startedAt,
       status: 'interrupted',
+      partitionNumber: state.partitionNumber,
+      partitionStartSector: state.partitionStartSector,
+      partitionSizeSectors: state.partitionSizeSectors,
+      scope: state.scope,
+      limitation: state.limitation,
     );
     await saveActiveJob(interrupted);
   }

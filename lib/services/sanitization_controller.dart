@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 
 import '../models/certificate.dart';
 import '../models/device_profile.dart';
+import '../models/partition_info.dart';
 import '../models/sanitization_job.dart';
 import 'certificate_service.dart';
 import 'classification_service.dart';
@@ -51,6 +52,9 @@ class SanitizationController extends ChangeNotifier {
 
   // Simple Mode shared state (reset on every launch)
   bool _showInternalDrives = false;
+  PartitionInfo? _selectedPartition;
+
+  PartitionInfo? get selectedPartition => _selectedPartition;
 
   // Real-time telemetry and stall watchdog
   DateTime? _lastHeartbeatTime;
@@ -132,6 +136,19 @@ class SanitizationController extends ChangeNotifier {
 
     final recResult = getAutoMethod(device, intent);
 
+    var effectiveRecMethod = recResult.method;
+    var standardRef = recResult.standardReference;
+    var explanation = recResult.explanation;
+
+    if (_selectedPartition != null) {
+      if (effectiveRecMethod != SanitizationMethod.singlePassOverwrite &&
+          effectiveRecMethod != SanitizationMethod.multiPassOverwrite) {
+        effectiveRecMethod = SanitizationMethod.singlePassOverwrite;
+        standardRef = 'NIST SP 800-88 R1 Clear (Partition Scope Overwrite)';
+        explanation = 'Partition-scoped wiping only supports overwrite methods.';
+      }
+    }
+
     final jobId = 'JOB-${DateTime.now().millisecondsSinceEpoch.toString().substring(6)}';
 
     _currentJob = SanitizationJob(
@@ -142,9 +159,10 @@ class SanitizationController extends ChangeNotifier {
       disposalPath: disposalPath,
       riskScore: riskResult.score,
       targetCategory: riskResult.targetCategory,
-      recommendedMethod: recResult.method,
-      standardReference: recResult.standardReference,
-      explanationText: recResult.explanation,
+      recommendedMethod: effectiveRecMethod,
+      standardReference: standardRef,
+      explanationText: explanation,
+      targetPartition: _selectedPartition,
       shouldSimulateFailure: _simulateFailureMode,
       overriddenMethod: overrideMethod,
     );
@@ -609,6 +627,14 @@ class SanitizationController extends ChangeNotifier {
   void selectDevice(DeviceProfile device) {
     if (isJobRunning) return;
     _selectedDevice = device;
+    _selectedPartition = null;
+    _updateJobRecommendation();
+    notifyListeners();
+  }
+
+  void selectPartition(PartitionInfo? partition) {
+    if (isJobRunning) return;
+    _selectedPartition = partition;
     _updateJobRecommendation();
     notifyListeners();
   }
@@ -663,6 +689,19 @@ class SanitizationController extends ChangeNotifier {
       sensitivity: _dataSensitivity,
     );
 
+    var effectiveRecMethod = recResult.method;
+    var standardRef = recResult.standardReference;
+    var explanation = recResult.explanation;
+
+    if (_selectedPartition != null) {
+      if (effectiveRecMethod != SanitizationMethod.singlePassOverwrite &&
+          effectiveRecMethod != SanitizationMethod.multiPassOverwrite) {
+        effectiveRecMethod = SanitizationMethod.singlePassOverwrite;
+        standardRef = 'NIST SP 800-88 R1 Clear (Partition Scope Overwrite)';
+        explanation = 'Partition-scoped wiping only supports overwrite methods. Firmware sanitize and crypto commands affect the whole drive and cannot be scoped to a single partition.';
+      }
+    }
+
     final jobId = 'JOB-${DateTime.now().millisecondsSinceEpoch.toString().substring(6)}';
 
     _currentJob = SanitizationJob(
@@ -673,9 +712,10 @@ class SanitizationController extends ChangeNotifier {
       disposalPath: _disposalPath,
       riskScore: riskResult.score,
       targetCategory: riskResult.targetCategory,
-      recommendedMethod: recResult.method,
-      standardReference: recResult.standardReference,
-      explanationText: recResult.explanation,
+      recommendedMethod: effectiveRecMethod,
+      standardReference: standardRef,
+      explanationText: explanation,
+      targetPartition: _selectedPartition,
       shouldSimulateFailure: _simulateFailureMode,
     );
 
@@ -753,10 +793,19 @@ class SanitizationController extends ChangeNotifier {
         await JobStateFile.saveActiveJob(ActiveJobState(
           jobId: job.jobId,
           deviceSerial: job.device.serialNumber,
-          devicePath: job.device.id.startsWith('real_') ? '/dev/${job.device.id.substring(5)}' : '/dev/sdb',
+          devicePath: job.isPartitionScope
+              ? job.targetPartition!.devicePath
+              : (job.device.id.startsWith('real_') ? '/dev/${job.device.id.substring(5)}' : '/dev/sdb'),
           deviceName: job.device.name,
           method: job.effectiveMethod.displayName,
           startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
+          partitionNumber: job.targetPartition?.partitionNumber,
+          partitionStartSector: job.targetPartition?.startSector,
+          partitionSizeSectors: job.targetPartition?.sizeSectors,
+          scope: job.isPartitionScope ? 'partial' : 'full',
+          limitation: job.isPartitionScope
+              ? 'Partition wipe: partition table and unselected sectors are not overwritten'
+              : null,
         ));
 
         _lastHeartbeatTime = DateTime.now();
@@ -782,6 +831,7 @@ class SanitizationController extends ChangeNotifier {
           method: job.effectiveMethod,
           confirmationToken: job.device.serialNumber, // verified by dialog retype
           deviceSerial: job.device.serialNumber,
+          targetPartition: job.targetPartition,
           dryRun: false,
           onProgress: (event) {
             _lastHeartbeatTime = DateTime.now();
@@ -870,6 +920,7 @@ class SanitizationController extends ChangeNotifier {
             device: job.device,
             method: cliMethod,
             deviceSerial: job.device.serialNumber,
+            targetPartition: job.targetPartition,
             sampleCount: 50,
             expectZeros: expectZeros,
           );
@@ -964,9 +1015,11 @@ class SanitizationController extends ChangeNotifier {
             timestamp: DateTime.now().toIso8601String(),
             jobId: job.jobId,
             deviceSerial: job.device.serialNumber,
-            devicePath: job.device.id.startsWith('real_')
-                ? '/dev/${job.device.id.substring(5)}'
-                : '/dev/null',
+            devicePath: job.isPartitionScope
+                ? job.targetPartition!.devicePath
+                : (job.device.id.startsWith('real_')
+                    ? '/dev/${job.device.id.substring(5)}'
+                    : '/dev/null'),
             method: job.recommendedMethod.displayName,
             standardReference: job.standardReference,
             nistCategory: job.effectiveNistCategoryDisplayName,

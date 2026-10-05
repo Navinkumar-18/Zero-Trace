@@ -60,6 +60,14 @@ class AssistantContext {
   final bool? isCertificateSimulated;
   final bool isSimulated;
 
+  final bool isPartitionScope;
+  final int? partitionNumber;
+  final UntrustedText? partitionLabel;
+  final String? partitionFsType;
+  final int? partitionSizeBytes;
+  final String? partitionFormattedSize;
+  final int? totalDeviceSizeBytes;
+
   /// Injected operating system name. Defaults to 'unknown' with platform-neutral wording.
   final String platform;
 
@@ -93,6 +101,13 @@ class AssistantContext {
     this.certificateId,
     this.isCertificateSimulated,
     this.isSimulated = true,
+    this.isPartitionScope = false,
+    this.partitionNumber,
+    this.partitionLabel,
+    this.partitionFsType,
+    this.partitionSizeBytes,
+    this.partitionFormattedSize,
+    this.totalDeviceSizeBytes,
     this.platform = 'unknown',
   });
 
@@ -105,8 +120,12 @@ class AssistantContext {
   /// Human-readable target summary for message cards (e.g. "Answered for: Samsung SSD 980").
   String get targetSummary {
     if (!hasDevice) return 'None (general knowledge)';
-    if (isDisconnected) return '${deviceName!.sanitized} (disconnected)';
-    return deviceName!.sanitized;
+    final base = deviceName!.sanitized;
+    final partSuffix = isPartitionScope
+        ? ' (Partition $partitionNumber${partitionLabel != null && partitionLabel!.sanitized.isNotEmpty ? ': "${partitionLabel!.sanitized}"' : ''})'
+        : '';
+    if (isDisconnected) return '$base$partSuffix (disconnected)';
+    return '$base$partSuffix';
   }
 
   /// Generates dynamic, context-aware quick questions capped at ~6.
@@ -132,7 +151,13 @@ class AssistantContext {
       questions.add('What does the cryptographic signature prove?');
     }
 
-    // 3. Device Characteristics
+    // 3. Partition Scope Specific Questions
+    if (isPartitionScope) {
+      questions.add('What are the limitations of a partition wipe?');
+      questions.add('Are unselected partitions overwritten?');
+    }
+
+    // 4. Device Characteristics
     if (hasDevice) {
       if (isSecurityFrozen) {
         questions.add('What does security frozen mean?');

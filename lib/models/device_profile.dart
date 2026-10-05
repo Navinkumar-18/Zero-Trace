@@ -1,3 +1,5 @@
+import 'partition_info.dart';
+
 enum MediaType {
   hdd,
   sataSsd,
@@ -124,6 +126,12 @@ class DeviceProfile {
   /// Non-null for unsupported devices (RAID, optical, unknown).
   final String? disabledReason;
 
+  /// Discovered partitions on this storage device, if any.
+  final List<PartitionInfo> partitions;
+
+  /// Canonical SHA-256 fingerprint of the partition table, if partitions exist.
+  final String? partitionTableFingerprint;
+
   const DeviceProfile({
     required this.id,
     required this.name,
@@ -147,7 +155,66 @@ class DeviceProfile {
     this.notes = '',
     this.isRemovable = false,
     this.disabledReason,
+    this.partitions = const [],
+    this.partitionTableFingerprint,
   });
+
+  /// Whether this device has any discovered partitions.
+  bool get hasPartitions => partitions.isNotEmpty;
+
+  DeviceProfile copyWith({
+    String? id,
+    String? name,
+    String? serialNumber,
+    MediaType? mediaType,
+    String? busType,
+    int? capacityBytes,
+    int? rotationalRpm,
+    bool? isHardwareEncrypted,
+    bool? supportsAtaSecureErase,
+    bool? supportsAtaSanitize,
+    bool? supportsNvmeSanitize,
+    bool? supportsEmmcSanitize,
+    bool? supportsTrim,
+    bool? hpaDcoPresent,
+    String? mountPoint,
+    bool? isSystemDisk,
+    bool? hasFilesystem,
+    String? fsType,
+    bool? isWipedNoFilesystem,
+    String? notes,
+    bool? isRemovable,
+    String? disabledReason,
+    List<PartitionInfo>? partitions,
+    String? partitionTableFingerprint,
+  }) {
+    return DeviceProfile(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      serialNumber: serialNumber ?? this.serialNumber,
+      mediaType: mediaType ?? this.mediaType,
+      busType: busType ?? this.busType,
+      capacityBytes: capacityBytes ?? this.capacityBytes,
+      rotationalRpm: rotationalRpm ?? this.rotationalRpm,
+      isHardwareEncrypted: isHardwareEncrypted ?? this.isHardwareEncrypted,
+      supportsAtaSecureErase: supportsAtaSecureErase ?? this.supportsAtaSecureErase,
+      supportsAtaSanitize: supportsAtaSanitize ?? this.supportsAtaSanitize,
+      supportsNvmeSanitize: supportsNvmeSanitize ?? this.supportsNvmeSanitize,
+      supportsEmmcSanitize: supportsEmmcSanitize ?? this.supportsEmmcSanitize,
+      supportsTrim: supportsTrim ?? this.supportsTrim,
+      hpaDcoPresent: hpaDcoPresent ?? this.hpaDcoPresent,
+      mountPoint: mountPoint ?? this.mountPoint,
+      isSystemDisk: isSystemDisk ?? this.isSystemDisk,
+      hasFilesystem: hasFilesystem ?? this.hasFilesystem,
+      fsType: fsType ?? this.fsType,
+      isWipedNoFilesystem: isWipedNoFilesystem ?? this.isWipedNoFilesystem,
+      notes: notes ?? this.notes,
+      isRemovable: isRemovable ?? this.isRemovable,
+      disabledReason: disabledReason ?? this.disabledReason,
+      partitions: partitions ?? this.partitions,
+      partitionTableFingerprint: partitionTableFingerprint ?? this.partitionTableFingerprint,
+    );
+  }
 
   /// Derive the user-facing drive type from MediaType + bus.
   DriveType get driveType {
@@ -284,6 +351,9 @@ class DeviceProfile {
         'notes': notes,
         'isRemovable': isRemovable,
         'disabledReason': disabledReason,
+        'partitions': partitions.map((p) => p.toJson()).toList(),
+        if (partitionTableFingerprint != null)
+          'partitionTableFingerprint': partitionTableFingerprint,
       };
 
   factory DeviceProfile.fromJson(Map<String, dynamic> json) {
@@ -313,6 +383,11 @@ class DeviceProfile {
       notes: (json['notes'] as String?) ?? '',
       isRemovable: (json['isRemovable'] as bool?) ?? false,
       disabledReason: json['disabledReason'] as String?,
+      partitions: (json['partitions'] as List<dynamic>?)
+              ?.map((p) => PartitionInfo.fromJson(p as Map<String, dynamic>))
+              .toList() ??
+          const [],
+      partitionTableFingerprint: json['partitionTableFingerprint'] as String?,
     );
   }
 }

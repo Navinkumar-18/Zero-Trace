@@ -1,4 +1,5 @@
 import 'device_profile.dart';
+import 'partition_info.dart';
 
 enum DataSensitivity { public, internal, confidential, restricted }
 enum DeviceCondition { functional, degraded, endOfLife }
@@ -153,6 +154,7 @@ class SanitizationJob {
   final SanitizationMethod recommendedMethod;
   final String standardReference;
   final String explanationText;
+  final PartitionInfo? targetPartition;
   
   JobStatus status;
   double? progress; // 0.0 to 1.0, null for indeterminate
@@ -176,6 +178,7 @@ class SanitizationJob {
     required this.recommendedMethod,
     required this.standardReference,
     required this.explanationText,
+    this.targetPartition,
     this.status = JobStatus.idle,
     this.progress,
     this.currentStageDescription = 'Ready to initiate sanitization pipeline',
@@ -187,6 +190,9 @@ class SanitizationJob {
     this.destroyAcknowledged = false,
     this.wipeCompleted = false,
   }) : logs = logs ?? [];
+
+  /// Whether this job targets a single partition rather than the whole block device.
+  bool get isPartitionScope => targetPartition != null;
 
   /// Whether this job is actively running an operation.
   bool get isRunning =>
