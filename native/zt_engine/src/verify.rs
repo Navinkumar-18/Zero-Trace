@@ -53,6 +53,10 @@ pub struct VerificationReport {
     pub entropy_score: f64,
     pub fingerprint_hash: String,
     pub rng_seed: u64,
+    #[serde(default)]
+    pub bytes_overwritten: u64,
+    #[serde(default)]
+    pub total_device_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +186,14 @@ fn read_sector_at(path: &str, offset: u64) -> Result<Vec<u8>, VerifyError> {
         // Fallback to standard I/O if O_DIRECT fails (e.g., on non-block devices)
         let mut file = std::fs::File::open(path)
             .map_err(|e| VerifyError::DeviceOpenFailed(format!("{}: {}", path, e)))?;
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = file.as_raw_fd();
+            unsafe {
+                libc::ioctl(fd, 0x1261, 0); // BLKFLSBUF
+                libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
+            }
+        }
         file.seek(SeekFrom::Start(offset)).map_err(|e| VerifyError::ReadFailed {
             offset,
             message: format!("Seek failed: {}", e),
@@ -347,7 +359,34 @@ pub fn verify_device_with_cancel(
         entropy_score,
         fingerprint_hash,
         rng_seed: seed,
+        bytes_overwritten: device_size,
+        total_device_bytes: device_size,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_device_scoped(
+    device_path: &str,
+    partition_size: u64,
+    total_device_size: u64,
+    device_serial: &str,
+    method_used: &str,
+    sample_count: Option<u32>,
+    expect_zeros: bool,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<VerificationReport, VerifyError> {
+    let mut report = verify_device_with_cancel(
+        device_path,
+        partition_size,
+        device_serial,
+        method_used,
+        sample_count,
+        expect_zeros,
+        cancel_flag,
+    )?;
+    report.bytes_overwritten = partition_size;
+    report.total_device_bytes = total_device_size;
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +569,8 @@ mod tests {
             entropy_score: 0.001,
             fingerprint_hash: "deadbeef".to_string(),
             rng_seed: 42,
+            bytes_overwritten: 25600,
+            total_device_bytes: 25600,
         };
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"pass\":true"));

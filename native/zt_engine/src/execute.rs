@@ -53,6 +53,8 @@ pub enum ExecuteError {
     PrematureEndOfDevice(String),
     #[error("Progress channel closed")]
     ChannelClosed,
+    #[error("Identity mismatch: {0}")]
+    IdentityMismatch(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -707,7 +709,7 @@ pub fn verify_exclusive_access_and_recheck(
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EBUSY) {
                 return Err(ExecuteError::CommandFailed(format!(
-                    "Device {} is busy or mounted (O_EXCL conflict): cannot safely sanitize",
+                    "the system remounted the drive, retry (Device {} is busy or mounted with O_EXCL conflict)",
                     device
                 )));
             }
@@ -1500,7 +1502,7 @@ impl DirectBlockWriter {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EBUSY) {
                 return Err(ExecuteError::CommandFailed(format!(
-                    "Device {} is busy or mounted (O_EXCL conflict): cannot safely overwrite",
+                    "the system remounted the drive, retry (Device {} is busy or mounted with O_EXCL conflict)",
                     path
                 )));
             }
@@ -1663,6 +1665,80 @@ impl BlockWriter for FileBlockWriter {
 
     fn io_mode(&self) -> &'static str {
         "file_test"
+    }
+}
+
+/// A bounded range writer wrapping an inner BlockWriter.
+/// Translates relative offsets: inner_offset = start_offset + rel_offset.
+/// Strictly enforces that rel_offset + chunk_len <= length, refusing any out-of-range write.
+#[derive(Debug)]
+pub struct PartitionRangeWriter<W: BlockWriter> {
+    inner: W,
+    start_offset: u64,
+    length: u64,
+}
+
+impl<W: BlockWriter> PartitionRangeWriter<W> {
+    pub fn new(inner: W, start_offset: u64, length: u64) -> Self {
+        Self {
+            inner,
+            start_offset,
+            length,
+        }
+    }
+
+    pub fn start_offset(&self) -> u64 {
+        self.start_offset
+    }
+
+    pub fn length(&self) -> u64 {
+        self.length
+    }
+
+    pub fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: BlockWriter> BlockWriter for PartitionRangeWriter<W> {
+    fn write_chunk(&mut self, offset: u64, data: &[u8]) -> Result<usize, io::Error> {
+        let chunk_len = data.len() as u64;
+        let end = offset.checked_add(chunk_len).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Offset overflow in partition write")
+        })?;
+        if end > self.length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Out of partition range write refused: offset {} + chunk {} > length {}",
+                    offset, chunk_len, self.length
+                ),
+            ));
+        }
+        let target_offset = self.start_offset.checked_add(offset).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Target offset overflow in partition write")
+        })?;
+        self.inner.write_chunk(target_offset, data)
+    }
+
+    fn sync_data(&mut self) -> Result<(), io::Error> {
+        self.inner.sync_data()
+    }
+
+    fn flush_buffers(&mut self) -> Result<(), io::Error> {
+        self.inner.flush_buffers()
+    }
+
+    fn total_size(&self) -> Result<u64, io::Error> {
+        Ok(self.length)
+    }
+
+    fn logical_block_size(&self) -> u32 {
+        self.inner.logical_block_size()
+    }
+
+    fn io_mode(&self) -> &'static str {
+        self.inner.io_mode()
     }
 }
 
@@ -2355,6 +2431,536 @@ pub async fn software_overwrite(
     // 6. Execute native overwrite
     execute_writer_overwrite(
         writer,
+        total_passes,
+        pattern,
+        device_serial,
+        &method_name,
+        start,
+        tx,
+    ).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EngineMethod {
+    AtaSecureErase,
+    AtaEnhancedSecureErase,
+    AtaSanitizeBlock,
+    AtaSanitizeCrypto,
+    NvmeSanitizeBlock,
+    NvmeSanitizeCrypto,
+    OpalRevert,
+    EmmcSanitize,
+    OverwriteZero,
+    OverwriteRandom,
+    Overwrite3Pass,
+}
+
+impl EngineMethod {
+    pub const ALL: &'static [EngineMethod] = &[
+        EngineMethod::AtaSecureErase,
+        EngineMethod::AtaEnhancedSecureErase,
+        EngineMethod::AtaSanitizeBlock,
+        EngineMethod::AtaSanitizeCrypto,
+        EngineMethod::NvmeSanitizeBlock,
+        EngineMethod::NvmeSanitizeCrypto,
+        EngineMethod::OpalRevert,
+        EngineMethod::EmmcSanitize,
+        EngineMethod::OverwriteZero,
+        EngineMethod::OverwriteRandom,
+        EngineMethod::Overwrite3Pass,
+    ];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EngineMethod::AtaSecureErase => "ata-secure-erase",
+            EngineMethod::AtaEnhancedSecureErase => "ata-enhanced-secure-erase",
+            EngineMethod::AtaSanitizeBlock => "ata-sanitize-block",
+            EngineMethod::AtaSanitizeCrypto => "ata-sanitize-crypto",
+            EngineMethod::NvmeSanitizeBlock => "nvme-sanitize-block",
+            EngineMethod::NvmeSanitizeCrypto => "nvme-sanitize-crypto",
+            EngineMethod::OpalRevert => "opal-revert",
+            EngineMethod::EmmcSanitize => "emmc-sanitize",
+            EngineMethod::OverwriteZero => "overwrite-zero",
+            EngineMethod::OverwriteRandom => "overwrite-random",
+            EngineMethod::Overwrite3Pass => "overwrite-3pass",
+        }
+    }
+
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s {
+            "ata-secure-erase" => Some(EngineMethod::AtaSecureErase),
+            "ata-enhanced-secure-erase" => Some(EngineMethod::AtaEnhancedSecureErase),
+            "ata-sanitize-block" => Some(EngineMethod::AtaSanitizeBlock),
+            "ata-sanitize-crypto" => Some(EngineMethod::AtaSanitizeCrypto),
+            "nvme-sanitize-block" => Some(EngineMethod::NvmeSanitizeBlock),
+            "nvme-sanitize-crypto" => Some(EngineMethod::NvmeSanitizeCrypto),
+            "opal-revert" => Some(EngineMethod::OpalRevert),
+            "emmc-sanitize" => Some(EngineMethod::EmmcSanitize),
+            "overwrite-zero" => Some(EngineMethod::OverwriteZero),
+            "overwrite-random" => Some(EngineMethod::OverwriteRandom),
+            "overwrite-3pass" => Some(EngineMethod::Overwrite3Pass),
+            _ => None,
+        }
+    }
+
+    pub fn is_allowed_in_partition_mode(&self) -> bool {
+        matches!(
+            self,
+            EngineMethod::OverwriteZero | EngineMethod::OverwriteRandom | EngineMethod::Overwrite3Pass
+        )
+    }
+}
+
+pub const ALLOWED_PARTITION_METHODS: &[&str] = &[
+    "overwrite-zero",
+    "overwrite-random",
+    "overwrite-3pass",
+];
+
+pub fn validate_partition_method(method: &str) -> Result<EngineMethod, ExecuteError> {
+    let engine_method = EngineMethod::from_str_opt(method).ok_or_else(|| {
+        ExecuteError::UnsupportedOperation(format!("Unknown sanitization method: {}", method))
+    })?;
+    if !engine_method.is_allowed_in_partition_mode() {
+        return Err(ExecuteError::UnsupportedOperation(format!(
+            "Method '{}' is not allowed in partition mode. Partition mode only allows overwrite methods (overwrite-zero, overwrite-random, overwrite-3pass).",
+            method
+        )));
+    }
+    Ok(engine_method)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartitionTargetParams {
+    pub expected_partition_num: u32,
+    pub expected_start_sector: u64,
+    pub expected_size_sectors: u64,
+    pub expected_partuuid: Option<String>,
+    pub expected_table_fingerprint: String,
+}
+
+/// Calculates the SHA-256 fingerprint of the partition table on the parent disk.
+/// Sorted ascending by partition number: format "{part_num}:{start_sector}:{size_sectors}\n".
+pub fn compute_partition_table_fingerprint(
+    parent_disk: &str,
+    ctx: &FsContext,
+) -> Result<String, ExecuteError> {
+    let parent_name = parent_disk.strip_prefix("/dev/").unwrap_or(parent_disk);
+    let class_block = ctx.sys_root.join("class/block");
+    let mut parts: Vec<(u32, u64, u64)> = Vec::new();
+
+    if let Ok(entries) = fs::read_dir(&class_block) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(parent_name)
+                && (name[parent_name.len()..].starts_with('p')
+                    || name[parent_name.len()..].chars().next().is_some_and(|c| c.is_ascii_digit()))
+            {
+                let part_file = entry.path().join("partition");
+                if part_file.exists() {
+                    let num_str = fs::read_to_string(&part_file).unwrap_or_default();
+                    if let Ok(num) = num_str.trim().parse::<u32>() {
+                        let start_str = fs::read_to_string(entry.path().join("start")).unwrap_or_default();
+                        let size_str = fs::read_to_string(entry.path().join("size")).unwrap_or_default();
+                        let start = start_str.trim().parse::<u64>().unwrap_or(0);
+                        let size = size_str.trim().parse::<u64>().unwrap_or(0);
+                        parts.push((num, start, size));
+                    }
+                }
+            }
+        }
+    }
+
+    parts.sort_by_key(|p| p.0);
+
+    let mut canonical_text = String::new();
+    for (num, start, size) in parts {
+        canonical_text.push_str(&format!("{}:{}:{}\n", num, start, size));
+    }
+
+    let hash = format!("{:x}", Sha256::digest(canonical_text.as_bytes()));
+    Ok(hash)
+}
+
+/// Check if a target partition is an MBR extended container partition.
+pub fn is_mbr_extended_partition(
+    device: &str,
+    parent_disk: &str,
+    ctx: &FsContext,
+) -> Result<bool, ExecuteError> {
+    let part_name = device.strip_prefix("/dev/").unwrap_or(device);
+    let class_block = ctx.sys_root.join("class/block");
+    let part_dir = class_block.join(part_name);
+
+    if part_dir.join("subpartition").exists() {
+        return Ok(true);
+    }
+
+    let parent_canonical = canonicalize_device_path(parent_disk, false, ctx).unwrap_or_else(|_| parent_disk.to_string());
+    let parent_file_path = if ctx.dev_root != Path::new("/dev") {
+        let rel = parent_disk.strip_prefix("/dev/").unwrap_or(parent_disk);
+        ctx.dev_root.join(rel)
+    } else {
+        PathBuf::from(&parent_canonical)
+    };
+    if let Ok(mut file) = fs::File::open(&parent_file_path) {
+        use std::io::Read;
+        let mut mbr = [0u8; 512];
+        if file.read_exact(&mut mbr).is_ok() && mbr[510] == 0x55 && mbr[511] == 0xAA {
+            let start_str = fs::read_to_string(part_dir.join("start")).unwrap_or_default();
+            let target_start = start_str.trim().parse::<u32>().unwrap_or(0);
+            let part_num_str = fs::read_to_string(part_dir.join("partition")).unwrap_or_default();
+            let target_num = part_num_str.trim().parse::<u32>().ok();
+            for i in 0..4 {
+                let entry_offset = 446 + i * 16;
+                let sys_ind = mbr[entry_offset + 4];
+                let start_lba = u32::from_le_bytes([
+                    mbr[entry_offset + 8],
+                    mbr[entry_offset + 9],
+                    mbr[entry_offset + 10],
+                    mbr[entry_offset + 11],
+                ]);
+                let matches_start = target_start != 0 && target_start == start_lba;
+                let matches_num = target_num == Some(i as u32 + 1);
+                if (sys_ind == 0x05 || sys_ind == 0x0f || sys_ind == 0x85)
+                    && (matches_start || matches_num || (target_start == 0 && target_num.is_none()))
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Safely unmounts active filesystems on the target partition and any active holders.
+/// Sibling partitions are left untouched.
+pub fn unmount_target_partition_and_holders(
+    target_partition: &str,
+    dry_run: bool,
+    command_log: &mut Vec<String>,
+    ctx: &FsContext,
+) -> Result<(String, String), ExecuteError> {
+    let mut stdout_accum = String::new();
+    let mut stderr_accum = String::new();
+
+    if dry_run {
+        command_log.push(format!("[DRY RUN] Would check mounts and unmount partition {} and its holders", target_partition));
+        return Ok((stdout_accum, stderr_accum));
+    }
+
+    let target_name = target_partition.strip_prefix("/dev/").unwrap_or(target_partition);
+    let target_canonical = canonicalize_device_path(target_partition, dry_run, ctx)?;
+
+    // 1. Resolve holders from /sys/class/block/<dev>/holders
+    let holders_dir = ctx.sys_root.join("class/block").join(target_name).join("holders");
+    let mut holders = Vec::new();
+    if holders_dir.exists() {
+        if let Ok(entries) = fs::read_dir(&holders_dir) {
+            for entry in entries.flatten() {
+                let h_name = entry.file_name().to_string_lossy().to_string();
+                holders.push(h_name);
+            }
+        }
+    }
+
+    let mounts_content = fs::read_to_string(ctx.proc_root.join("mounts")).unwrap_or_default();
+
+    for holder in &holders {
+        let holder_dev = format!("/dev/{}", holder);
+        let mut is_mounted = false;
+        for line in mounts_content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if !parts.is_empty() && (parts[0] == holder_dev || parts[0].ends_with(holder)) {
+                is_mounted = true;
+                break;
+            }
+        }
+        if is_mounted {
+            command_log.push(format!("[UNMOUNT] Unmounting active holder: {}", holder_dev));
+            let (stdout, stderr, code) = run_cmd("umount", &["-f", &holder_dev], dry_run, command_log)?;
+            stdout_accum.push_str(&stdout);
+            stderr_accum.push_str(&stderr);
+            if code != 0 {
+                return Err(ExecuteError::CommandFailed(format!(
+                    "Target partition {} is held by active holder '{}' which cannot be unmounted",
+                    target_partition, holder_dev
+                )));
+            }
+        }
+    }
+
+    let mut is_target_mounted = false;
+    for line in mounts_content.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if !parts.is_empty() && (parts[0] == target_partition || parts[0] == target_canonical) {
+            is_target_mounted = true;
+            break;
+        }
+    }
+
+    if is_target_mounted {
+        command_log.push(format!("[UNMOUNT] Unmounting active partition: {}", target_partition));
+        let (stdout, stderr, code) = run_cmd("umount", &["-f", target_partition], dry_run, command_log)?;
+        stdout_accum.push_str(&stdout);
+        stderr_accum.push_str(&stderr);
+        if code != 0 {
+            return Err(ExecuteError::CommandFailed(format!(
+                "Failed to unmount partition {}: {}", target_partition, stderr
+            )));
+        }
+    }
+
+    Ok((stdout_accum, stderr_accum))
+}
+
+/// Resolves the parent disk device name from a partition device path or name.
+pub fn resolve_parent_disk(device: &str, ctx: &FsContext) -> Result<String, ExecuteError> {
+    let target_name = device.strip_prefix("/dev/").unwrap_or(device);
+    let target_block_dir = ctx.sys_root.join("class/block").join(target_name);
+
+    if let Ok(link) = fs::read_link(&target_block_dir) {
+        if let Some(parent) = link.parent() {
+            if let Some(p_name) = parent.file_name() {
+                let p_str = p_name.to_string_lossy().to_string();
+                if p_str != "block" && ctx.sys_root.join("class/block").join(&p_str).exists() {
+                    return Ok(p_str);
+                }
+            }
+        }
+    }
+
+    if target_name.starts_with("nvme") || target_name.starts_with("mmcblk") {
+        if let Some(idx) = target_name.rfind('p') {
+            let candidate = &target_name[..idx];
+            if ctx.sys_root.join("class/block").join(candidate).exists() {
+                return Ok(candidate.to_string());
+            }
+        }
+    } else {
+        let candidate = target_name.trim_end_matches(|c: char| c.is_ascii_digit());
+        if !candidate.is_empty() && ctx.sys_root.join("class/block").join(candidate).exists() {
+            return Ok(candidate.to_string());
+        }
+    }
+
+    Err(ExecuteError::DeviceNotFound(format!(
+        "Cannot resolve parent disk for partition {}",
+        device
+    )))
+}
+
+/// Performs sector-aligned overwrite on a specific partition node.
+/// Enforces partition method allowlist, sysfs geometry match, parent serial check,
+/// partition table fingerprint invariance, targeted unmount of holders,
+/// and bounds enforcement via PartitionRangeWriter.
+#[allow(clippy::too_many_arguments)]
+pub async fn software_overwrite_partition(
+    device: &str,
+    passes: u8,
+    pattern: OverwritePattern,
+    confirmation_token: &str,
+    device_serial: &str,
+    params: &PartitionTargetParams,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> Result<ExecutionReport, ExecuteError> {
+    software_overwrite_partition_ctx(
+        device,
+        passes,
+        pattern,
+        confirmation_token,
+        device_serial,
+        params,
+        dry_run,
+        tx,
+        &FsContext::default(),
+    ).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn software_overwrite_partition_ctx(
+    device: &str,
+    passes: u8,
+    pattern: OverwritePattern,
+    confirmation_token: &str,
+    device_serial: &str,
+    params: &PartitionTargetParams,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+    ctx: &FsContext,
+) -> Result<ExecutionReport, ExecuteError> {
+    let start = Instant::now();
+    let mut command_log = Vec::new();
+
+    // 1. Authoritative safety check: parent disk and target partition
+    check_boot_disk_protection_ctx(device, dry_run, ctx)?;
+    verify_confirmation(confirmation_token, device_serial)?;
+
+    let target_name = device.strip_prefix("/dev/").unwrap_or(device);
+    let class_block = ctx.sys_root.join("class/block");
+    let part_dir = class_block.join(target_name);
+
+    // 2. Sysfs geometry validation: partition, start, size
+    let part_file = part_dir.join("partition");
+    if !part_file.exists() {
+        return Err(ExecuteError::UnsupportedOperation(format!(
+            "Target '{}' is not recognized as a partition in sysfs ({})",
+            device, part_dir.display()
+        )));
+    }
+    let actual_num: u32 = fs::read_to_string(&part_file)
+        .unwrap_or_default()
+        .trim()
+        .parse()
+        .map_err(|_| ExecuteError::IdentityMismatch("Corrupt sysfs partition file".into()))?;
+    if actual_num != params.expected_partition_num {
+        return Err(ExecuteError::IdentityMismatch(format!(
+            "Partition number mismatch: expected {}, got sysfs partition {}",
+            params.expected_partition_num, actual_num
+        )));
+    }
+
+    let actual_start: u64 = fs::read_to_string(part_dir.join("start"))
+        .unwrap_or_default()
+        .trim()
+        .parse()
+        .map_err(|_| ExecuteError::IdentityMismatch("Corrupt sysfs start file".into()))?;
+    if actual_start != params.expected_start_sector {
+        return Err(ExecuteError::IdentityMismatch(format!(
+            "Partition start sector mismatch: expected {}, got sysfs start {}",
+            params.expected_start_sector, actual_start
+        )));
+    }
+
+    let actual_size: u64 = fs::read_to_string(part_dir.join("size"))
+        .unwrap_or_default()
+        .trim()
+        .parse()
+        .map_err(|_| ExecuteError::IdentityMismatch("Corrupt sysfs size file".into()))?;
+    if actual_size != params.expected_size_sectors {
+        return Err(ExecuteError::IdentityMismatch(format!(
+            "Partition size sectors mismatch: expected {}, got sysfs size {}",
+            params.expected_size_sectors, actual_size
+        )));
+    }
+
+    // Optional PARTUUID check
+    if let Some(expected_uuid) = &params.expected_partuuid {
+        let uevent = fs::read_to_string(part_dir.join("uevent")).unwrap_or_default();
+        let mut found_uuid = None;
+        for line in uevent.lines() {
+            if let Some(uuid) = line.strip_prefix("PARTUUID=") {
+                found_uuid = Some(uuid.trim().to_string());
+                break;
+            }
+        }
+        if let Some(actual_uuid) = found_uuid {
+            if !actual_uuid.eq_ignore_ascii_case(expected_uuid) {
+                return Err(ExecuteError::IdentityMismatch(format!(
+                    "PARTUUID mismatch: expected {}, got sysfs {}",
+                    expected_uuid, actual_uuid
+                )));
+            }
+        }
+    }
+
+    // 3. Resolve parent disk and check partition table fingerprint
+    let parent_name = resolve_parent_disk(device, ctx)?;
+    let actual_fingerprint = compute_partition_table_fingerprint(&parent_name, ctx)?;
+    if actual_fingerprint != params.expected_table_fingerprint {
+        return Err(ExecuteError::IdentityMismatch(format!(
+            "Partition table changed: expected fingerprint {}, got sysfs {}",
+            params.expected_table_fingerprint, actual_fingerprint
+        )));
+    }
+
+    // 4. Refuse MBR extended container partitions
+    let parent_path = format!("/dev/{}", parent_name);
+    if is_mbr_extended_partition(device, &parent_path, ctx)? {
+        return Err(ExecuteError::UnsupportedOperation(format!(
+            "Refusing operation: target '{}' is an MBR extended container partition",
+            device
+        )));
+    }
+
+    // 5. Logical block size alignment validation
+    let start_bytes = actual_start.checked_mul(512).ok_or_else(|| {
+        ExecuteError::UnsupportedOperation("Partition start sector overflow".into())
+    })?;
+    let verified_size_bytes = actual_size.checked_mul(512).ok_or_else(|| {
+        ExecuteError::UnsupportedOperation("Partition size sector overflow".into())
+    })?;
+    if start_bytes % 512 != 0 || verified_size_bytes % 512 != 0 {
+        return Err(ExecuteError::UnsupportedOperation(
+            "Partition start or size is not aligned to logical block size".into()
+        ));
+    }
+
+    let guard_identity = get_guard_identity(device, dry_run, device_serial, ctx)?;
+
+    let total_passes = match pattern {
+        OverwritePattern::MultiPass3 => 3u8,
+        _ => passes.max(1),
+    };
+    let method_name = format!(
+        "Partition Overwrite ({}-pass, {:?})",
+        total_passes, pattern
+    );
+
+    // 6. Dry run early exit: no unmounts, zero write opens
+    if dry_run {
+        command_log.push(format!(
+            "[DRY RUN] Native partition block overwrite: {} passes ({:?}) on {} (size: {} bytes)",
+            total_passes, pattern, device, verified_size_bytes
+        ));
+        send_detailed_progress(&tx, ExecutionPhase::FirmwareCommand, 0, 0, None, 0.0, None,
+            "[DRY RUN] Starting simulated partition overwrite...", false).await;
+        for pass in 1..=total_passes {
+            send_detailed_progress(&tx, ExecutionPhase::FirmwareCommand, 0, 0, None, 0.0, None,
+                &format!("[DRY RUN] Overwrite pass {} of {} complete", pass, total_passes), false).await;
+        }
+        send_detailed_progress(&tx, ExecutionPhase::Flushing, 0, 0, None, 0.0, None, "[DRY RUN] Flushing complete", false).await;
+        send_detailed_progress(&tx, ExecutionPhase::Verification, 0, 0, None, 0.0, None, "[DRY RUN] Post-verification complete", false).await;
+        return Ok(ExecutionReport {
+            success: true,
+            method_used: method_name,
+            command_log,
+            stdout: "[DRY RUN] Partition overwrite simulated successfully".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
+            dry_run: true,
+            bytes_written: 0,
+            io_mode: "dry_run".to_string(),
+        });
+    }
+
+    send_detailed_progress(&tx, ExecutionPhase::SecurityUnlock, 0, 0, None, 0.0, Some(5),
+        "Unmounting filesystems on target partition...", false).await;
+
+    // 7. Targeted unmount: target partition & holders only
+    let (_stdout, _stderr) = unmount_target_partition_and_holders(device, false, &mut command_log, ctx)?;
+
+    // 8. Verify exclusive access on the partition node
+    verify_exclusive_access_and_recheck(device, false, ctx)?;
+
+    // 9. Open native block writer on the partition node with O_EXCL
+    let inner_writer = DirectBlockWriter::open(&guard_identity.canonical_path, &guard_identity)?;
+    let actual_blk_size = inner_writer.total_size()?;
+    if actual_blk_size != verified_size_bytes {
+        return Err(ExecuteError::IdentityMismatch(format!(
+            "BLKGETSIZE64 size ({}) does not match sysfs size ({})",
+            actual_blk_size, verified_size_bytes
+        )));
+    }
+
+    // 10. Wrap with PartitionRangeWriter as second boundary guard
+    let range_writer = PartitionRangeWriter::new(inner_writer, 0, verified_size_bytes);
+
+    // 11. Execute native overwrite
+    execute_writer_overwrite(
+        range_writer,
         total_passes,
         pattern,
         device_serial,

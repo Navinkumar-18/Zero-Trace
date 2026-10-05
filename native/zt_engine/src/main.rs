@@ -1,12 +1,35 @@
 use std::env;
+use std::path::Path;
 use std::process;
 use tokio::sync::mpsc;
 use zt_engine::execute::{
     ata_sanitize, ata_secure_erase, emmc_sanitize, nvme_sanitize, opal_revert, software_overwrite,
-    AtaSanitizeAction, OverwritePattern, ProgressEvent, SanitizeAction,
+    software_overwrite_partition, AtaSanitizeAction, OverwritePattern, PartitionTargetParams,
+    ProgressEvent, SanitizeAction, ALLOWED_PARTITION_METHODS,
 };
-use zt_engine::verify::verify_device;
+use zt_engine::verify::{verify_device, verify_device_scoped};
 use zt_engine::detect::probe_device;
+
+fn is_partition_device(device: &str) -> bool {
+    let name = device.strip_prefix("/dev/").unwrap_or(device);
+    let sys_part = format!("/sys/class/block/{}/partition", name);
+    if Path::new(&sys_part).exists() {
+        return true;
+    }
+    // Heuristic: check if name ends in digit after letters or 'p'
+    if name.starts_with("nvme") || name.starts_with("mmcblk") || name.starts_with("loop") {
+        if let Some(pos) = name.rfind('p') {
+            let suffix = &name[pos + 1..];
+            return !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
+        }
+    } else {
+        let trimmed = name.trim_end_matches(|c: char| c.is_ascii_digit());
+        if !trimmed.is_empty() && trimmed != name {
+            return true;
+        }
+    }
+    false
+}
 
 #[tokio::main]
 async fn main() {
@@ -20,9 +43,9 @@ async fn main() {
     let subcommand = args[1].as_str();
     match subcommand {
         "sanitize" => {
-            // Usage: zt_engine sanitize <device> <method> <confirmation_token> <device_serial> [--dry-run] [--psid <psid>]
+            // Usage: zt_engine sanitize <device> <method> <confirmation_token> <device_serial> [--dry-run] [--psid <psid>] [--mode <whole-disk|partition>] ...
             if args.len() < 6 {
-                eprintln!("Usage: zt_engine sanitize <device> <method> <confirmation_token> <device_serial> [--dry-run] [--psid <psid>]");
+                eprintln!("Usage: zt_engine sanitize <device> <method> <confirmation_token> <device_serial> [--dry-run] [--psid <psid>] [--mode <partition>]");
                 process::exit(1);
             }
             let device = &args[2];
@@ -34,6 +57,22 @@ async fn main() {
             let psid = args.iter()
                 .position(|arg| arg == "--psid")
                 .and_then(|pos| args.get(pos + 1).map(|s| s.as_str()));
+
+            let mode = args.iter()
+                .position(|arg| arg == "--mode")
+                .and_then(|pos| args.get(pos + 1).map(|s| s.as_str()));
+
+            let is_part_mode = mode == Some("partition");
+            let target_looks_like_part = is_partition_device(device);
+
+            // Fail-closed CLI requirement: partition target without --mode partition refuses
+            if target_looks_like_part && !is_part_mode {
+                eprintln!(
+                    "Refusing operation: target '{}' appears to be a partition, but --mode partition was not specified (fail closed)",
+                    device
+                );
+                process::exit(1);
+            }
 
             let (tx, mut rx) = mpsc::channel::<ProgressEvent>(100);
 
@@ -50,43 +89,98 @@ async fn main() {
                 }
             });
 
-            let res = match method.as_str() {
-                "ata-secure-erase" => {
-                    ata_secure_erase(device, false, token, serial, dry_run, tx).await
-                }
-                "ata-enhanced-secure-erase" => {
-                    ata_secure_erase(device, true, token, serial, dry_run, tx).await
-                }
-                "ata-sanitize-block" => {
-                    ata_sanitize(device, AtaSanitizeAction::BlockErase, token, serial, dry_run, tx).await
-                }
-                "ata-sanitize-crypto" => {
-                    ata_sanitize(device, AtaSanitizeAction::CryptoScramble, token, serial, dry_run, tx).await
-                }
-                "nvme-sanitize-block" => {
-                    nvme_sanitize(device, SanitizeAction::BlockErase, token, serial, dry_run, tx).await
-                }
-                "nvme-sanitize-crypto" => {
-                    nvme_sanitize(device, SanitizeAction::CryptoErase, token, serial, dry_run, tx).await
-                }
-                "opal-revert" => {
-                    opal_revert(device, psid, token, serial, dry_run, tx).await
-                }
-                "emmc-sanitize" => {
-                    emmc_sanitize(device, token, serial, dry_run, tx).await
-                }
-                "overwrite-zero" => {
-                    software_overwrite(device, 1, OverwritePattern::Zeros, token, serial, dry_run, tx).await
-                }
-                "overwrite-random" => {
-                    software_overwrite(device, 1, OverwritePattern::Random, token, serial, dry_run, tx).await
-                }
-                "overwrite-3pass" => {
-                    software_overwrite(device, 3, OverwritePattern::MultiPass3, token, serial, dry_run, tx).await
-                }
-                _ => {
-                    eprintln!("Unknown method: {}", method);
+            let res = if is_part_mode {
+                // Fail-closed: partition mode requires allowlisted method
+                if !ALLOWED_PARTITION_METHODS.contains(&method.as_str()) {
+                    eprintln!(
+                        "Refusing operation: method '{}' is not allowed in partition mode. Partition mode only allows overwrite methods (overwrite-zero, overwrite-random, overwrite-3pass)",
+                        method
+                    );
                     process::exit(1);
+                }
+
+                // Fail-closed: partition mode requires all expected flags
+                let part_num = args.iter()
+                    .position(|arg| arg == "--expected-part-num")
+                    .and_then(|pos| args.get(pos + 1).and_then(|s| s.parse::<u32>().ok()));
+                let start_sector = args.iter()
+                    .position(|arg| arg == "--expected-start-sector")
+                    .and_then(|pos| args.get(pos + 1).and_then(|s| s.parse::<u64>().ok()));
+                let size_sectors = args.iter()
+                    .position(|arg| arg == "--expected-size-sectors")
+                    .and_then(|pos| args.get(pos + 1).and_then(|s| s.parse::<u64>().ok()));
+                let table_fingerprint = args.iter()
+                    .position(|arg| arg == "--expected-table-fingerprint")
+                    .and_then(|pos| args.get(pos + 1).cloned());
+                let partuuid = args.iter()
+                    .position(|arg| arg == "--expected-partuuid")
+                    .and_then(|pos| args.get(pos + 1).cloned());
+
+                if part_num.is_none() || start_sector.is_none() || size_sectors.is_none() || table_fingerprint.is_none() {
+                    eprintln!(
+                        "Partition mode requires --expected-part-num, --expected-start-sector, --expected-size-sectors, and --expected-table-fingerprint"
+                    );
+                    process::exit(1);
+                }
+
+                let params = PartitionTargetParams {
+                    expected_partition_num: part_num.unwrap(),
+                    expected_start_sector: start_sector.unwrap(),
+                    expected_size_sectors: size_sectors.unwrap(),
+                    expected_partuuid: partuuid,
+                    expected_table_fingerprint: table_fingerprint.unwrap(),
+                };
+
+                let (pattern, passes) = match method.as_str() {
+                    "overwrite-zero" => (OverwritePattern::Zeros, 1u8),
+                    "overwrite-random" => (OverwritePattern::Random, 1u8),
+                    "overwrite-3pass" => (OverwritePattern::MultiPass3, 3u8),
+                    _ => {
+                        eprintln!("Unknown partition method: {}", method);
+                        process::exit(1);
+                    }
+                };
+
+                software_overwrite_partition(device, passes, pattern, token, serial, &params, dry_run, tx).await
+            } else {
+                match method.as_str() {
+                    "ata-secure-erase" => {
+                        ata_secure_erase(device, false, token, serial, dry_run, tx).await
+                    }
+                    "ata-enhanced-secure-erase" => {
+                        ata_secure_erase(device, true, token, serial, dry_run, tx).await
+                    }
+                    "ata-sanitize-block" => {
+                        ata_sanitize(device, AtaSanitizeAction::BlockErase, token, serial, dry_run, tx).await
+                    }
+                    "ata-sanitize-crypto" => {
+                        ata_sanitize(device, AtaSanitizeAction::CryptoScramble, token, serial, dry_run, tx).await
+                    }
+                    "nvme-sanitize-block" => {
+                        nvme_sanitize(device, SanitizeAction::BlockErase, token, serial, dry_run, tx).await
+                    }
+                    "nvme-sanitize-crypto" => {
+                        nvme_sanitize(device, SanitizeAction::CryptoErase, token, serial, dry_run, tx).await
+                    }
+                    "opal-revert" => {
+                        opal_revert(device, psid, token, serial, dry_run, tx).await
+                    }
+                    "emmc-sanitize" => {
+                        emmc_sanitize(device, token, serial, dry_run, tx).await
+                    }
+                    "overwrite-zero" => {
+                        software_overwrite(device, 1, OverwritePattern::Zeros, token, serial, dry_run, tx).await
+                    }
+                    "overwrite-random" => {
+                        software_overwrite(device, 1, OverwritePattern::Random, token, serial, dry_run, tx).await
+                    }
+                    "overwrite-3pass" => {
+                        software_overwrite(device, 3, OverwritePattern::MultiPass3, token, serial, dry_run, tx).await
+                    }
+                    _ => {
+                        eprintln!("Unknown method: {}", method);
+                        process::exit(1);
+                    }
                 }
             };
 
@@ -109,9 +203,9 @@ async fn main() {
             }
         }
         "verify" => {
-            // Usage: zt_engine verify <device> <size> <serial> <method> <sample_count> <expect_zeros>
+            // Usage: zt_engine verify <device> <size> <serial> <method> <sample_count> <expect_zeros> [--device-size <total_device_size>]
             if args.len() < 8 {
-                eprintln!("Usage: zt_engine verify <device> <size> <serial> <method> <sample_count> <expect_zeros>");
+                eprintln!("Usage: zt_engine verify <device> <size> <serial> <method> <sample_count> <expect_zeros> [--device-size <total_device_size>]");
                 process::exit(1);
             }
             let device = &args[2];
@@ -129,8 +223,17 @@ async fn main() {
                 eprintln!("Invalid expect_zeros (must be true/false)");
                 process::exit(1);
             });
+            let total_device_size = args.iter()
+                .position(|arg| arg == "--device-size" || arg == "--total-device-size")
+                .and_then(|pos| args.get(pos + 1).and_then(|s| s.parse::<u64>().ok()));
 
-            match verify_device(device, size, serial, method, Some(sample_count), expect_zeros) {
+            let res = if let Some(total_size) = total_device_size {
+                verify_device_scoped(device, size, total_size, serial, method, Some(sample_count), expect_zeros, None)
+            } else {
+                verify_device(device, size, serial, method, Some(sample_count), expect_zeros)
+            };
+
+            match res {
                 Ok(report) => {
                     if let Ok(json) = serde_json::to_string(&report) {
                         println!("VERIFY_REPORT:{}", json);

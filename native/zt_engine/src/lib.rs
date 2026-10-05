@@ -16,6 +16,13 @@ pub mod certificate;
 
 /// Re-export primary types for FFI consumers
 pub use detect::{DeviceCapabilities, BusType, SmartHealth, DurationClass};
-pub use execute::{ExecutionReport, ProgressEvent, ExecutionPhase, SanitizeAction, AtaSanitizeAction, OverwritePattern, FsContext, check_boot_disk_protection, check_boot_disk_protection_ctx};
+pub use execute::{
+    ExecutionReport, ProgressEvent, ExecutionPhase, SanitizeAction, AtaSanitizeAction,
+    OverwritePattern, FsContext, check_boot_disk_protection, check_boot_disk_protection_ctx,
+    PartitionRangeWriter, PartitionTargetParams, compute_partition_table_fingerprint,
+    software_overwrite_partition, software_overwrite_partition_ctx, ALLOWED_PARTITION_METHODS,
+    is_mbr_extended_partition, unmount_target_partition_and_holders,
+    EngineMethod, validate_partition_method, BlockWriter, FileBlockWriter, execute_writer_overwrite,
+};
 pub use verify::{VerificationReport, SampleResult};
 pub use certificate::{SignedCertificate, SigningMethod};
