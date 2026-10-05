@@ -213,7 +213,7 @@ class _SanitizationActiveBannerState extends State<SanitizationActiveBanner>
                   Text(
                     isProcessActive
                         ? 'Active zt_engine process running on ${state?.deviceName ?? "Device"} (${state?.devicePath})'
-                        : 'Device ${state?.deviceName ?? "Target"}: ${result.checkpointWording ?? "about 0 GB reported written at the last check, not verified"}. Verify before reuse.',
+                        : 'Device ${state?.deviceName ?? "Target"} was not cleanly verified before app closed. Verify before reuse.',
                     style: const TextStyle(
                       color: AppTheme.textPrimary,
                       fontSize: 12,

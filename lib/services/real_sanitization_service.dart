@@ -184,23 +184,21 @@ class RealSanitizationService {
 
   /// Unified cancellation interface:
   /// Sends SIGTERM to allow engine to gracefully sync buffers, write checkpoint, and exit with code 130.
-  /// Escalates to SIGKILL if the process fails to exit within 5 seconds.
-  Future<void> cancelActiveProcess() async {
+  /// Does NOT automatically SIGKILL; UI prompts the user if the drive takes time to finish writes.
+  void cancelActiveProcess() {
     final proc = _activeProcess;
     if (proc == null) return;
-
     try {
-      // Step 1: Request graceful cancellation
       proc.kill(ProcessSignal.sigterm);
+    } catch (_) {}
+  }
 
-      // Step 2: 5-second timeout escalation to hard kill
-      await proc.exitCode.timeout(
-        const Duration(seconds: 5),
-        onTimeout: () {
-          proc.kill(ProcessSignal.sigkill);
-          return -9;
-        },
-      );
+  /// Force stop the process via SIGKILL upon explicit user confirmation.
+  void forceKillActiveProcess() {
+    final proc = _activeProcess;
+    if (proc == null) return;
+    try {
+      proc.kill(ProcessSignal.sigkill);
     } catch (_) {}
   }
 

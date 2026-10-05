@@ -47,7 +47,6 @@ app.*.map.json
 # Rust / Cargo build artifacts
 **/target/
 **/*.rs.bk
-Cargo.lock
 
 # Zero Trace key files (sensitive)
 .zero_trace/keys/

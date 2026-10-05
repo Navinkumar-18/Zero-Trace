@@ -59,9 +59,16 @@ class SanitizationController extends ChangeNotifier {
   double _currentSpeedBytesPerSec = 0.0;
   int? _currentEtaSeconds;
 
+  // Cancellation and Force Stop escalation state
+  bool _isCancelling = false;
+  bool _showForceStop = false;
+  Timer? _cancelEscalationTimer;
+
   bool get isStalled => _isStalled;
   double get currentSpeedBytesPerSec => _currentSpeedBytesPerSec;
   int? get currentEtaSeconds => _currentEtaSeconds;
+  bool get isCancelling => _isCancelling;
+  bool get showForceStop => _showForceStop;
 
   bool _isDisposed = false;
 
@@ -210,13 +217,9 @@ class SanitizationController extends ChangeNotifier {
         return d;
       }).toList();
     }
-    final serial = active?.deviceSerial;
     _orphanResult = null;
     notifyListeners();
 
-    if (serial != null) {
-      await OrphanedProcessChecker.removeEngineCheckpoint(serial);
-    }
     await JobStateFile.clearActiveJob();
   }
 
@@ -236,11 +239,26 @@ class SanitizationController extends ChangeNotifier {
   }
 
   /// Cancel an in-progress software overwrite job.
-  /// Leaves the target drive marked as partially wiped.
+  /// Sends SIGTERM to allow the engine to flush buffers and write a checkpoint.
+  /// After 5 seconds without exit, offers a Force stop option if the drive is still writing.
   Future<void> cancelCurrentJob() async {
     if (!canCancelJob || _currentJob == null) return;
-    _addLog('USER CANCEL: Sending cancellation signal to zt_engine (SIGTERM with 5s hard-kill escalation)...');
-    await _realSanitizeService.cancelActiveProcess();
+    _isCancelling = true;
+    _showForceStop = false;
+    _addLog('USER CANCEL: Sending cancellation signal to zt_engine (SIGTERM)...');
+    _realSanitizeService.cancelActiveProcess();
+
+    // After 5 seconds: show "waiting for the drive to finish its current write" and offer Force stop button
+    _cancelEscalationTimer?.cancel();
+    _cancelEscalationTimer = Timer(const Duration(seconds: 5), () {
+      if (_isCancelling && _currentJob != null && isJobRunning) {
+        _showForceStop = true;
+        _currentJob!.currentStageDescription = 'waiting for the drive to finish its current write';
+        _addLog('CANCEL NOTICE: waiting for the drive to finish its current write');
+        notifyListeners();
+      }
+    });
+
     final job = _currentJob!;
     job.status = JobStatus.failed;
     job.endTime = DateTime.now();
@@ -296,6 +314,54 @@ class SanitizationController extends ChangeNotifier {
     }).toList();
 
     await JobStateFile.clearActiveJob();
+    notifyListeners();
+  }
+
+  /// Force stop the in-progress job immediately via SIGKILL upon user request.
+  Future<void> forceStopCurrentJob() async {
+    if (_currentJob == null) return;
+    _cancelEscalationTimer?.cancel();
+    _cancelEscalationTimer = null;
+    _isCancelling = false;
+    _showForceStop = false;
+
+    _addLog('USER FORCE STOP: Terminating process immediately with SIGKILL...');
+    _realSanitizeService.forceKillActiveProcess();
+
+    final job = _currentJob!;
+    job.status = JobStatus.failed;
+    job.endTime = DateTime.now();
+    job.currentStageDescription = 'interrupted, state unknown';
+    _addLog('USER FORCE STOP: Job force stopped. Warning: Drive in interrupted, state unknown.');
+
+    await _auditLogService.appendEntry(
+      AuditLogEntry(
+        timestamp: DateTime.now().toIso8601String(),
+        jobId: job.jobId,
+        deviceSerial: job.device.serialNumber,
+        devicePath: job.device.id,
+        method: job.effectiveMethod.displayName,
+        standardReference: job.standardReference,
+        nistCategory: job.effectiveNistCategoryDisplayName,
+        success: false,
+        fingerprintHash: 'FORCE_STOPPED_UNVERIFIED',
+        entropyScore: 0.0,
+        sampleCount: 0,
+        commandLog: List<String>.from(job.logs)
+          ..add('User force stopped sanitization via SIGKILL.'),
+      ),
+    );
+
+    // Save interrupted state so checkpoint stays and discovery/recovery detects it
+    await JobStateFile.recordInterrupted(ActiveJobState(
+      jobId: job.jobId,
+      deviceSerial: job.device.serialNumber,
+      devicePath: job.device.id,
+      deviceName: job.device.name,
+      method: job.effectiveMethod.displayName,
+      startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
+    ));
+
     notifyListeners();
   }
 
@@ -758,13 +824,22 @@ class SanitizationController extends ChangeNotifier {
 
         _stallWatchdogTimer?.cancel();
         _stallWatchdogTimer = null;
+        _cancelEscalationTimer?.cancel();
+        _cancelEscalationTimer = null;
+        _isCancelling = false;
+        _showForceStop = false;
 
         if (!report.success) {
           job.status = JobStatus.failed;
           job.endTime = DateTime.now();
-          job.currentStageDescription = 'Sanitization Failed: ${report.stderr}';
-          _addLog('ERROR: Sanitization command failed with code ${report.exitCode}');
-          _addLog('ERROR Details: ${report.stderr}');
+          if (report.exitCode == 130) {
+            job.currentStageDescription = 'Sanitization Cancelled: Partially Wiped';
+            _addLog('CANCEL: Sanitization cancelled by user. Partially wiped.');
+          } else {
+            job.currentStageDescription = 'Sanitization Failed: ${report.stderr}';
+            _addLog('ERROR: Sanitization command failed with code ${report.exitCode}');
+            _addLog('ERROR Details: ${report.stderr}');
+          }
           await JobStateFile.clearActiveJob();
           notifyListeners();
           return;

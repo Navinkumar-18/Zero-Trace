@@ -9,6 +9,8 @@ use sha2::{Sha256, Digest};
 use rand::SeedableRng;
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[cfg(target_os = "linux")]
@@ -26,6 +28,8 @@ pub enum VerifyError {
     ReadFailed { offset: u64, message: String },
     #[error("Verification failed: {0}")]
     VerificationFailed(String),
+    #[error("Verification cancelled by user")]
+    Cancelled,
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
 }
@@ -227,6 +231,26 @@ pub fn verify_device(
     sample_count: Option<u32>,
     expect_zeros: bool,
 ) -> Result<VerificationReport, VerifyError> {
+    verify_device_with_cancel(
+        device_path,
+        device_size,
+        device_serial,
+        method_used,
+        sample_count,
+        expect_zeros,
+        None,
+    )
+}
+
+pub fn verify_device_with_cancel(
+    device_path: &str,
+    device_size: u64,
+    device_serial: &str,
+    method_used: &str,
+    sample_count: Option<u32>,
+    expect_zeros: bool,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Result<VerificationReport, VerifyError> {
     let count = sample_count.unwrap_or(DEFAULT_SAMPLE_COUNT);
 
     // Generate deterministic seed from device serial + method for audit reproducibility
@@ -245,6 +269,12 @@ pub fn verify_device(
         || method_used.to_lowercase().contains("opal");
 
     for &offset in &offsets {
+        if let Some(ref flag) = cancel_flag {
+            if flag.load(Ordering::SeqCst) {
+                return Err(VerifyError::Cancelled);
+            }
+        }
+
         match read_sector_at(device_path, offset) {
             Ok(sector_data) => {
                 let is_zero = sector_data.iter().all(|&b| b == 0);

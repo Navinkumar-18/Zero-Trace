@@ -539,8 +539,48 @@ class DriveDetailScreen extends StatelessWidget {
           ),
           const SizedBox(height: 14),
 
-          // Cancel Wipe button or hardware notice
-          if (controller.canCancelJob)
+          // Cancel Wipe / Waiting Notice / Force Stop button
+          if (controller.showForceStop) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: AppTheme.accentGold.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: AppTheme.accentGold.withValues(alpha: 0.4)),
+              ),
+              child: const Text(
+                'waiting for the drive to finish its current write',
+                style: TextStyle(color: AppTheme.accentGold, fontSize: 12, fontWeight: FontWeight.w500),
+                textAlign: TextAlign.center,
+              ),
+            ),
+            const SizedBox(height: 10),
+            ElevatedButton.icon(
+              icon: const Icon(Icons.dangerous_outlined, size: 16),
+              label: const Text('Force stop', style: TextStyle(fontSize: 12)),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: AppTheme.accentRose,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              ),
+              onPressed: () => _handleForceStop(context, controller),
+            ),
+          ] else if (controller.isCancelling) ...[
+            const Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: AppTheme.accentRose),
+                ),
+                SizedBox(width: 8),
+                Text(
+                  'Cancelling... waiting for write to sync',
+                  style: TextStyle(color: AppTheme.accentRose, fontSize: 12),
+                ),
+              ],
+            ),
+          ] else if (controller.canCancelJob)
             OutlinedButton.icon(
               icon: const Icon(Icons.cancel_outlined, size: 16),
               label: const Text('Cancel Wipe', style: TextStyle(fontSize: 12)),
@@ -559,6 +599,42 @@ class DriveDetailScreen extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  Future<void> _handleForceStop(BuildContext context, SanitizationController controller) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppTheme.surfaceDark,
+        title: const Row(
+          children: [
+            Icon(Icons.dangerous_rounded, color: AppTheme.accentRose),
+            SizedBox(width: 8),
+            Text('Force Stop Process?'),
+          ],
+        ),
+        content: const Text(
+          'Warning: Force stopping terminates the zt_engine process immediately (SIGKILL).\n\n'
+          'Drive write buffers will not be flushed and sectors may be left in an inconsistent state.\n\n'
+          'Are you sure you want to force terminate?',
+          style: TextStyle(color: AppTheme.textSecondary, fontSize: 13),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Wait for Drive'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: AppTheme.accentRose),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Force Stop Now'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await controller.forceStopCurrentJob();
+    }
   }
 
   Future<void> _handleCancel(BuildContext context, SanitizationController controller) async {
