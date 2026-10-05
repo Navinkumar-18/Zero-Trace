@@ -175,7 +175,9 @@ class ProgressScreen extends StatelessWidget {
                               ),
                             ),
                             Text(
-                              '${(job.progress * 100).toInt()}%',
+                              job.progress != null
+                                  ? '${(job.progress! * 100).toInt()}%'
+                                  : '...',
                               style: TextStyle(
                                 fontSize: 26,
                                 fontWeight: FontWeight.bold,

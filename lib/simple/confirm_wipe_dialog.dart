@@ -211,7 +211,6 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                 const SizedBox(height: 12),
               ],
 
-              // Drive info
               _infoRow('Drive:', widget.device.name),
               const SizedBox(height: 4),
               _infoRow('Size:', widget.device.formattedCapacity),
@@ -219,6 +218,33 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
               _infoRow('Serial:', widget.device.serialNumber),
               const SizedBox(height: 4),
               _infoRow('Method:', _methodDisplayText(method, isDestroyRecommended)),
+              const SizedBox(height: 4),
+              _infoRow('Est. Duration:', _estimateDisplayText(widget.device, method)),
+              if (widget.device.driveType == DriveType.usb ||
+                  widget.device.mediaType == MediaType.usbFlash ||
+                  widget.device.busType.toUpperCase() == 'USB') ...[
+                const SizedBox(height: 8),
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: AppTheme.accentBlue.withValues(alpha: 0.1),
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: AppTheme.accentBlue.withValues(alpha: 0.3)),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.usb, color: AppTheme.accentBlue, size: 16),
+                      SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          'Connecting to a USB 3 port is strongly recommended for faster write speeds.',
+                          style: TextStyle(color: AppTheme.accentBlue, fontSize: 11),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               if (isClearOnly && isFlash) ...[
                 const SizedBox(height: 8),
                 Container(
@@ -466,6 +492,39 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
   String _methodDisplayText(SanitizationMethod method, bool isDestroy) {
     if (isDestroy) return 'Physical destruction recommended';
     return '${method.displayName} (auto)';
+  }
+
+  String _estimateDisplayText(DeviceProfile device, SanitizationMethod method) {
+    if (method == SanitizationMethod.cryptographicErase ||
+        method == SanitizationMethod.nvmeSanitize ||
+        method == SanitizationMethod.ataSanitizeBlockErase) {
+      return 'Estimate: ~1 to 5 min (firmware purge)';
+    }
+    if (method == SanitizationMethod.ataSecureErase) {
+      if (device.mediaTechnology == MediaTechnology.rotational) {
+        return 'Estimate: ~1 to 3+ hours (firmware erase)';
+      }
+      return 'Estimate: ~2 to 20 min (firmware erase)';
+    }
+    final bytes = device.capacityBytes;
+    final isMultiPass = method == SanitizationMethod.multiPassOverwrite;
+    if (bytes <= 32 * 1024 * 1024 * 1024) {
+      return isMultiPass
+          ? 'Estimate: ~45 min to 4+ hours'
+          : 'Estimate: ~15 to 90 min';
+    } else if (bytes <= 128 * 1024 * 1024 * 1024) {
+      return isMultiPass
+          ? 'Estimate: ~2 to 9+ hours'
+          : 'Estimate: ~45 min to 3+ hours';
+    } else if (bytes <= 512 * 1024 * 1024 * 1024) {
+      return isMultiPass
+          ? 'Estimate: ~6 to 24+ hours'
+          : 'Estimate: ~2 to 8+ hours';
+    } else {
+      return isMultiPass
+          ? 'Estimate: ~12 to 48+ hours'
+          : 'Estimate: ~4 to 16+ hours';
+    }
   }
 
   Widget _infoRow(String label, String value) {

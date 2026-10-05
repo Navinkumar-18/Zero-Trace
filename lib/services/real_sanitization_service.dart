@@ -13,6 +13,8 @@ class RealExecutionReport {
   final int exitCode;
   final int durationMs;
   final bool dryRun;
+  final int bytesWritten;
+  final String ioMode;
 
   RealExecutionReport({
     required this.success,
@@ -23,6 +25,8 @@ class RealExecutionReport {
     required this.exitCode,
     required this.durationMs,
     required this.dryRun,
+    this.bytesWritten = 0,
+    this.ioMode = '',
   });
 
   factory RealExecutionReport.fromJson(Map<String, dynamic> json) {
@@ -35,29 +39,47 @@ class RealExecutionReport {
       exitCode: json['exit_code'] as int? ?? 0,
       durationMs: json['duration_ms'] as int? ?? 0,
       dryRun: json['dry_run'] as bool? ?? false,
+      bytesWritten: (json['bytes_written'] as num? ?? 0).toInt(),
+      ioMode: json['io_mode'] as String? ?? '',
     );
   }
 }
 
 class RealProgressEvent {
+  final int schemaVersion;
   final String phase;
-  final double percent;
-  final String message;
+  final int bytesDone;
+  final int bytesTotal;
+  final double? percent;
+  final double speedBytesPerSec;
   final int? etaSeconds;
+  final String message;
+  final bool isHeartbeat;
 
   RealProgressEvent({
+    this.schemaVersion = 2,
     required this.phase,
-    required this.percent,
-    required this.message,
+    this.bytesDone = 0,
+    this.bytesTotal = 0,
+    this.percent,
+    this.speedBytesPerSec = 0.0,
     this.etaSeconds,
+    required this.message,
+    this.isHeartbeat = false,
   });
 
   factory RealProgressEvent.fromJson(Map<String, dynamic> json) {
+    final num? pct = json['percent'] as num?;
     return RealProgressEvent(
+      schemaVersion: json['schema_version'] as int? ?? 2,
       phase: json['phase'] as String? ?? 'Unknown',
-      percent: (json['percent'] as num? ?? 0.0).toDouble(),
-      message: json['message'] as String? ?? '',
+      bytesDone: (json['bytes_done'] as num? ?? 0).toInt(),
+      bytesTotal: (json['bytes_total'] as num? ?? 0).toInt(),
+      percent: pct?.toDouble(),
+      speedBytesPerSec: (json['speed_bytes_per_sec'] as num? ?? 0.0).toDouble(),
       etaSeconds: json['eta_seconds'] as int?,
+      message: json['message'] as String? ?? '',
+      isHeartbeat: json['is_heartbeat'] as bool? ?? false,
     );
   }
 }
@@ -92,6 +114,10 @@ class RealVerificationReport {
 }
 
 class RealSanitizationService {
+  Process? _activeProcess;
+
+  Process? get activeProcess => _activeProcess;
+
   /// Resolves the compiled zt_engine binary path using:
   /// 1. ZT_ENGINE_PATH environment variable.
   /// 2. Workspace target directory target/release/zt_engine (development).
@@ -156,6 +182,28 @@ class RealSanitizationService {
     }
   }
 
+  /// Unified cancellation interface:
+  /// Sends SIGTERM to allow engine to gracefully sync buffers, write checkpoint, and exit with code 130.
+  /// Escalates to SIGKILL if the process fails to exit within 5 seconds.
+  Future<void> cancelActiveProcess() async {
+    final proc = _activeProcess;
+    if (proc == null) return;
+
+    try {
+      // Step 1: Request graceful cancellation
+      proc.kill(ProcessSignal.sigterm);
+
+      // Step 2: 5-second timeout escalation to hard kill
+      await proc.exitCode.timeout(
+        const Duration(seconds: 5),
+        onTimeout: () {
+          proc.kill(ProcessSignal.sigkill);
+          return -9;
+        },
+      );
+    } catch (_) {}
+  }
+
   /// Spawn zt_engine binary for real-time sanitization, updating progress via callback.
   Future<RealExecutionReport> executeSanitization({
     required DeviceProfile device,
@@ -170,9 +218,7 @@ class RealSanitizationService {
     final binary = await getBinaryPath();
     final cliMethod = mapMethodToCliArg(method, device);
     
-    // Map device name to a linux path (e.g. /dev/sdb). 
-    // Real profiles will have real path in id/name/notes, but let's ensure we use a real path.
-    // Real device profiles created in discoverDevices have id "real_sdb" - we parse name or prefix it.
+    // Map device name to a linux path (e.g. /dev/sdb).
     String devPath = device.id.startsWith('real_') 
         ? '/dev/${device.id.substring(5)}' 
         : '/dev/null'; // safe fallback for simulator/dry run
@@ -196,60 +242,67 @@ class RealSanitizationService {
     onRawLog('EXECUTION: Launching $binary ${args.join(' ')}');
 
     final Process process = await Process.start(binary, args);
+    _activeProcess = process;
     RealExecutionReport? finalReport;
     final StringBuffer stderrBuffer = StringBuffer();
 
-    // Handle stdout line-by-line
-    final stdoutStream = process.stdout
-        .transform(utf8.decoder)
-        .transform(const LineSplitter());
+    try {
+      // Handle stdout line-by-line
+      final stdoutStream = process.stdout
+          .transform(utf8.decoder)
+          .transform(const LineSplitter());
 
-    await for (final line in stdoutStream) {
-      onRawLog(line);
-      if (line.startsWith('PROGRESS:')) {
-        try {
-          final jsonStr = line.substring('PROGRESS:'.length);
-          final parsed = jsonDecode(jsonStr);
-          final event = RealProgressEvent.fromJson(parsed);
-          onProgress(event);
-        } catch (e) {
-          onRawLog('ERROR parsing progress event: $e');
-        }
-      } else if (line.startsWith('REPORT:')) {
-        try {
-          final jsonStr = line.substring('REPORT:'.length);
-          final parsed = jsonDecode(jsonStr);
-          finalReport = RealExecutionReport.fromJson(parsed);
-        } catch (e) {
-          onRawLog('ERROR parsing final report: $e');
+      await for (final line in stdoutStream) {
+        onRawLog(line);
+        if (line.startsWith('PROGRESS:')) {
+          try {
+            final jsonStr = line.substring('PROGRESS:'.length);
+            final parsed = jsonDecode(jsonStr);
+            final event = RealProgressEvent.fromJson(parsed);
+            onProgress(event);
+          } catch (e) {
+            onRawLog('ERROR parsing progress event: $e');
+          }
+        } else if (line.startsWith('REPORT:')) {
+          try {
+            final jsonStr = line.substring('REPORT:'.length);
+            final parsed = jsonDecode(jsonStr);
+            finalReport = RealExecutionReport.fromJson(parsed);
+          } catch (e) {
+            onRawLog('ERROR parsing final report: $e');
+          }
         }
       }
+
+      // Handle stderr
+      process.stderr.transform(utf8.decoder).listen((data) {
+        stderrBuffer.write(data);
+      });
+
+      final exitCode = await process.exitCode;
+      onRawLog('EXECUTION: zt_engine exited with code $exitCode');
+
+      if (finalReport != null) {
+        return finalReport;
+      }
+
+      // Fallback if binary failed without writing report JSON
+      final rawStderr = stderrBuffer.toString();
+      return RealExecutionReport(
+        success: exitCode == 0,
+        methodUsed: cliMethod,
+        commandLog: ['$binary ${args.join(' ')}'],
+        stdout: '',
+        stderr: rawStderr.isNotEmpty ? rawStderr : 'Process exited with code $exitCode',
+        exitCode: exitCode,
+        durationMs: 0,
+        dryRun: dryRun,
+      );
+    } finally {
+      if (_activeProcess == process) {
+        _activeProcess = null;
+      }
     }
-
-    // Handle stderr
-    process.stderr.transform(utf8.decoder).listen((data) {
-      stderrBuffer.write(data);
-    });
-
-    final exitCode = await process.exitCode;
-    onRawLog('EXECUTION: zt_engine exited with code $exitCode');
-
-    if (finalReport != null) {
-      return finalReport;
-    }
-
-    // Fallback if binary failed without writing report JSON
-    final rawStderr = stderrBuffer.toString();
-    return RealExecutionReport(
-      success: exitCode == 0,
-      methodUsed: cliMethod,
-      commandLog: ['$binary ${args.join(' ')}'],
-      stdout: '',
-      stderr: rawStderr.isNotEmpty ? rawStderr : 'Process exited prematurely with code $exitCode',
-      exitCode: exitCode,
-      durationMs: 0,
-      dryRun: dryRun,
-    );
   }
 
   /// Run post-erase verification LBA sampling on physical device.

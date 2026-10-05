@@ -210,8 +210,11 @@ async fn test_software_overwrite_zeros_dry_run() {
     let report = result.unwrap();
     assert!(report.success);
     assert!(report.dry_run);
-    assert!(report.command_log.iter().any(|c| c.contains("dd")));
-    assert!(report.command_log.iter().any(|c| c.contains("if=/dev/zero")));
+    assert!(report.command_log.iter().any(|c| c.contains("Native block overwrite")));
+    // Item 2 test: Prove dry run performs no unmount and never opens the target for writing
+    assert!(!report.command_log.iter().any(|c| c.to_lowercase().contains("umount")));
+    assert_eq!(report.bytes_written, 0);
+    assert_eq!(report.io_mode, "dry_run");
 
     let mut events = Vec::new();
     while let Ok(evt) = rx.try_recv() {
@@ -221,13 +224,13 @@ async fn test_software_overwrite_zeros_dry_run() {
 }
 
 #[tokio::test]
-async fn test_software_overwrite_nist_legacy_3pass_dry_run() {
+async fn test_software_overwrite_multi_pass_3_dry_run() {
     let (tx, _rx) = mpsc::channel::<ProgressEvent>(64);
 
     let result = software_overwrite(
         "/dev/sdb",
-        1,                     // ignored for NistLegacy3Pass
-        OverwritePattern::NistLegacy3Pass,
+        1,                     // ignored for MultiPass3
+        OverwritePattern::MultiPass3,
         "NIST_SER",
         "NIST_SER",
         true,
@@ -236,9 +239,10 @@ async fn test_software_overwrite_nist_legacy_3pass_dry_run() {
 
     let report = result.unwrap();
     assert!(report.success);
-    // Should have dd commands for 3 passes
-    let dd_count = report.command_log.iter().filter(|c| c.starts_with("dd")).count();
-    assert_eq!(dd_count, 3, "NIST legacy 3-pass should issue exactly 3 dd commands");
+    assert!(report.dry_run);
+    assert!(report.command_log.iter().any(|c| c.contains("3 passes")));
+    assert!(!report.command_log.iter().any(|c| c.to_lowercase().contains("umount")));
+    assert_eq!(report.bytes_written, 0);
 }
 
 // =========================================================================
@@ -355,10 +359,9 @@ async fn test_confirmation_mismatch_on_software_overwrite() {
 async fn test_progress_events_cover_all_phases() {
     let (tx, mut rx) = mpsc::channel::<ProgressEvent>(64);
 
-    let _ = software_overwrite(
+    let _ = ata_secure_erase(
         "/dev/sdb",
-        1,
-        OverwritePattern::Zeros,
+        false,
         "PHASE_SER",
         "PHASE_SER",
         true,
@@ -399,7 +402,7 @@ async fn test_progress_percentages_are_monotonically_increasing() {
     for i in 1..events.len() {
         assert!(
             events[i].percent >= events[i - 1].percent,
-            "Progress should be monotonically increasing: {} < {} at event {}",
+            "Progress should be monotonically increasing: {:?} < {:?} at event {}",
             events[i].percent,
             events[i - 1].percent,
             i

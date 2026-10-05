@@ -240,6 +240,10 @@ pub fn verify_device(
     let mut all_sector_data = Vec::new(); // concatenated for entropy calculation
     let mut all_pass = true;
 
+    let is_crypto_mode = method_used.to_lowercase().contains("crypto")
+        || method_used.to_lowercase().contains("revert")
+        || method_used.to_lowercase().contains("opal");
+
     for &offset in &offsets {
         match read_sector_at(device_path, offset) {
             Ok(sector_data) => {
@@ -249,10 +253,12 @@ pub fn verify_device(
                 // Check pass condition
                 let sample_pass = if expect_zeros {
                     is_zero
+                } else if is_crypto_mode {
+                    // For crypto erase: controllers can return all zeros (unmapped) or ciphertext
+                    is_zero || shannon_entropy(&sector_data) > 0.5
                 } else {
-                    // For crypto erase: expect high entropy (not plaintext residue)
-                    // A zero sector after crypto erase is also acceptable (key destroyed → reads as zero)
-                    is_zero || shannon_entropy(&sector_data) > 0.7
+                    // For random software overwrite pass: sector must not be all zeros
+                    !is_zero
                 };
 
                 if !sample_pass {
@@ -292,8 +298,20 @@ pub fn verify_device(
     }
     let fingerprint_hash = format!("{:x}", fingerprint_hasher.finalize());
 
+    // Item 3: Random-pass verification: no per-512B-sample 7.99 threshold.
+    // Use aggregated samples or a statistical test, verified against real ChaCha output.
+    let final_pass = if expect_zeros {
+        all_pass
+    } else if is_crypto_mode {
+        // For crypto erase: require aggregated entropy > 0.95 or all zeros
+        all_pass && (entropy_score > 0.95 || all_sector_data.iter().all(|&b| b == 0))
+    } else {
+        // For random overwrite pass: require aggregated entropy > 0.95
+        all_pass && entropy_score > 0.95
+    };
+
     Ok(VerificationReport {
-        pass: all_pass,
+        pass: final_pass,
         sample_count: samples.len() as u32,
         samples,
         entropy_score,

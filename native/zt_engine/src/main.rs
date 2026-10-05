@@ -39,9 +39,13 @@ async fn main() {
 
             // Spawn progress handler to print JSON lines to stdout in real-time
             let progress_handle = tokio::spawn(async move {
+                use std::io::Write;
+                let stdout = std::io::stdout();
                 while let Some(event) = rx.recv().await {
                     if let Ok(json) = serde_json::to_string(&event) {
-                        println!("PROGRESS:{}", json);
+                        let mut handle = stdout.lock();
+                        let _ = writeln!(handle, "PROGRESS:{}", json);
+                        let _ = handle.flush();
                     }
                 }
             });
@@ -78,7 +82,7 @@ async fn main() {
                     software_overwrite(device, 1, OverwritePattern::Random, token, serial, dry_run, tx).await
                 }
                 "overwrite-3pass" => {
-                    software_overwrite(device, 3, OverwritePattern::NistLegacy3Pass, token, serial, dry_run, tx).await
+                    software_overwrite(device, 3, OverwritePattern::MultiPass3, token, serial, dry_run, tx).await
                 }
                 _ => {
                     eprintln!("Unknown method: {}", method);

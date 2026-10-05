@@ -52,6 +52,17 @@ class SanitizationController extends ChangeNotifier {
   // Simple Mode shared state (reset on every launch)
   bool _showInternalDrives = false;
 
+  // Real-time telemetry and stall watchdog
+  DateTime? _lastHeartbeatTime;
+  Timer? _stallWatchdogTimer;
+  bool _isStalled = false;
+  double _currentSpeedBytesPerSec = 0.0;
+  int? _currentEtaSeconds;
+
+  bool get isStalled => _isStalled;
+  double get currentSpeedBytesPerSec => _currentSpeedBytesPerSec;
+  int? get currentEtaSeconds => _currentEtaSeconds;
+
   bool _isDisposed = false;
 
   SanitizationController({bool enableAutoPolling = true, bool deferInitialDiscovery = false}) {
@@ -139,15 +150,16 @@ class SanitizationController extends ChangeNotifier {
 
   Future<void> _checkForOrphansOnStartup() async {
     final result = await OrphanedProcessChecker.checkForOrphan();
+    if (_isDisposed) return;
     if (result.status != OrphanCheckStatus.none) {
       _orphanResult = result;
       notifyListeners();
     }
   }
 
-  void acknowledgeOrphan() {
-    if (_orphanResult?.activeJobState != null) {
-      final active = _orphanResult!.activeJobState!;
+  Future<void> acknowledgeOrphan() async {
+    final active = _orphanResult?.activeJobState;
+    if (active != null) {
       _auditLogService.appendEntry(
         AuditLogEntry(
           timestamp: DateTime.now().toIso8601String(),
@@ -198,9 +210,14 @@ class SanitizationController extends ChangeNotifier {
         return d;
       }).toList();
     }
+    final serial = active?.deviceSerial;
     _orphanResult = null;
-    JobStateFile.clearActiveJob();
     notifyListeners();
+
+    if (serial != null) {
+      await OrphanedProcessChecker.removeEngineCheckpoint(serial);
+    }
+    await JobStateFile.clearActiveJob();
   }
 
   /// Whether the currently running job can be safely cancelled.
@@ -222,6 +239,8 @@ class SanitizationController extends ChangeNotifier {
   /// Leaves the target drive marked as partially wiped.
   Future<void> cancelCurrentJob() async {
     if (!canCancelJob || _currentJob == null) return;
+    _addLog('USER CANCEL: Sending cancellation signal to zt_engine (SIGTERM with 5s hard-kill escalation)...');
+    await _realSanitizeService.cancelActiveProcess();
     final job = _currentJob!;
     job.status = JobStatus.failed;
     job.endTime = DateTime.now();
@@ -517,6 +536,7 @@ class SanitizationController extends ChangeNotifier {
   void dispose() {
     _isDisposed = true;
     _stopAutoPolling();
+    _stallWatchdogTimer?.cancel();
     super.dispose();
   }
 
@@ -653,14 +673,14 @@ class SanitizationController extends ChangeNotifier {
       try {
         // Stage 1: Detecting & unmounting filesystems
         job.status = JobStatus.unmounting;
-        job.progress = 0.10;
+        job.progress = null; // Honest indeterminate state
         job.currentStageDescription = 'Preparing device: zt_engine handling partition unmounts...';
         _addLog('SYSTEM: Initializing device preparation (zt_engine managing unmount)...');
         notifyListeners();
 
         // Stage 2: Sanitization execution
         job.status = JobStatus.sanitizing;
-        job.progress = 0.20;
+        job.progress = null; // Honest indeterminate state until write progress arrives
         job.currentStageDescription = 'Executing real-hardware sanitization...';
         notifyListeners();
 
@@ -673,6 +693,24 @@ class SanitizationController extends ChangeNotifier {
           startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
         ));
 
+        _lastHeartbeatTime = DateTime.now();
+        _isStalled = false;
+        _stallWatchdogTimer?.cancel();
+        _stallWatchdogTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+          if (job.status == JobStatus.sanitizing && _lastHeartbeatTime != null) {
+            final secondsSinceHeartbeat = DateTime.now().difference(_lastHeartbeatTime!).inSeconds;
+            if (secondsSinceHeartbeat >= 30 && !_isStalled) {
+              _isStalled = true;
+              job.currentStageDescription = 'Drive I/O stalled - waiting for hardware response...';
+              _addLog('WARNING: No progress or heartbeat received for ${secondsSinceHeartbeat}s; drive I/O may be stalled.');
+              notifyListeners();
+            } else if (secondsSinceHeartbeat < 30 && _isStalled) {
+              _isStalled = false;
+              notifyListeners();
+            }
+          }
+        });
+
         final report = await _realSanitizeService.executeSanitization(
           device: job.device,
           method: job.effectiveMethod,
@@ -680,9 +718,36 @@ class SanitizationController extends ChangeNotifier {
           deviceSerial: job.device.serialNumber,
           dryRun: false,
           onProgress: (event) {
-            job.progress = 0.20 + (event.percent * 0.60); // map 0.0-1.0 to 0.20-0.80 range
-            job.currentStageDescription = 'Sanitizing: ${event.message}';
-            _addLog('PROGRESS: [${event.phase}] ${event.message} (${(event.percent * 100).toInt()}%)');
+            _lastHeartbeatTime = DateTime.now();
+            if (_isStalled) {
+              _isStalled = false;
+            }
+            if (event.isHeartbeat) {
+              notifyListeners();
+              return;
+            }
+
+            _currentSpeedBytesPerSec = event.speedBytesPerSec;
+            _currentEtaSeconds = event.etaSeconds;
+
+            // Firmware sanitize methods have percent == null -> indeterminate
+            // Software overwrite has real percent computed by native engine
+            job.progress = event.percent;
+
+            if (event.bytesTotal > 0 && event.bytesDone > 0) {
+              final doneGb = (event.bytesDone / 1e9).toStringAsFixed(1);
+              final totalGb = (event.bytesTotal / 1e9).toStringAsFixed(1);
+              final speedMb = (event.speedBytesPerSec / 1e6).toStringAsFixed(1);
+              final etaStr = event.etaSeconds != null && event.speedBytesPerSec > 1024
+                  ? 'ETA: ${event.etaSeconds}s'
+                  : 'Estimating ETA...';
+              job.currentStageDescription = '${event.message} ($doneGb / $totalGb GB @ $speedMb MB/s, $etaStr)';
+            } else {
+              job.currentStageDescription = event.message;
+            }
+
+            final pctStr = event.percent != null ? ' (${(event.percent! * 100).toInt()}%)' : '';
+            _addLog('PROGRESS: [${event.phase}] ${event.message}$pctStr');
             notifyListeners();
           },
           onRawLog: (rawLine) {
@@ -690,6 +755,9 @@ class SanitizationController extends ChangeNotifier {
             notifyListeners();
           },
         );
+
+        _stallWatchdogTimer?.cancel();
+        _stallWatchdogTimer = null;
 
         if (!report.success) {
           job.status = JobStatus.failed;
@@ -710,7 +778,7 @@ class SanitizationController extends ChangeNotifier {
 
         // Stage 3: Verification LBA sampling
         job.status = JobStatus.verifying;
-        job.progress = 0.80;
+        job.progress = null; // Indeterminate during LBA sampling
         job.currentStageDescription = 'Verifying sector erasure via LBA sampling...';
         _addLog('VERIFICATION: Running post-sanitize verify LBA sampling...');
         notifyListeners();
@@ -734,9 +802,6 @@ class SanitizationController extends ChangeNotifier {
           _addLog('WARNING: Verification sampling failed: $verifyErr');
           _addLog('NOTE: Disk write operation itself completed successfully.');
         }
-
-        job.progress = 0.95;
-        notifyListeners();
 
         final bool verificationPassed = verifyReport?.pass ?? false;
 

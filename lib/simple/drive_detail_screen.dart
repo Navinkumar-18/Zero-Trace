@@ -497,22 +497,24 @@ class DriveDetailScreen extends StatelessWidget {
 
           // Circular progress
           SizedBox(
-            width: 100,
-            height: 100,
+            width: 120,
+            height: 120,
             child: Stack(
               alignment: Alignment.center,
               children: [
                 CircularProgressIndicator(
                   value: job.progress,
-                  strokeWidth: 8,
+                  strokeWidth: 10,
                   backgroundColor: AppTheme.surfaceBorder,
                   valueColor: const AlwaysStoppedAnimation<Color>(
                       AppTheme.simplePrimary),
                 ),
                 Text(
-                  '${(job.progress * 100).toInt()}%',
+                  job.progress != null
+                      ? '${(job.progress! * 100).toInt()}%'
+                      : '...',
                   style: const TextStyle(
-                    fontSize: 22,
+                    fontSize: 28,
                     fontWeight: FontWeight.bold,
                     color: AppTheme.textPrimary,
                   ),

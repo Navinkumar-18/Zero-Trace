@@ -155,7 +155,7 @@ class SanitizationJob {
   final String explanationText;
   
   JobStatus status;
-  double progress; // 0.0 to 1.0
+  double? progress; // 0.0 to 1.0, null for indeterminate
   String currentStageDescription;
   DateTime? startTime;
   DateTime? endTime;
@@ -177,7 +177,7 @@ class SanitizationJob {
     required this.standardReference,
     required this.explanationText,
     this.status = JobStatus.idle,
-    this.progress = 0.0,
+    this.progress,
     this.currentStageDescription = 'Ready to initiate sanitization pipeline',
     this.startTime,
     this.endTime,

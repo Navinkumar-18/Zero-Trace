@@ -208,8 +208,9 @@ class _DriveListScreenState extends State<DriveListScreen> {
                                 ),
                                 const SizedBox(height: 2),
                                 Text(
-                                  'Device ${orphanResult.activeJobState?.deviceName ?? "unknown"} '
-                                  'was not cleanly verified. Check before reuse.',
+                                  'Device ${orphanResult.activeJobState?.deviceName ?? "unknown"}: '
+                                  '${orphanResult.checkpointWording ?? "about 0 GB reported written at the last check, not verified"}. '
+                                  'Check before reuse.',
                                   style: const TextStyle(
                                     color: AppTheme.textSecondary,
                                     fontSize: 12,
