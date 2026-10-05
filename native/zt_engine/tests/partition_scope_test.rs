@@ -2,13 +2,15 @@
 //! MBR extended container checks, fingerprint verification, and PartitionRangeWriter.
 
 use std::fs::{self, OpenOptions};
+use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::sync::mpsc;
 
 use sha2::{Digest, Sha256};
 use zt_engine::certificate::{sign_certificate, verify_ed25519_signature, SigningMethod};
 use zt_engine::execute::*;
-use zt_engine::verify::verify_device_scoped;
+use zt_engine::verify::{verify_device_scoped, VerificationReport};
 
 // =========================================================================
 // 1. Method Allowlist Test (Iterates every variant of EngineMethod::ALL)
@@ -378,18 +380,32 @@ fn test_refuse_partition_active_md_lvm_holder_unmount_failure() {
 
 #[test]
 fn test_partition_auto_remount_ebusy_message() {
-    // Verify that the error message returned on EBUSY specifically matches:
-    // "the system remounted the drive, retry"
-    let ebusy_err = ExecuteError::CommandFailed(
-        "the system remounted the drive, retry (Device /dev/sda1 is busy or mounted with O_EXCL conflict)".to_string()
-    );
+    // Exercises map_open_excl_error: verify that libc::EBUSY error translates to
+    // the exact required failure message instructing retry on auto-remount.
+    let ebusy_io_err = std::io::Error::from_raw_os_error(libc::EBUSY);
+    let mapped_ebusy = map_open_excl_error(ebusy_io_err, "/dev/sda1");
 
-    let err_str = ebusy_err.to_string();
-    assert!(
-        err_str.contains("the system remounted the drive, retry"),
-        "EBUSY error message must contain exact phrase 'the system remounted the drive, retry'. Got: {}",
-        err_str
-    );
+    match mapped_ebusy {
+        ExecuteError::CommandFailed(msg) => {
+            assert!(
+                msg.contains("the system remounted the drive, retry"),
+                "EBUSY must translate to 'the system remounted the drive, retry'. Got: {}",
+                msg
+            );
+            assert!(msg.contains("/dev/sda1"));
+        }
+        other => panic!("Expected CommandFailed on EBUSY, got {:?}", other),
+    }
+
+    // Verify non-EBUSY error translates to DeviceNotFound
+    let enoent_io_err = std::io::Error::from_raw_os_error(libc::ENOENT);
+    let mapped_enoent = map_open_excl_error(enoent_io_err, "/dev/sda1");
+    match mapped_enoent {
+        ExecuteError::DeviceNotFound(msg) => {
+            assert!(msg.contains("Failed to open device /dev/sda1 with O_EXCL"));
+        }
+        other => panic!("Expected DeviceNotFound on ENOENT, got {:?}", other),
+    }
 }
 
 // =========================================================================
@@ -414,6 +430,13 @@ async fn test_dry_run_partition_assert_zero_write_opens() {
     fs::write(p_dir.join("partition"), "1\n").unwrap();
     fs::write(p_dir.join("start"), "2048\n").unwrap();
     fs::write(p_dir.join("size"), "204800\n").unwrap();
+
+    // Create device file on disk with read-only permissions (0o400)
+    // If dry-run attempted any write open (O_RDWR or O_WRONLY), open() would fail with EACCES
+    let dev_file_path = dev_root.join("sda1");
+    let initial_data = vec![0x55u8; 4096];
+    fs::write(&dev_file_path, &initial_data).unwrap();
+    fs::set_permissions(&dev_file_path, fs::Permissions::from_mode(0o400)).unwrap();
 
     // Mountinfo with safe root
     let mountinfo = "1 0 8:0 / / rw,relatime - ext4 /dev/root rw\n";
@@ -443,13 +466,17 @@ async fn test_dry_run_partition_assert_zero_write_opens() {
         true, // dry_run = true
         tx,
         &ctx,
-    ).await.expect("Dry run should succeed");
+    ).await.expect("Dry run should succeed without opening device for writing");
 
     assert!(report.success);
     assert!(report.dry_run);
     assert_eq!(report.bytes_written, 0, "Dry run must write ZERO bytes");
     assert_eq!(report.io_mode, "dry_run");
     assert!(report.command_log.iter().all(|line| line.starts_with("[DRY RUN]")));
+
+    // Verify that the read-only file was never written to
+    let current_data = fs::read(&dev_file_path).unwrap();
+    assert_eq!(current_data, initial_data, "Underlying file data must be completely unmodified");
 }
 
 // =========================================================================
@@ -572,4 +599,426 @@ fn test_real_loop_device_partition_overwrite_and_verify() {
     println!("2. parted -s /tmp/test_disk.img mklabel gpt mkpart p1 ext4 2048s 32768s mkpart p2 ext4 34816s 65500s");
     println!("3. sudo losetup -Pf /tmp/test_disk.img");
     println!("4. cargo test --test partition_scope_test test_real_loop_device -- --ignored");
+}
+
+// =========================================================================
+// 10. CLI Fail-Closed & Missing Flag Validation Tests
+// =========================================================================
+
+#[test]
+fn test_cli_refuse_partition_without_mode_partition() {
+    let binary = env!("CARGO_BIN_EXE_zt_engine");
+    let output = Command::new(binary)
+        .args(&["sanitize", "/dev/sdb1", "overwrite-zero", "TOKEN", "SERIAL"])
+        .output()
+        .expect("Failed to execute zt_engine CLI");
+
+    assert_eq!(output.status.code(), Some(1), "Target partition without --mode partition must exit with 1");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("target '/dev/sdb1' appears to be a partition, but --mode partition was not specified (fail closed)"),
+        "Unexpected stderr: {}", stderr
+    );
+}
+
+#[test]
+fn test_cli_missing_expected_flags_in_partition_mode() {
+    let binary = env!("CARGO_BIN_EXE_zt_engine");
+    let output = Command::new(binary)
+        .args(&["sanitize", "/dev/sdb1", "overwrite-zero", "TOKEN", "SERIAL", "--mode", "partition"])
+        .output()
+        .expect("Failed to execute zt_engine CLI");
+
+    assert_eq!(output.status.code(), Some(1), "Partition mode missing expected flags must exit with 1");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Partition mode requires --expected-part-num, --expected-start-sector, --expected-size-sectors, and --expected-table-fingerprint"),
+        "Unexpected stderr: {}", stderr
+    );
+}
+
+// =========================================================================
+// 11. Geometry Mismatch Refusal
+// =========================================================================
+
+#[tokio::test]
+async fn test_partition_geometry_mismatch_refused() {
+    let tmp = TempDir::new().unwrap();
+    let sys_root = tmp.path().join("sys");
+    let proc_root = tmp.path().join("proc");
+    let dev_root = tmp.path().join("dev");
+    let class_block = sys_root.join("class/block");
+    fs::create_dir_all(&class_block).unwrap();
+    fs::create_dir_all(&proc_root).unwrap();
+    fs::create_dir_all(&dev_root).unwrap();
+
+    // Mock parent sdb and partition sdb1
+    fs::create_dir_all(class_block.join("sdb")).unwrap();
+    let p_dir = class_block.join("sdb1");
+    fs::create_dir_all(&p_dir).unwrap();
+    fs::write(p_dir.join("partition"), "1\n").unwrap();
+    fs::write(p_dir.join("start"), "2048\n").unwrap();
+    fs::write(p_dir.join("size"), "204800\n").unwrap();
+
+    let mountinfo = "1 0 8:0 / / rw,relatime - ext4 /dev/root rw\n";
+    fs::create_dir_all(proc_root.join("self")).unwrap();
+    fs::write(proc_root.join("self/mountinfo"), mountinfo).unwrap();
+
+    let ctx = FsContext { sys_root, proc_root, dev_root };
+    let fp = compute_partition_table_fingerprint("sdb", &ctx).unwrap();
+    let (tx, _rx) = mpsc::channel(16);
+
+    // Mismatched expected_start_sector: 99999 vs sysfs 2048
+    let params_mismatch = PartitionTargetParams {
+        expected_partition_num: 1,
+        expected_start_sector: 99999,
+        expected_size_sectors: 204800,
+        expected_partuuid: None,
+        expected_table_fingerprint: fp,
+    };
+
+    let res = software_overwrite_partition_ctx(
+        "/dev/sdb1",
+        1,
+        OverwritePattern::Zeros,
+        "SER123",
+        "SER123",
+        &params_mismatch,
+        true,
+        tx,
+        &ctx,
+    ).await;
+
+    assert!(res.is_err(), "Must refuse on geometry mismatch");
+    match res.unwrap_err() {
+        ExecuteError::IdentityMismatch(msg) => {
+            assert!(msg.contains("Partition start sector mismatch: expected 99999, got sysfs start 2048"), "Got: {}", msg);
+        }
+        other => panic!("Expected IdentityMismatch, got {:?}", other),
+    }
+}
+
+// =========================================================================
+// 12. Sibling Removable Mount vs Protected Mount / Swap Test
+// =========================================================================
+
+#[test]
+fn test_sibling_allowed_removable_mount_vs_protected_mount_or_swap() {
+    let tmp = TempDir::new().unwrap();
+    let sys_root = tmp.path().join("sys");
+    let proc_root = tmp.path().join("proc");
+    let dev_root = tmp.path().join("dev");
+    let class_block = sys_root.join("class/block");
+    fs::create_dir_all(&class_block).unwrap();
+    fs::create_dir_all(&proc_root).unwrap();
+    fs::create_dir_all(&dev_root).unwrap();
+    fs::create_dir_all(proc_root.join("self")).unwrap();
+
+    // Mock parent sdb
+    fs::create_dir_all(class_block.join("sdb")).unwrap();
+
+    // Target partition sdb1
+    let p1_dir = class_block.join("sdb1");
+    fs::create_dir_all(&p1_dir).unwrap();
+    fs::write(p1_dir.join("partition"), "1\n").unwrap();
+    fs::write(p1_dir.join("start"), "2048\n").unwrap();
+    fs::write(p1_dir.join("size"), "204800\n").unwrap();
+    fs::write(p1_dir.join("dev"), "8:17\n").unwrap();
+
+    // Sibling partition sdb2
+    let p2_dir = class_block.join("sdb2");
+    fs::create_dir_all(&p2_dir).unwrap();
+    fs::write(p2_dir.join("partition"), "2\n").unwrap();
+    fs::write(p2_dir.join("start"), "206848\n").unwrap();
+    fs::write(p2_dir.join("size"), "204800\n").unwrap();
+    fs::write(p2_dir.join("dev"), "8:18\n").unwrap();
+
+    // Create device nodes in dev_root
+    fs::write(dev_root.join("sdb1"), "").unwrap();
+    fs::write(dev_root.join("sdb2"), "").unwrap();
+
+    let ctx = FsContext {
+        sys_root: sys_root.clone(),
+        proc_root: proc_root.clone(),
+        dev_root: dev_root.clone(),
+    };
+
+    // Case A: Sibling sdb2 is mounted under an allowed removable mount (/media/usb_stick)
+    let mountinfo_allowed = "\
+1 0 8:0 / / rw,relatime - ext4 /dev/root rw\n\
+2 1 8:18 / /media/usb_stick rw,relatime - vfat /dev/sdb2 rw\n";
+    fs::write(proc_root.join("self/mountinfo"), mountinfo_allowed).unwrap();
+
+    let res_allowed = check_boot_disk_protection_ctx("/dev/sdb1", false, &ctx);
+    assert!(
+        res_allowed.is_ok(),
+        "Sibling partition sdb2 mounted under /media must NOT prevent wiping target sdb1: {:?}",
+        res_allowed.err()
+    );
+
+    // Case B: Sibling sdb2 is hosting a protected system mount (/home)
+    let mountinfo_protected = "\
+1 0 8:0 / / rw,relatime - ext4 /dev/root rw\n\
+2 1 8:18 / /home rw,relatime - ext4 /dev/sdb2 rw\n";
+    fs::write(proc_root.join("self/mountinfo"), mountinfo_protected).unwrap();
+
+    let res_protected = check_boot_disk_protection_ctx("/dev/sdb1", false, &ctx);
+    assert!(
+        res_protected.is_err(),
+        "Sibling partition sdb2 hosting protected mount (/home) MUST refuse operation"
+    );
+    match res_protected.unwrap_err() {
+        ExecuteError::BootDiskProtection(msg) => {
+            assert!(
+                msg.contains("matches a protected device/mount") && msg.contains("sdb2"),
+                "Expected protected mount msg mentioning sdb2: {}",
+                msg
+            );
+        }
+        other => panic!("Expected BootDiskProtection, got {:?}", other),
+    }
+
+    // Case C: Sibling sdb2 is an active swap partition
+    fs::write(proc_root.join("self/mountinfo"), mountinfo_allowed).unwrap(); // reset mountinfo to allowed
+    let swaps_content = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/dev/sdb2\t\t\t\tpartition\t1048572\t\t0\t\t-2\n";
+    fs::write(proc_root.join("swaps"), swaps_content).unwrap();
+
+    let res_swap = check_boot_disk_protection_ctx("/dev/sdb1", false, &ctx);
+    assert!(
+        res_swap.is_err(),
+        "Sibling partition sdb2 hosting active swap MUST refuse operation"
+    );
+    match res_swap.unwrap_err() {
+        ExecuteError::BootDiskProtection(msg) => {
+            assert!(
+                msg.contains("matches a protected device/mount") && msg.contains("sdb2"),
+                "Expected active swap msg mentioning sdb2: {}",
+                msg
+            );
+        }
+        other => panic!("Expected BootDiskProtection for swap, got {:?}", other),
+    }
+}
+
+// =========================================================================
+// 13. Logical Block Size Alignment Refusal
+// =========================================================================
+
+#[tokio::test]
+async fn test_partition_start_size_alignment_refusal() {
+    let tmp = TempDir::new().unwrap();
+    let sys_root = tmp.path().join("sys");
+    let proc_root = tmp.path().join("proc");
+    let dev_root = tmp.path().join("dev");
+    let class_block = sys_root.join("class/block");
+    fs::create_dir_all(&class_block).unwrap();
+    fs::create_dir_all(&proc_root).unwrap();
+    fs::create_dir_all(&dev_root).unwrap();
+
+    // Mock parent sdb with 4096-byte logical block size in queue/logical_block_size
+    let parent_dir = class_block.join("sdb");
+    fs::create_dir_all(parent_dir.join("queue")).unwrap();
+    fs::write(parent_dir.join("queue/logical_block_size"), "4096\n").unwrap();
+
+    // Partition sdb1 starts at sector 2049 (2049 * 512 = 1049088 bytes; 1049088 % 4096 = 512 != 0)
+    let p_dir = class_block.join("sdb1");
+    fs::create_dir_all(&p_dir).unwrap();
+    fs::write(p_dir.join("partition"), "1\n").unwrap();
+    fs::write(p_dir.join("start"), "2049\n").unwrap();
+    fs::write(p_dir.join("size"), "204800\n").unwrap();
+
+    let mountinfo = "1 0 8:0 / / rw,relatime - ext4 /dev/root rw\n";
+    fs::create_dir_all(proc_root.join("self")).unwrap();
+    fs::write(proc_root.join("self/mountinfo"), mountinfo).unwrap();
+
+    let ctx = FsContext { sys_root, proc_root, dev_root };
+    let fp = compute_partition_table_fingerprint("sdb", &ctx).unwrap();
+    let (tx, _rx) = mpsc::channel(16);
+
+    let params = PartitionTargetParams {
+        expected_partition_num: 1,
+        expected_start_sector: 2049,
+        expected_size_sectors: 204800,
+        expected_partuuid: None,
+        expected_table_fingerprint: fp,
+    };
+
+    let res = software_overwrite_partition_ctx(
+        "/dev/sdb1",
+        1,
+        OverwritePattern::Zeros,
+        "SER123",
+        "SER123",
+        &params,
+        true,
+        tx,
+        &ctx,
+    ).await;
+
+    assert!(res.is_err(), "Must refuse execution when partition start/size is not aligned to logical block size");
+    match res.unwrap_err() {
+        ExecuteError::UnsupportedOperation(msg) => {
+            assert!(
+                msg.contains("not aligned to logical block size (4096)"),
+                "Expected alignment refusal message, got: {}",
+                msg
+            );
+        }
+        other => panic!("Expected UnsupportedOperation, got {:?}", other),
+    }
+}
+
+// =========================================================================
+// 14. Targeted Unmount: Touches Target, Sibling Stays Mounted
+// =========================================================================
+
+#[test]
+fn test_unmount_touches_only_target_sibling_stays_mounted() {
+    let tmp = TempDir::new().unwrap();
+    let sys_root = tmp.path().join("sys");
+    let proc_root = tmp.path().join("proc");
+    let dev_root = tmp.path().join("dev");
+    let class_block = sys_root.join("class/block");
+    fs::create_dir_all(&class_block).unwrap();
+    fs::create_dir_all(&proc_root).unwrap();
+    fs::create_dir_all(&dev_root).unwrap();
+
+    // Mock parent sdb and partition sdb1, sdb2
+    fs::create_dir_all(class_block.join("sdb")).unwrap();
+    fs::create_dir_all(class_block.join("sdb1")).unwrap();
+    fs::create_dir_all(class_block.join("sdb2")).unwrap();
+
+    // Both /dev/sdb1 and /dev/sdb2 are in /proc/mounts
+    let mounts_content = "\
+/dev/sdb1 /mnt/target_usb ext4 rw,relatime 0 0\n\
+/dev/sdb2 /mnt/sibling_usb ext4 rw,relatime 0 0\n";
+    fs::write(proc_root.join("mounts"), mounts_content).unwrap();
+
+    let ctx = FsContext { sys_root, proc_root, dev_root };
+    let mut command_log = Vec::new();
+
+    // In dry-run mode, unmount_target_partition_and_holders logs what it would touch
+    let res = unmount_target_partition_and_holders("/dev/sdb1", true, &mut command_log, &ctx);
+    assert!(res.is_ok());
+
+    // Verify command log contains only target partition and no sibling partition
+    assert!(
+        command_log.iter().all(|line| !line.contains("sdb2")),
+        "Unmount must NEVER target sibling partition sdb2. Command log: {:?}",
+        command_log
+    );
+    assert!(
+        command_log.iter().any(|line| line.contains("sdb1")),
+        "Command log must reference target partition sdb1"
+    );
+}
+
+// =========================================================================
+// 15. Resolve Parent Serial From Partition Node
+// =========================================================================
+
+#[test]
+fn test_resolve_parent_serial_from_partition_node() {
+    let tmp = TempDir::new().unwrap();
+    let sys_root = tmp.path().join("sys");
+    let class_block = sys_root.join("class/block");
+    fs::create_dir_all(&class_block).unwrap();
+
+    // Parent sdb
+    let parent_dir = class_block.join("sdb");
+    let device_dir = parent_dir.join("device");
+    fs::create_dir_all(&device_dir).unwrap();
+    fs::write(device_dir.join("serial"), "  WD-WCC4N12345678  \n").unwrap();
+
+    // Partition sdb1
+    let p_dir = class_block.join("sdb1");
+    fs::create_dir_all(&p_dir).unwrap();
+    fs::write(p_dir.join("partition"), "1\n").unwrap();
+
+    let ctx = FsContext {
+        sys_root,
+        proc_root: tmp.path().join("proc"),
+        dev_root: tmp.path().join("dev"),
+    };
+
+    let resolved_serial = resolve_parent_serial("/dev/sdb1", &ctx)
+        .expect("Parent serial should be resolved from partition node");
+
+    assert_eq!(
+        resolved_serial, "WD-WCC4N12345678",
+        "Parent serial must be correctly resolved and trimmed"
+    );
+}
+
+// =========================================================================
+// 16. Verify CLI Scoped vs Whole-Device Compatibility Tests
+// =========================================================================
+
+#[test]
+fn test_verify_cli_whole_device_without_total_device_size_flag() {
+    let tmp = NamedTempFile::new().unwrap();
+    let size: u64 = 65536; // 64 KiB
+    tmp.as_file().set_len(size).unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_zt_engine");
+    let output = Command::new(binary)
+        .args(&[
+            "verify",
+            tmp.path().to_str().unwrap(),
+            &size.to_string(),
+            "SERIAL-TEST-001",
+            "overwrite-zero",
+            "10",
+            "true",
+        ])
+        .output()
+        .expect("Failed to execute zt_engine verify CLI");
+
+    assert_eq!(output.status.code(), Some(0), "Whole device verify CLI without --total-device-size must exit with 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("VERIFY_REPORT:"));
+
+    let json_line = stdout.lines().find(|l| l.starts_with("VERIFY_REPORT:")).unwrap();
+    let json_str = &json_line["VERIFY_REPORT:".len()..];
+    let report: VerificationReport = serde_json::from_str(json_str).unwrap();
+
+    assert!(report.pass);
+    assert_eq!(report.bytes_overwritten, size, "Without flag, bytes_overwritten must equal device size");
+    assert_eq!(report.total_device_bytes, size, "Without flag, total_device_bytes must equal device size");
+}
+
+#[test]
+fn test_verify_cli_scoped_with_total_device_size_flag() {
+    let tmp = NamedTempFile::new().unwrap();
+    let part_size: u64 = 65536; // 64 KiB
+    let total_size: u64 = 1048576; // 1 MiB
+    tmp.as_file().set_len(part_size).unwrap();
+
+    let binary = env!("CARGO_BIN_EXE_zt_engine");
+    let output = Command::new(binary)
+        .args(&[
+            "verify",
+            tmp.path().to_str().unwrap(),
+            &part_size.to_string(),
+            "SERIAL-TEST-002",
+            "overwrite-zero",
+            "10",
+            "true",
+            "--total-device-size",
+            &total_size.to_string(),
+        ])
+        .output()
+        .expect("Failed to execute zt_engine verify CLI");
+
+    assert_eq!(output.status.code(), Some(0), "Scoped verify CLI with --total-device-size must exit with 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("VERIFY_REPORT:"));
+
+    let json_line = stdout.lines().find(|l| l.starts_with("VERIFY_REPORT:")).unwrap();
+    let json_str = &json_line["VERIFY_REPORT:".len()..];
+    let report: VerificationReport = serde_json::from_str(json_str).unwrap();
+
+    assert!(report.pass);
+    assert_eq!(report.bytes_overwritten, part_size, "bytes_overwritten must equal partition size");
+    assert_eq!(report.total_device_bytes, total_size, "total_device_bytes must equal total device size");
 }

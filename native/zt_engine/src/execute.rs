@@ -707,16 +707,7 @@ pub fn verify_exclusive_access_and_recheck(
         let fd = libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_EXCL | libc::O_CLOEXEC);
         if fd < 0 {
             let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EBUSY) {
-                return Err(ExecuteError::CommandFailed(format!(
-                    "the system remounted the drive, retry (Device {} is busy or mounted with O_EXCL conflict)",
-                    device
-                )));
-            }
-            return Err(ExecuteError::DeviceNotFound(format!(
-                "Cannot open device {} with O_EXCL: {}",
-                device, err
-            )));
+            return Err(map_open_excl_error(err, device));
         }
 
         let mut stat_buf: libc::stat = std::mem::zeroed();
@@ -1500,16 +1491,7 @@ impl DirectBlockWriter {
 
         if fd < 0 {
             let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EBUSY) {
-                return Err(ExecuteError::CommandFailed(format!(
-                    "the system remounted the drive, retry (Device {} is busy or mounted with O_EXCL conflict)",
-                    path
-                )));
-            }
-            return Err(ExecuteError::DeviceNotFound(format!(
-                "Failed to open device {} with O_EXCL: {}",
-                path, err
-            )));
+            return Err(map_open_excl_error(err, path));
         }
 
         let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
@@ -2750,6 +2732,64 @@ pub fn resolve_parent_disk(device: &str, ctx: &FsContext) -> Result<String, Exec
     )))
 }
 
+/// Maps raw OS open/lock errors into appropriate ExecuteError.
+/// Specifically translates libc::EBUSY into the auto-remount retry message.
+pub fn map_open_excl_error(err: io::Error, path: &str) -> ExecuteError {
+    if err.raw_os_error() == Some(libc::EBUSY) {
+        ExecuteError::CommandFailed(format!(
+            "the system remounted the drive, retry (Device {} is busy or mounted with O_EXCL conflict)",
+            path
+        ))
+    } else {
+        ExecuteError::DeviceNotFound(format!(
+            "Failed to open device {} with O_EXCL: {}",
+            path, err
+        ))
+    }
+}
+
+/// Resolves the parent disk's serial number for a partition device node.
+pub fn resolve_parent_serial(device: &str, ctx: &FsContext) -> Result<String, ExecuteError> {
+    let parent_name = resolve_parent_disk(device, ctx)?;
+    let parent_dir = ctx.sys_root.join("class/block").join(&parent_name);
+
+    for path in &[
+        parent_dir.join("device/serial"),
+        parent_dir.join("serial"),
+    ] {
+        if let Ok(content) = fs::read_to_string(path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_string());
+            }
+        }
+    }
+
+    let uevent_paths = [
+        parent_dir.join("device/uevent"),
+        parent_dir.join("uevent"),
+    ];
+    for uevent_path in &uevent_paths {
+        if let Ok(uevent) = fs::read_to_string(uevent_path) {
+            for line in uevent.lines() {
+                if let Some(s) = line.strip_prefix("ID_SERIAL_SHORT=")
+                    .or_else(|| line.strip_prefix("ID_SERIAL="))
+                    .or_else(|| line.strip_prefix("SERIAL=")) {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        return Ok(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    Err(ExecuteError::DeviceNotFound(format!(
+        "Cannot resolve serial for parent disk {} of partition {}",
+        parent_name, device
+    )))
+}
+
 /// Performs sector-aligned overwrite on a specific partition node.
 /// Enforces partition method allowlist, sysfs geometry match, parent serial check,
 /// partition table fingerprint invariance, targeted unmount of holders,
@@ -2885,16 +2925,23 @@ pub async fn software_overwrite_partition_ctx(
     }
 
     // 5. Logical block size alignment validation
+    let lbs: u64 = fs::read_to_string(ctx.sys_root.join("class/block").join(&parent_name).join("queue/logical_block_size"))
+        .or_else(|_| fs::read_to_string(part_dir.join("queue/logical_block_size")))
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(512);
+
     let start_bytes = actual_start.checked_mul(512).ok_or_else(|| {
         ExecuteError::UnsupportedOperation("Partition start sector overflow".into())
     })?;
     let verified_size_bytes = actual_size.checked_mul(512).ok_or_else(|| {
         ExecuteError::UnsupportedOperation("Partition size sector overflow".into())
     })?;
-    if start_bytes % 512 != 0 || verified_size_bytes % 512 != 0 {
-        return Err(ExecuteError::UnsupportedOperation(
-            "Partition start or size is not aligned to logical block size".into()
-        ));
+    if start_bytes % lbs != 0 || verified_size_bytes % lbs != 0 {
+        return Err(ExecuteError::UnsupportedOperation(format!(
+            "Partition start or size is not aligned to logical block size ({})",
+            lbs
+        )));
     }
 
     let guard_identity = get_guard_identity(device, dry_run, device_serial, ctx)?;

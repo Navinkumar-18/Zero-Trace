@@ -23,6 +23,7 @@ pub use execute::{
     software_overwrite_partition, software_overwrite_partition_ctx, ALLOWED_PARTITION_METHODS,
     is_mbr_extended_partition, unmount_target_partition_and_holders,
     EngineMethod, validate_partition_method, BlockWriter, FileBlockWriter, execute_writer_overwrite,
+    resolve_parent_disk, resolve_parent_serial, map_open_excl_error,
 };
 pub use verify::{VerificationReport, SampleResult};
 pub use certificate::{SignedCertificate, SigningMethod};
