@@ -1,0 +1,2 @@
+/dev/mmcblk0 is NOT an Opal compliant drive
+No method to determine device type for /dev/mmcblk0

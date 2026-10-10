@@ -1,0 +1,12 @@
+/dev/sda Samsung SSD 870 EVO 500GB     Opal 2.0  Locking Y   MBRDone Y   MBR Y
+Identifying /dev/sda                    Samsung SSD 870 EVO 500GB           SVT01B6Q
+  TPer    Y
+  Locking Y
+  Geometry N
+  Enterprise N
+  SingleUser N
+  DataStore Y
+  OPAL SSC 2.0 compliant
+  Locked = N
+  MBR Shadow = Y
+  MBR Enabled = Y

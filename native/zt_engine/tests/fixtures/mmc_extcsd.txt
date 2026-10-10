@@ -1,0 +1,16 @@
+=============================================
+  Extended CSD rev 1.8 (MMC 5.1)
+=============================================
+
+Card Supported Command sets [S_CMD_SET: 0x01]
+HPI Features [HPI_FEATURE: 0x01]: implementation based on CMD13
+Background operations support [BKOPS_SUPPORT: 0x01]
+Max packed read cmd [MAX_PACKED_READS: 0x3f]
+Max packed write cmd [MAX_PACKED_WRITES: 0x3f]
+Data TAG support [DATA_TAG_SUPPORT: 0x01]
+SEC Feature support [SEC_FEATURE_SUPPORT: 0x55]
+  Secure Removal Type supported
+  Sanitize supported
+  Secure Purge supported
+Trim Multiplier [TRIM_MULT: 0x08]
+Secure Trim Multiplier [SEC_TRIM_MULT: 0x08]
