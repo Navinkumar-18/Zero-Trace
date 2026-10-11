@@ -50,3 +50,6 @@ app.*.map.json
 
 # Zero Trace key files (sensitive)
 .zero_trace/keys/
+.agent/
+.agents/
+.gsd/
