@@ -92,12 +92,6 @@ class SimpleAdvancedDrawer extends StatelessWidget {
                   _sectionHeader('Advanced Tools'),
                   _navTile(
                     context,
-                    icon: Icons.history,
-                    label: 'History',
-                    route: '/history',
-                  ),
-                  _navTile(
-                    context,
                     icon: Icons.smart_toy_outlined,
                     label: 'AI Assistant',
                     route: '/advanced/ai',

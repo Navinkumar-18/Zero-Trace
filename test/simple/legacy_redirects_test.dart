@@ -17,7 +17,7 @@ void main() {
       capacityBytes: 500000000000,
     );
 
-    testWidgets('Idle redirects send legacy paths to / or /history', (tester) async {
+    testWidgets('Idle redirects send legacy paths to /', (tester) async {
       tester.view.physicalSize = const Size(1920, 1080);
       tester.view.devicePixelRatio = 1.0;
 
@@ -35,17 +35,17 @@ void main() {
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 100));
 
-      // Navigate to /advanced/dashboard -> redirects to /history
+      // Navigate to /advanced/dashboard -> redirects to /
       appRouter.go('/advanced/dashboard');
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 100));
-      expect(find.text('Operation History'), findsOneWidget);
+      expect(find.text('Zero Trace'), findsWidgets);
 
-      // Navigate to /advanced/audit -> redirects to /history
+      // Navigate to /advanced/audit -> redirects to /
       appRouter.go('/advanced/audit');
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 100));
-      expect(find.text('Operation History'), findsOneWidget);
+      expect(find.text('Zero Trace'), findsWidgets);
 
       // Navigate to /advanced/devices -> redirects to /
       appRouter.go('/advanced/devices');

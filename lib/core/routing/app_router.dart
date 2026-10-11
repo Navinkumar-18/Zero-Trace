@@ -9,7 +9,6 @@ import '../../services/sanitization_controller.dart';
 import '../../simple/simple_shell.dart';
 import '../../simple/drive_list_screen.dart';
 import '../../simple/drive_detail_screen.dart';
-import '../../simple/history_screen.dart';
 
 final GlobalKey<NavigatorState> _rootNavigatorKey = GlobalKey<NavigatorState>();
 final GlobalKey<NavigatorState> _shellNavigatorKey = GlobalKey<NavigatorState>(debugLabel: 'shell');
@@ -48,12 +47,6 @@ final GoRouter appRouter = GoRouter(
           ),
         ),
         GoRoute(
-          path: '/history',
-          pageBuilder: (context, state) => const NoTransitionPage(
-            child: HistoryScreen(),
-          ),
-        ),
-        GoRoute(
           path: '/advanced/ai',
           pageBuilder: (context, state) => const NoTransitionPage(
             child: AiAssistantScreen(),
@@ -77,7 +70,7 @@ final GoRouter appRouter = GoRouter(
     // ─── Legacy & Retired Route Redirects ───
     GoRoute(
       path: '/advanced/dashboard',
-      redirect: (context, state) => _handleRedirect(context, fallback: '/history'),
+      redirect: (context, state) => _handleRedirect(context, fallback: '/'),
     ),
     GoRoute(
       path: '/advanced/devices',
@@ -105,11 +98,11 @@ final GoRouter appRouter = GoRouter(
     ),
     GoRoute(
       path: '/advanced/verification',
-      redirect: (context, state) => _handleRedirect(context, fallback: '/history'),
+      redirect: (context, state) => _handleRedirect(context, fallback: '/'),
     ),
     GoRoute(
       path: '/advanced/certificates',
-      redirect: (context, state) => _handleRedirect(context, fallback: '/history'),
+      redirect: (context, state) => _handleRedirect(context, fallback: '/'),
       routes: [
         GoRoute(
           path: 'verify',
@@ -119,13 +112,13 @@ final GoRouter appRouter = GoRouter(
     ),
     GoRoute(
       path: '/advanced/audit',
-      redirect: (context, state) => _handleRedirect(context, fallback: '/history'),
+      redirect: (context, state) => _handleRedirect(context, fallback: '/'),
     ),
 
     // Top-level aliases
     GoRoute(
       path: '/dashboard',
-      redirect: (context, state) => _handleRedirect(context, fallback: '/history'),
+      redirect: (context, state) => _handleRedirect(context, fallback: '/'),
     ),
     GoRoute(
       path: '/devices',
@@ -137,19 +130,19 @@ final GoRouter appRouter = GoRouter(
     ),
     GoRoute(
       path: '/verification',
-      redirect: (context, state) => _handleRedirect(context, fallback: '/history'),
+      redirect: (context, state) => _handleRedirect(context, fallback: '/'),
     ),
     GoRoute(
       path: '/certificates',
-      redirect: (context, state) => _handleRedirect(context, fallback: '/history'),
+      redirect: (context, state) => _handleRedirect(context, fallback: '/'),
     ),
     GoRoute(
       path: '/certificate',
-      redirect: (context, state) => _handleRedirect(context, fallback: '/history'),
+      redirect: (context, state) => _handleRedirect(context, fallback: '/'),
     ),
     GoRoute(
       path: '/audit',
-      redirect: (context, state) => _handleRedirect(context, fallback: '/history'),
+      redirect: (context, state) => _handleRedirect(context, fallback: '/'),
     ),
     GoRoute(
       path: '/ai-assistant',
@@ -173,7 +166,7 @@ final GoRouter appRouter = GoRouter(
     ),
     GoRoute(
       path: '/results',
-      redirect: (context, state) => _handleRedirect(context, fallback: '/history'),
+      redirect: (context, state) => _handleRedirect(context, fallback: '/'),
     ),
   ],
 );
