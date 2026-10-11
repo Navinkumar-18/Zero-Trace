@@ -180,7 +180,11 @@ type(scope): description
 | `chore` | Maintenance, dependencies |
 
 **Rules:**
-- One task = one commit
+- Work on the branch that is currently checked out; do not create branches unless asked.
+- Commit small and often (one logical change per commit, conventional messages) and only after flutter analyze, flutter test and cargo checks pass.
+- Start every task with a clean git status; if it is not clean, stop and tell the user.
+- Never push, force, reset --hard, checkout ., clean, rebase, or amend. The user pushes and rolls back.
+- Before engine, guard or signing changes, remind the user to tag a checkpoint.
 - Verify before commit
 - Scope = phase number for phase work (e.g., `feat(phase-1): ...`)
 - **Confirm the commit landed** with `git log -1 --oneline` before starting the next task
