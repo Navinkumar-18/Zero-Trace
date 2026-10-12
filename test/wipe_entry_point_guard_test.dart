@@ -31,8 +31,7 @@ void main() {
           // Ignore comments or definitions of the method
           if (line.trim().startsWith('//') ||
               line.contains('Future<void> startSimpleWipe(') ||
-              line.contains('Future<void> _runSanitizationPipeline(') ||
-              line.contains('runSanitizationPipelineForTesting(')) {
+              line.contains('Future<void> _runSanitizationPipeline(')) {
             continue;
           }
           if (regex.hasMatch(line)) {

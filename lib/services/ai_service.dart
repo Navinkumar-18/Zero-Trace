@@ -9,6 +9,7 @@ library;
 import '../models/assistant_context.dart';
 import '../models/device_profile.dart';
 import '../models/sanitization_error_code.dart';
+import 'assistant_router.dart';
 import 'knowledge/bm25_retriever.dart';
 import 'knowledge/knowledge_entry.dart';
 
@@ -109,8 +110,6 @@ class AiService {
     AssistantContext? context,
     DeviceProfile? device,
   }) {
-    final q = question.toLowerCase().trim();
-
     // Resolve effective device
     final effectiveDevice = device ??
         (context?.hasDevice == true
@@ -134,79 +133,35 @@ class AiService {
               )
             : null);
 
-    AiResponse response;
+    // Token-scoring route (deterministic, offline).
+    final route = AssistantRouter.route(question, context: context);
 
-    // 1. State handlers: always answer from AssistantContext (highest precedence)
-    if (q.contains('explain this error') ||
-        q.contains('why did the sanitization fail') ||
-        q.contains('what should i do after this error')) {
-      final code = context?.lastErrorCode ?? SanitizationErrorCode.unknown;
-      response = explainError(code, context: context);
-    } else if (q.contains('why did verification fail') || (q.contains('verification') && q.contains('fail'))) {
-      response = _verificationFailureResponse();
-    } else if (q.contains('security frozen')) {
-      response = _securityFrozenResponse();
-    } else if (q.contains('cryptographic signature prove') || (q.contains('signature') && q.contains('prove'))) {
-      response = _signatureExplanation();
-    } else if (q.contains('certificate') || (q.contains('explain') && q.contains('cert'))) {
-      response = _certificateExplanation();
-    } else if (q.contains('how does overwrite work for hdd') || (q.contains('overwrite') && q.contains('hdd'))) {
-      response = _hddOverwriteResponse(effectiveDevice);
-    } else if (q.contains('overwrite') && (q.contains('ssd') || q.contains('flash') || q.contains('nvme'))) {
-      response = _ssdOverwriteResponse(effectiveDevice);
-    } else if (q.contains('recommend') || q.contains('which method') || q.contains('what method')) {
-      response = _recommendMethodResponse(effectiveDevice);
-    } else if (q.contains('high risk') || (q.contains('why') && q.contains('risk'))) {
-      response = _riskExplanationResponse(effectiveDevice);
-    } else {
-      // 2. Conceptual handlers: check KB first only if a reviewed entry matches
-      SearchMatch? kbMatch;
-      if (retriever != null) {
-        final match = retriever!.findBestMatch(question, context: context);
-        if (match != null && match.entry.reviewStatus == KnowledgeReviewStatus.reviewed) {
-          kbMatch = match;
-        }
-      }
-
-      if (kbMatch != null) {
-        // KB reviewed answer with 'kb' handlerId and entry id
-        response = AiResponse(
-          answer: kbMatch.entry.content,
-          researchBasis: 'Based on: ${kbMatch.entry.title}',
-          handlerId: 'kb',
-          kbEntryIds: [kbMatch.entry.id],
-        );
-      } else if (q.contains('cryptographic erase') || q.contains('crypto erase')) {
-        response = _cryptoEraseExplanation();
-      } else if (q.contains('nist') || q.contains('800-88')) {
-        response = _nistExplanation();
-      } else if (q.contains('pales') || q.contains('ftl') || q.contains('flash translation')) {
-        response = _palesExplanation();
-      } else if (q.contains('clear') && q.contains('purge')) {
-        response = _clearVsPurgeExplanation();
-      } else if (q.contains('destroy') || q.contains('physical destruction')) {
-        response = _destroyExplanation();
-      } else if (q.contains('hpa') || q.contains('dco') || q.contains('hidden')) {
-        response = _hpaDcoExplanation();
-      } else if (q.contains('wear level') || q.contains('garbage collection') || q.contains('spare block')) {
-        response = _flashInternalsExplanation();
-      } else {
-        // Generic fallback
-        response = const AiResponse(
-          answer: 'I can help with questions about storage sanitization methods, '
-              'risk assessment, verification procedures, NIST standards, and device capabilities. '
-              'Try asking about specific topics like "Why is overwrite not recommended for SSDs?" '
-              'or "What does cryptographic erase mean?"',
-          warnings: [
-            'AI responses are advisory only.',
-            'All sanitization operations require explicit user confirmation and policy validation.',
-          ],
-          isFallback: true,
-          handlerId: 'fallback',
-        );
+    // State handlers answer from AssistantContext first. Conceptual handlers
+    // may instead be answered by a reviewed knowledge-base entry.
+    SearchMatch? kbMatch;
+    if (!route.isState && retriever != null) {
+      final match = retriever!.findBestMatch(question, context: context);
+      if (match != null && match.entry.reviewStatus == KnowledgeReviewStatus.reviewed) {
+        kbMatch = match;
       }
     }
 
+    final AiResponse response;
+    if (kbMatch != null) {
+      response = AiResponse(
+        answer: kbMatch.entry.content,
+        researchBasis: 'Based on: ${kbMatch.entry.title}',
+        handlerId: 'kb',
+        kbEntryIds: [kbMatch.entry.id],
+      );
+    } else {
+      response = _dispatch(
+        route.handlerId,
+        context: context,
+        device: effectiveDevice,
+        question: question,
+      );
+    }
     // Apply simulation disclaimer if isSimulated is true (Amendment 7)
     if (context?.isSimulated == true) {
       final simWarnings = List<String>.from(response.warnings);
@@ -249,6 +204,103 @@ class AiService {
     }
 
     return response;
+  }
+
+  AiResponse _dispatch(
+    String handlerId, {
+    required AssistantContext? context,
+    required DeviceProfile? device,
+    required String question,
+  }) {
+    switch (handlerId) {
+      case 'error_explanation':
+        return _errorExplanation(context);
+      case 'verification_failure':
+        return _verificationFailureResponse(context: context);
+      case 'security_frozen':
+        return _securityFrozenResponse();
+      case 'signature_explanation':
+        return _signatureExplanation();
+      case 'certificate_explanation':
+        return _certificateExplanation(context: context);
+      case 'ssd_overwrite':
+        return _ssdOverwriteResponse(device);
+      case 'hdd_overwrite':
+        return _hddOverwriteResponse(device);
+      case 'recommend_method':
+        return _recommendMethodResponse(device);
+      case 'risk_explanation':
+        return _riskExplanationResponse(device);
+      case 'crypto_erase':
+        return _cryptoEraseExplanation();
+      case 'nist_standards':
+        return _nistExplanation();
+      case 'clear_vs_purge':
+        return _clearVsPurgeExplanation();
+      case 'physical_destruction':
+        return _destroyExplanation();
+      case 'hpa_dco':
+        return _hpaDcoExplanation();
+      case 'pales_research':
+        return _palesExplanation();
+      case 'flash_internals':
+        return _flashInternalsExplanation();
+      case 'partition_limitations':
+        return _partitionLimitationsResponse(context);
+      case 'partition_overwrite':
+        return _partitionOverwriteResponse(context);
+      case 'data_status':
+        return _dataStatusResponse(context);
+      case 'command_refusal':
+        return _commandRefusalResponse();
+      default:
+        return _fallbackResponse(question);
+    }
+  }
+
+  AiResponse _errorExplanation(AssistantContext? context) {
+    if (context?.lastErrorCode != null) {
+      return explainError(context!.lastErrorCode!, context: context);
+    }
+    final hasState = context?.jobStarted == true || context?.jobStatus != null;
+    final caveat = hasState
+        ? ''
+        : '\n\nNo job is loaded right now, so this is a general explanation rather than a report on a specific run.';
+    return AiResponse(
+      answer: 'Sanitization can fail for recognizable reasons, and each has a specific '
+          'next step.\n\n'
+          '• **Permission denied**: the operating system blocked access to the raw device.\n'
+          '• **Device disconnected**: the target disappeared during the operation.\n'
+          '• **Timeout**: the device stopped responding.\n'
+          '• **Verification failed**: sampled sectors still contained data after the wipe.\n'
+          '• **Blocked target**: the drive was refused for safety (for example a system disk).'
+          '$caveat',
+      riskLevel: 'MEDIUM',
+      warnings: const [
+        'A failed or interrupted wipe means data may remain on the device.',
+      ],
+      handlerId: 'error_explanation',
+    );
+  }
+
+  AiResponse _fallbackResponse(String question) {
+    final topics = AssistantRouter.closestTopicLabels(question);
+    final hint = topics.isEmpty
+        ? ''
+        : '\n\nClosest topics I can help with: ${topics.join(', ')}.';
+    return AiResponse(
+      answer: 'I can help with questions about storage sanitization methods, '
+          'risk assessment, verification procedures, NIST standards, and device capabilities.'
+          '$hint\n\n'
+          'Try asking how the app wipes a drive, why overwrite behaves differently on '
+          'flash versus magnetic media, or what a certificate proves.',
+      warnings: const [
+        'AI responses are advisory only.',
+        'All sanitization operations require explicit user confirmation and policy validation.',
+      ],
+      isFallback: true,
+      handlerId: 'fallback',
+    );
   }
 
   AiResponse _ssdOverwriteResponse(DeviceProfile? device) {
@@ -431,17 +483,23 @@ class AiService {
     );
   }
 
-  AiResponse _verificationFailureResponse() {
-    return const AiResponse(
+  AiResponse _verificationFailureResponse({AssistantContext? context}) {
+    final hasState = context?.verificationPassed == false;
+    final caveat = hasState
+        ? ''
+        : '\n\nNo verification result is loaded right now, so this describes the general '
+            'failure modes rather than a specific run.';
+    return AiResponse(
       answer: 'Verification can fail for several reasons:\n\n'
           '• **Dirty or non-zero sectors**: Sector readback found residual non-zero bytes at sampled LBA offsets.\n'
           '• **Controller timeout**: The device did not respond within the expected timeframe during sampling.\n'
           '• **Device disconnection**: The device was removed or lost power during readback.\n'
           '• **I/O Read error**: Bad physical blocks prevented reading sampled sectors.\n\n'
           'A failed verification means sanitization assurance was not achieved. '
-          'Data may remain on the disk. Re-evaluate the drive or flag it for physical destruction.',
+          'Data may remain on the disk. Re-evaluate the drive or flag it for physical destruction.'
+          '$caveat',
       riskLevel: 'CRITICAL',
-      warnings: [
+      warnings: const [
         'Failed verification means sanitization assurance is insufficient. Data may remain.',
         'Consider physical destruction for failed devices handling sensitive data.',
       ],
@@ -471,8 +529,12 @@ class AiService {
     );
   }
 
-  AiResponse _certificateExplanation() {
-    return const AiResponse(
+  AiResponse _certificateExplanation({AssistantContext? context}) {
+    final caveat = context?.hasCertificate == true
+        ? ''
+        : '\n\nNo certificate is loaded right now, so this describes what a Zero Trace '
+            'certificate contains in general.';
+    return AiResponse(
       answer: 'A Zero Trace sanitization certificate provides auditable evidence of the '
           'sanitization process.\n\n'
           '**Certificate contents:**\n'
@@ -487,8 +549,8 @@ class AiService {
           'It does NOT prove physical erasure — it proves the certificate data has not been modified.\n\n'
           '**What the signature proves:**\n'
           'The digital signature proves the certificate was issued by Zero Trace '
-          'and has not been tampered with since issuance.',
-      warnings: [
+          'and has not been tampered with since issuance.$caveat',
+      warnings: const [
         'The certificate records what was observed, not absolute physical state.',
         'Hash integrity ≠ physical erasure proof.',
       ],
@@ -626,4 +688,146 @@ class AiService {
       handlerId: 'flash_internals',
     );
   }
+
+  AiResponse _partitionLimitationsResponse(AssistantContext? context) {
+    final sizeText = context?.partitionFormattedSize ??
+        (context?.partitionSizeBytes != null
+            ? _formatBytes(context!.partitionSizeBytes!)
+            : 'the selected partition');
+    final isFlash = context?.isFlash == true ||
+        context?.mediaTechnology == MediaTechnology.flash;
+    final buffer = StringBuffer()
+      ..writeln('A partition wipe only targets one partition ($sizeText) and is not a '
+          'whole-drive sanitization. Its limits:')
+      ..writeln('• The partition table that describes the drive layout is outside the '
+          'target range and is not overwritten.')
+      ..writeln('• Unselected partitions, unallocated gaps, and the space between '
+          'partitions are not overwritten.');
+    if (isFlash) {
+      buffer.writeln('• On flash media this is a Clear-level overwrite only; the '
+          'controller-managed spare blocks and over-provisioned areas are not reached.');
+    }
+    if (context?.isSimulated == true) {
+      buffer.writeln('• This run is simulated: nothing on the device was actually '
+          'written or erased.');
+    }
+    buffer.write('For whole-drive assurance, target the full device or use a '
+        'device-level sanitize command.');
+    return AiResponse(
+      answer: buffer.toString(),
+      riskLevel: 'MEDIUM',
+      warnings: const [
+        'A partition wipe leaves the rest of the drive, including the partition table, untouched.',
+      ],
+      handlerId: 'partition_limitations',
+    );
+  }
+
+  AiResponse _partitionOverwriteResponse(AssistantContext? context) {
+    final sizeText = context?.partitionFormattedSize ??
+        (context?.partitionSizeBytes != null
+            ? _formatBytes(context!.partitionSizeBytes!)
+            : 'the selected partition');
+    final isFlash = context?.isFlash == true ||
+        context?.mediaTechnology == MediaTechnology.flash;
+    final buffer = StringBuffer()
+      ..writeln('You can run an overwrite against a single partition ($sizeText), but it '
+          'only covers that partition.');
+    buffer.writeln(isFlash
+        ? '• On flash media an overwrite is treated as Clear-level only, because the '
+            'controller can remap logical writes away from old physical pages.'
+        : '• On magnetic media an overwrite can reach Clear level for the target '
+            'partition, but cannot cover controller-hidden areas.');
+    buffer.writeln('• The partition table and any other partitions are not sanitized.');
+    if (context?.isSimulated == true) {
+      buffer.writeln('• This run is simulated: nothing on the device was actually '
+          'written or erased.');
+    }
+    buffer.write('Final method selection is advisory and requires policy confirmation.');
+    return AiResponse(
+      answer: buffer.toString(),
+      recommendedMethod: isFlash ? 'Clear (overwrite)' : 'Overwrite (Clear)',
+      riskLevel: 'MEDIUM',
+      warnings: const [
+        'Overwriting a partition does not sanitize the rest of the drive.',
+      ],
+      handlerId: 'partition_overwrite',
+    );
+  }
+
+  AiResponse _dataStatusResponse(AssistantContext? context) {
+    final buffer = StringBuffer();
+    if (context == null || !context.jobStarted) {
+      buffer.write('No wipe has run for the selected target, so the data should still be '
+          'present and unchanged. ');
+    } else if (context.wipeCompleted) {
+      buffer.write('A wipe ran and reached completion on the recorded target. ');
+    } else {
+      buffer.write('A wipe started but completion was not recorded, so the drive should '
+          'be treated as not sanitized. ');
+    }
+    if (context?.isSimulated == true) {
+      buffer.write('Because this was a simulated run, nothing was actually written or '
+          'erased. ');
+    }
+    if (context?.isPartitionScope == true) {
+      buffer.write('Only the selected partition was targeted, so the partition table and '
+          'other regions are unchanged. ');
+    }
+    if (context?.mediaTechnology == MediaTechnology.flash) {
+      buffer.write('On flash storage, overwrite provides Clear-level assurance only, and '
+          'controller-managed areas are not reached. ');
+    } else if (context?.mediaTechnology == MediaTechnology.rotational) {
+      buffer.write('On magnetic media, a completed overwrite can reach Clear level; '
+          'controller-hidden sectors are not covered. ');
+    }
+    if (context?.verificationPassed == true) {
+      buffer.write('Verification sampled sectors and found no residual data at those '
+          'samples; sampling is evidence, not proof of every sector. ');
+    } else if (context?.verificationPassed == false) {
+      buffer.write('Verification failed, so assurance was not achieved and data may '
+          'remain. ');
+    } else {
+      buffer.write('No verification result is recorded, so the physical state cannot be '
+          'confirmed. ');
+    }
+    buffer.write('Treat the drive as clean only when the method and verification match '
+        'your assurance requirement.');
+    return AiResponse(
+      answer: buffer.toString(),
+      riskLevel: 'MEDIUM',
+      warnings: const [
+        'A wipe report describes what was observed, not an absolute physical guarantee.',
+      ],
+      handlerId: 'data_status',
+    );
+  }
+
+  AiResponse _commandRefusalResponse() {
+    return const AiResponse(
+      answer: 'I cannot provide shell commands or command-line instructions, and the '
+          'application never runs commands you type. Zero Trace performs the operation '
+          'through its own built-in engine after you confirm the target and method on the '
+          'wipe screen.',
+      warnings: [
+        'This assistant is advisory only and never generates or executes commands.',
+      ],
+      handlerId: 'command_refusal',
+    );
+  }
+
+  static String _formatBytes(int bytes) {
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    var value = bytes.toDouble();
+    var unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit++;
+    }
+    final text = value >= 10 || unit == 0
+        ? value.toStringAsFixed(0)
+        : value.toStringAsFixed(1);
+    return '$text ${units[unit]}';
+  }
 }
+

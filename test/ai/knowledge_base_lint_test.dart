@@ -306,4 +306,45 @@ void main() {
       expect(result.issues.any((i) => i.rule == 'word_cap_exceeded'), true);
     });
   });
+
+  group('Real assets/knowledge lint gate', () {
+    test('every shipped .md entry passes linting', () {
+      final dir = Directory('assets/knowledge');
+      expect(dir.existsSync(), true, reason: 'assets/knowledge/ must exist');
+
+      final loader = const KnowledgeLoader(isRelease: false, autoLint: false);
+      final entries = loader.loadFromDirectory(dir);
+
+      for (final entry in entries) {
+        final result = KnowledgeLint.lintEntry(entry);
+        expect(
+          result.isValid,
+          true,
+          reason: 'Shipped entry ${entry.id} failed linting:\n'
+              '${result.issues.map((i) => i.toString()).join('\n')}',
+        );
+      }
+    });
+
+    test('shipped entries are either reviewed or dev-only placeholders, never malformed', () {
+      final dir = Directory('assets/knowledge');
+      final loader = const KnowledgeLoader(isRelease: false, autoLint: true);
+      // autoLint throws on any malformed entry, so a clean load proves validity.
+      final entries = loader.loadFromDirectory(dir);
+      for (final entry in entries) {
+        expect(entry.title.trim().isNotEmpty, true);
+        expect(entry.lastReviewed, isNotNull);
+      }
+    });
+
+    test('release build serves only reviewed entries', () {
+      final dir = Directory('assets/knowledge');
+      final loader = const KnowledgeLoader(isRelease: true, autoLint: false);
+      final entries = loader.loadFromDirectory(dir);
+      for (final entry in entries) {
+        expect(entry.reviewStatus, KnowledgeReviewStatus.reviewed);
+      }
+    });
+  });
 }
+

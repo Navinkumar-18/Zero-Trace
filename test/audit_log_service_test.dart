@@ -87,7 +87,7 @@ void main() {
       final map2 = jsonDecode(lines[1]) as Map<String, dynamic>;
       map2['method'] = 'TAMPERED METHOD';
       lines[1] = jsonEncode(map2);
-      await logFile.writeAsString(lines.join('\n') + '\n');
+      await logFile.writeAsString('${lines.join('\n')}\n');
 
       final result = await service.verifyChainIntegrity();
       expect(result.status, equals(ChainIntegrityStatus.broken));
@@ -105,7 +105,7 @@ void main() {
 
       // Delete entry 2
       lines.removeAt(1);
-      await logFile.writeAsString(lines.join('\n') + '\n');
+      await logFile.writeAsString('${lines.join('\n')}\n');
 
       final result = await service.verifyChainIntegrity();
       expect(result.status, equals(ChainIntegrityStatus.broken));
@@ -122,7 +122,7 @@ void main() {
 
       // Swap line 1 and 2
       final swapped = [lines[1], lines[0]];
-      await logFile.writeAsString(swapped.join('\n') + '\n');
+      await logFile.writeAsString('${swapped.join('\n')}\n');
 
       final result = await service.verifyChainIntegrity();
       expect(result.status, equals(ChainIntegrityStatus.broken));
@@ -262,6 +262,142 @@ void main() {
       final loaded = await service.getCertificateById('ZT-CERT-TEST-123');
       expect(loaded, isNotNull);
       expect(loaded!.certificateId, equals('ZT-CERT-TEST-123'));
+    });
+
+    test('Canonical JSON test vector is stable (no floats, sorted keys, nulls omitted)', () {
+      final entry = AuditLogEntry(
+        timestamp: '2026-01-01T00:00:00Z',
+        jobId: 'JOB-VECTOR',
+        deviceSerial: 'SER',
+        devicePath: '/dev/sdx',
+        method: 'Zero Fill',
+        standardReference: 'NIST',
+        nistCategory: 'Clear',
+        success: true,
+        fingerprintHash: 'FP',
+        entropyScore: 0.0001,
+        sampleCount: 1,
+        commandLog: const ['a'],
+      );
+
+      const expected =
+          '{"commandLog":["a"],"devicePath":"/dev/sdx","deviceSerial":"SER",'
+          '"entropyScore":"0.000100","fingerprintHash":"FP","isSimulated":false,'
+          '"jobId":"JOB-VECTOR","method":"Zero Fill","nistCategory":"Clear",'
+          '"sampleCount":1,"scope":"full","standardReference":"NIST","success":true,'
+          '"timestamp":"2026-01-01T00:00:00Z"}';
+
+      expect(entry.toCanonicalJson(), equals(expected));
+      expect(
+        AuditLogService.calculateEntryHash(AuditLogService.genesisHash, expected),
+        equals('e558a341f7e6dcc6c45e84df14168f2b120403b32d483ff85c041b1dc93cde00'),
+      );
+    });
+
+    test('Tail truncation is detected via the head-anchor', () async {
+      await service.appendEntry(createSampleEntry(jobId: 'JOB-001'));
+      await service.appendEntry(createSampleEntry(jobId: 'JOB-002'));
+      await service.appendEntry(createSampleEntry(jobId: 'JOB-003'));
+
+      final logFile = File('${tempDir.path}/audit_log.jsonl');
+      final lines = await logFile.readAsLines();
+      await logFile.writeAsString('${lines.take(2).join('\n')}\n');
+
+      final result = await service.verifyChainIntegrity();
+      expect(result.status, equals(ChainIntegrityStatus.broken));
+      expect(result.failureReason, contains('truncated'));
+    });
+
+    test('Appending repairs a missing newline on the last line', () async {
+      await service.appendEntry(createSampleEntry(jobId: 'JOB-001'));
+
+      final logFile = File('${tempDir.path}/audit_log.jsonl');
+      logFile.writeAsStringSync(logFile.readAsStringSync().trimRight());
+
+      await service.appendEntry(createSampleEntry(jobId: 'JOB-002'));
+
+      final result = await service.verifyChainIntegrity();
+      expect(result.status, equals(ChainIntegrityStatus.valid));
+      expect(result.totalEntries, equals(2));
+    });
+
+    test('Appending drops a garbled torn fragment', () async {
+      await service.appendEntry(createSampleEntry(jobId: 'JOB-001'));
+
+      final logFile = File('${tempDir.path}/audit_log.jsonl');
+      logFile.writeAsStringSync('{"timestamp":"torn', mode: FileMode.append);
+
+      await service.appendEntry(createSampleEntry(jobId: 'JOB-002'));
+
+      final result = await service.verifyChainIntegrity();
+      expect(result.status, equals(ChainIntegrityStatus.valid));
+      expect(result.totalEntries, equals(2));
+    });
+
+    test('Outcome is hashed and survives round-trip', () async {
+      final appended = await service.appendEntry(
+        createSampleEntry(jobId: 'JOB-OUTCOME'),
+      );
+      expect(appended.entryHash, isNotNull);
+
+      final withOutcome = await service.appendEntry(AuditLogEntry(
+        timestamp: '2026-10-10T12:00:00Z',
+        jobId: 'JOB-OUTCOME-2',
+        deviceSerial: 'SERIAL-12345',
+        devicePath: '/dev/sdb',
+        method: 'Zero Fill',
+        standardReference: 'NIST',
+        nistCategory: 'Clear',
+        outcome: 'verify_failed',
+        success: false,
+        fingerprintHash: 'FP',
+        entropyScore: 0.0,
+        sampleCount: 0,
+        commandLog: const [],
+      ));
+      expect(withOutcome.toCanonicalJson(), contains('"outcome":"verify_failed"'));
+
+      final result = await service.verifyChainIntegrity();
+      expect(result.status, equals(ChainIntegrityStatus.valid));
+    });
+
+    test('Certificate dir is 0700 and files are 0600', () async {
+      if (!Platform.isLinux && !Platform.isMacOS) return;
+      final cert = SanitizationCertificate(
+        certificateId: 'ZT-CERT-MODE',
+        jobId: 'JOB-MODE',
+        deviceModel: 'Test Drive',
+        deviceSerial: 'SERIAL-999',
+        mediaType: 'SATA SSD',
+        capacity: '500 GB',
+        method: 'ATA Secure Erase',
+        standardReference: 'NIST',
+        startTime: DateTime.now(),
+        endTime: DateTime.now(),
+        result: 'SUCCESS',
+        verificationSummary: 'Passed',
+        evidence: VerificationEvidence(
+          statusCode: 0,
+          controllerConfirmation: 'OK',
+          sampleOffsets: const [],
+          sampleHashes: const {},
+          evidenceHash: 'HASH',
+          limitations: '',
+          verifiedPassed: true,
+        ),
+        softwareVersion: 'v2.0',
+        signature: 'SIG:HEX',
+        publicKeyPem: 'PEM',
+      );
+
+      final (file, _) = await service.saveCertificate(cert);
+      final dir = Directory('${tempDir.path}/certificates');
+      expect(FileStat.statSync(file.path).modeString(), equals('rw-------'));
+      expect(FileStat.statSync(dir.path).modeString(), equals('rwx------'));
+
+      await service.appendEntry(createSampleEntry(jobId: 'JOB-MODE-LOG'));
+      final logFile = File('${tempDir.path}/audit_log.jsonl');
+      expect(FileStat.statSync(logFile.path).modeString(), equals('rw-------'));
     });
   });
 }

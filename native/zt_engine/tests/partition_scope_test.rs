@@ -609,7 +609,7 @@ fn test_real_loop_device_partition_overwrite_and_verify() {
 fn test_cli_refuse_partition_without_mode_partition() {
     let binary = env!("CARGO_BIN_EXE_zt_engine");
     let output = Command::new(binary)
-        .args(&["sanitize", "/dev/sdb1", "overwrite-zero", "TOKEN", "SERIAL"])
+        .args(["sanitize", "/dev/sdb1", "overwrite-zero", "TOKEN", "SERIAL"])
         .output()
         .expect("Failed to execute zt_engine CLI");
 
@@ -625,7 +625,7 @@ fn test_cli_refuse_partition_without_mode_partition() {
 fn test_cli_missing_expected_flags_in_partition_mode() {
     let binary = env!("CARGO_BIN_EXE_zt_engine");
     let output = Command::new(binary)
-        .args(&["sanitize", "/dev/sdb1", "overwrite-zero", "TOKEN", "SERIAL", "--mode", "partition"])
+        .args(["sanitize", "/dev/sdb1", "overwrite-zero", "TOKEN", "SERIAL", "--mode", "partition"])
         .output()
         .expect("Failed to execute zt_engine CLI");
 
@@ -962,7 +962,7 @@ fn test_verify_cli_whole_device_without_total_device_size_flag() {
 
     let binary = env!("CARGO_BIN_EXE_zt_engine");
     let output = Command::new(binary)
-        .args(&[
+        .args([
             "verify",
             tmp.path().to_str().unwrap(),
             &size.to_string(),
@@ -996,7 +996,7 @@ fn test_verify_cli_scoped_with_total_device_size_flag() {
 
     let binary = env!("CARGO_BIN_EXE_zt_engine");
     let output = Command::new(binary)
-        .args(&[
+        .args([
             "verify",
             tmp.path().to_str().unwrap(),
             &part_size.to_string(),

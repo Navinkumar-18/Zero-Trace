@@ -83,7 +83,11 @@ kill -TERM $(pgrep -f zt_engine)
 Expected behavior:
 - Engine catches `SIGTERM` via `signal-hook`.
 - Syncs remaining in-flight buffers to disk.
-- Writes checkpoint file `/tmp/zt_checkpoint_<serial>.json`.
+- Writes a checkpoint file `active_checkpoint.json` into the engine's checkpoint
+  directory: `$ZT_CHECKPOINT_DIR` if set, otherwise
+  `~/.local/state/zero_trace/` (or `/tmp/zero_trace` as a last resort). When the
+  Flutter app launches the engine it sets `ZT_CHECKPOINT_DIR` to the app's state
+  checkpoint directory, so the file does not live in `/tmp` in normal use.
 - Exits cleanly with exit code `130`.
 - Outputs `REPORT:{"success":false,...,"stderr":"Sanitization cancelled by user: partially wiped",...}` with exact `bytes_written`.
 
@@ -98,6 +102,6 @@ sudo losetup -d /dev/loop7
 # Remove test file
 rm -f /tmp/zt_test_1g.img
 
-# Clean up checkpoint file if present
-rm -f /tmp/zt_checkpoint_*.json
+# Clean up checkpoint file if present (uses the engine's checkpoint dir)
+rm -f "${ZT_CHECKPOINT_DIR:-$HOME/.local/state/zero_trace}/active_checkpoint.json"
 ```

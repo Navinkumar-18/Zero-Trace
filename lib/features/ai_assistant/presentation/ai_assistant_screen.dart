@@ -6,18 +6,23 @@ import '../../../models/assistant_context.dart';
 import '../../../models/device_profile.dart';
 import '../../../services/ai_service.dart';
 import '../../../services/assistant_context_builder.dart';
+import '../../../services/knowledge/knowledge_base.dart';
 import '../../../services/sanitization_controller.dart';
 import '../../../widgets/theme.dart';
 
 class AiAssistantScreen extends StatefulWidget {
-  const AiAssistantScreen({super.key});
+  /// Optional override for tests and dependency injection. Defaults to the
+  /// knowledge-base-backed service built once at application startup.
+  final AiService? aiService;
+
+  const AiAssistantScreen({super.key, this.aiService});
 
   @override
   State<AiAssistantScreen> createState() => _AiAssistantScreenState();
 }
 
 class _AiAssistantScreenState extends State<AiAssistantScreen> {
-  final AiService _aiService = AiService();
+  late final AiService _aiService = widget.aiService ?? KnowledgeBase.service;
   final TextEditingController _inputController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   final List<_ChatMessage> _messages = [];

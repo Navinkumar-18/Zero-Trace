@@ -1,6 +1,7 @@
-import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
-import 'package:zero_trace/models/assistant_context.dart';
+import 'package:zero_trace/core/app_paths.dart';
 import 'package:zero_trace/models/certificate.dart';
 import 'package:zero_trace/models/device_profile.dart';
 import 'package:zero_trace/models/partition_info.dart';
@@ -12,6 +13,7 @@ import 'package:zero_trace/services/device_intelligence_service.dart';
 import 'package:zero_trace/services/job_state_file.dart';
 import 'package:zero_trace/services/partition_table_service.dart';
 import 'package:zero_trace/services/policy_layer.dart';
+import 'package:zero_trace/services/real_sanitization_service.dart';
 import 'package:zero_trace/services/sanitization_controller.dart';
 
 void main() {
@@ -306,6 +308,38 @@ void main() {
       expect(result.policyMessage, contains('Partition mode only allows overwrite methods'));
     });
 
+    test('refuses partition scope on an internal (non-removable) disk', () {
+      final policy = PolicyLayer();
+      final internalDevice = const DeviceProfile(
+        id: 'real_sda',
+        name: 'Internal SATA SSD',
+        serialNumber: 'INT123',
+        mediaType: MediaType.sataSsd,
+        busType: 'SATA',
+        capacityBytes: 512000000000,
+        isRemovable: false,
+        isSystemDisk: false,
+      );
+
+      final job = SanitizationJob(
+        jobId: 'JOB-PART-INT',
+        device: internalDevice,
+        dataSensitivity: DataSensitivity.internal,
+        deviceCondition: DeviceCondition.functional,
+        disposalPath: DisposalPath.internalReuse,
+        riskScore: 0.3,
+        targetCategory: NistCategory.clear,
+        recommendedMethod: SanitizationMethod.singlePassOverwrite,
+        standardReference: 'NIST Clear',
+        explanationText: 'Overwrite',
+        targetPartition: safePartition,
+      );
+
+      final result = policy.validateOperation(job);
+      expect(result.isAllowed, isFalse);
+      expect(result.policyMessage, contains('only permitted on removable media'));
+    });
+
     test('refuses operation on protected partition', () {
       final policy = PolicyLayer();
       final job = SanitizationJob(
@@ -519,6 +553,91 @@ void main() {
 
       expect(context.quickQuestions, contains('What are the limitations of a partition wipe?'));
       expect(context.quickQuestions, contains('Are unselected partitions overwritten?'));
+    });
+  });
+
+  group('RealSanitizationService Engine Argument Contract', () {
+    final service = RealSanitizationService(
+      paths: AppPaths(
+        baseDir: Directory.systemTemp,
+        checkpointDir: Directory.systemTemp,
+      ),
+    );
+
+    const partition = PartitionInfo(
+      partitionNumber: 1,
+      name: 'sdb1',
+      devicePath: '/dev/sdb1',
+      startSector: 2048,
+      sizeSectors: 204800,
+      sizeBytes: 104857600,
+      label: UntrustedText('DATA'),
+    );
+
+    final deviceWithTable = DeviceProfile(
+      id: 'real_sdb',
+      name: 'USB Drive',
+      serialNumber: 'USB777',
+      mediaType: MediaType.usbFlash,
+      busType: 'USB',
+      capacityBytes: 16000000000,
+      isRemovable: true,
+      partitions: const [partition],
+    );
+
+    final expectedFingerprint =
+        PartitionTableService.computeFingerprint([partition]);
+
+    test('passes the partition-table fingerprint to a whole-disk run', () {
+      final args = service.buildSanitizeArgs(
+        device: deviceWithTable,
+        method: SanitizationMethod.singlePassOverwrite,
+        confirmationToken: 'TOKEN',
+        deviceSerial: 'USB777',
+      );
+
+      expect(args, isNot(contains('--mode')));
+      expect(args, contains('--expected-table-fingerprint'));
+      expect(args[args.indexOf('--expected-table-fingerprint') + 1],
+          expectedFingerprint);
+    });
+
+    test('passes the partition-table fingerprint and mode to a partition run', () {
+      final args = service.buildSanitizeArgs(
+        device: deviceWithTable,
+        method: SanitizationMethod.singlePassOverwrite,
+        confirmationToken: 'TOKEN',
+        deviceSerial: 'USB777',
+        targetPartition: partition,
+      );
+
+      expect(args[args.indexOf('--mode') + 1], 'partition');
+      expect(args[args.indexOf('--expected-part-num') + 1], '1');
+      expect(args[args.indexOf('--expected-start-sector') + 1], '2048');
+      expect(args[args.indexOf('--expected-size-sectors') + 1], '204800');
+      expect(args[args.indexOf('--expected-table-fingerprint') + 1],
+          expectedFingerprint);
+    });
+
+    test('omits the fingerprint when the device has no partition table', () {
+      final bare = DeviceProfile(
+        id: 'real_sdc',
+        name: 'Bare Disk',
+        serialNumber: 'BARE1',
+        mediaType: MediaType.usbFlash,
+        busType: 'USB',
+        capacityBytes: 8000000000,
+        isRemovable: true,
+      );
+
+      final args = service.buildSanitizeArgs(
+        device: bare,
+        method: SanitizationMethod.singlePassOverwrite,
+        confirmationToken: 'TOKEN',
+        deviceSerial: 'BARE1',
+      );
+
+      expect(args, isNot(contains('--expected-table-fingerprint')));
     });
   });
 }

@@ -1,6 +1,7 @@
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'package:crypto/crypto.dart';
 
 import '../core/app_paths.dart';
@@ -56,12 +57,17 @@ class AuditLogEntry {
   // Enriched schema fields
   final String? deviceName;
   final String scope; // "full" or "partial" (defaults to "full")
+  final String? outcome; // completed|wipe_failed|verify_failed|interrupted|cancelled; null in legacy
   final String? methodClass; // null in legacy
   final String? certificateId; // null in legacy
   final String? certificateSha256; // SHA-256 of certificate/report file
   final bool isSimulated;
   final bool? verificationPassed; // null in legacy
   final List<PartitionAuditOutcome>? partitions;
+
+  // Derived (never serialized / never hashed): true when the source JSON had no
+  // isSimulated field, i.e. an older unchained entry whose provenance is unknown.
+  final bool isLegacy;
 
   // Hash chain fields
   final String? previousHash;
@@ -82,12 +88,14 @@ class AuditLogEntry {
     required this.commandLog,
     this.deviceName,
     this.scope = 'full',
+    this.outcome,
     this.methodClass,
     this.certificateId,
     this.certificateSha256,
     this.isSimulated = false,
     this.verificationPassed,
     this.partitions,
+    this.isLegacy = false,
     this.previousHash,
     this.entryHash,
   });
@@ -98,7 +106,8 @@ class AuditLogEntry {
     map['commandLog'] = commandLog;
     map['devicePath'] = devicePath;
     map['deviceSerial'] = deviceSerial;
-    map['entropyScore'] = entropyScore;
+    // Hashed fields must contain no floats: entropy is a fixed-decimal string.
+    map['entropyScore'] = entropyScore.toStringAsFixed(6);
     map['fingerprintHash'] = fingerprintHash;
     map['isSimulated'] = isSimulated;
     map['jobId'] = jobId;
@@ -111,6 +120,7 @@ class AuditLogEntry {
     map['timestamp'] = timestamp;
 
     if (deviceName != null) map['deviceName'] = deviceName;
+    if (outcome != null) map['outcome'] = outcome;
     if (methodClass != null) map['methodClass'] = methodClass;
     if (certificateId != null) map['certificateId'] = certificateId;
     if (certificateSha256 != null) map['certificateSha256'] = certificateSha256;
@@ -141,6 +151,7 @@ class AuditLogEntry {
     };
 
     if (deviceName != null) map['deviceName'] = deviceName;
+    if (outcome != null) map['outcome'] = outcome;
     if (methodClass != null) map['methodClass'] = methodClass;
     if (certificateId != null) map['certificateId'] = certificateId;
     if (certificateSha256 != null) map['certificateSha256'] = certificateSha256;
@@ -175,12 +186,14 @@ class AuditLogEntry {
       commandLog: List<String>.from(json['commandLog'] ?? []),
       deviceName: json['deviceName'] as String?,
       scope: json['scope'] as String? ?? 'full', // defaults to full for legacy
+      outcome: json['outcome'] as String?, // null in legacy -> renders "—"
       methodClass: json['methodClass'] as String?, // null in legacy -> renders "—"
       certificateId: json['certificateId'] as String?, // null in legacy -> renders "—"
       certificateSha256: json['certificateSha256'] as String?,
       isSimulated: json['isSimulated'] as bool? ?? false,
       verificationPassed: json['verificationPassed'] as bool?, // null in legacy -> renders "—"
       partitions: partitions,
+      isLegacy: !json.containsKey('isSimulated'),
       previousHash: json['previousHash'] as String?,
       entryHash: json['entryHash'] as String?,
     );
@@ -205,12 +218,14 @@ class AuditLogEntry {
       commandLog: commandLog,
       deviceName: deviceName,
       scope: scope,
+      outcome: outcome,
       methodClass: methodClass,
       certificateId: certificateId,
       certificateSha256: certificateSha256,
       isSimulated: isSimulated,
       verificationPassed: verificationPassed,
       partitions: partitions,
+      isLegacy: isLegacy,
       previousHash: previousHash,
       entryHash: entryHash,
     );
@@ -260,15 +275,24 @@ class AuditLogService {
 
   File get _logFile => paths.auditLogFile;
 
-  Directory get _certificatesDir {
-    final dir = paths.certificatesDir;
-    if (!dir.existsSync()) dir.createSync(recursive: true);
-    return dir;
+  Directory get _certificatesDir => _ensureDir0700(paths.certificatesDir);
+
+  Directory get _reportsDir => _ensureDir0700(paths.reportsDir);
+
+  File get _anchorFile => File('${paths.baseDir.path}/audit_log.anchor.json');
+
+  static void _chmod(String path, String mode) {
+    if (Platform.isLinux || Platform.isMacOS) {
+      try {
+        Process.runSync('chmod', [mode, path]);
+      } catch (_) {}
+    }
   }
 
-  Directory get _reportsDir {
-    final dir = paths.reportsDir;
+  /// Creates [dir] if missing and restricts it to mode 0700 on POSIX.
+  static Directory _ensureDir0700(Directory dir) {
     if (!dir.existsSync()) dir.createSync(recursive: true);
+    _chmod(dir.path, '700');
     return dir;
   }
 
@@ -278,17 +302,14 @@ class AuditLogService {
     return sha256.convert(input).toString();
   }
 
-  /// Atomically writes content to target file with mode 0600 on POSIX platforms.
+  /// Atomically writes content to targetPath: create an empty temp file, lock it
+  /// down to 0600, write, then rename over the target.
   Future<File> _writeAtomic(String targetPath, String content) async {
-    final tmpFile = File('$targetPath.tmp.${DateTime.now().microsecondsSinceEpoch}');
+    final tmpPath = '$targetPath.tmp.${DateTime.now().microsecondsSinceEpoch}';
+    final tmpFile = File(tmpPath);
+    tmpFile.createSync();
+    _chmod(tmpPath, '600');
     tmpFile.writeAsStringSync(content, flush: true);
-
-    if (Platform.isLinux || Platform.isMacOS) {
-      try {
-        Process.runSync('chmod', ['600', tmpFile.path]);
-      } catch (_) {}
-    }
-
     return tmpFile.renameSync(targetPath);
   }
 
@@ -333,8 +354,13 @@ class AuditLogService {
       paths.baseDir.createSync(recursive: true);
       final file = _logFile;
 
-      // Find the last chained entry's hash to determine previousHash
+      // Repair a torn trailing line so the chain stays parseable after append.
+      _repairTornTail(file);
+
+      // Find the last chained entry's hash to determine previousHash, and count
+      // the existing chained entries for the head anchor.
       String prevHash = genesisHash;
+      int chainedCount = 0;
       if (file.existsSync()) {
         final lines = file.readAsLinesSync();
         for (int i = lines.length - 1; i >= 0; i--) {
@@ -343,8 +369,8 @@ class AuditLogService {
           try {
             final parsed = jsonDecode(line);
             if (parsed is Map && parsed['entryHash'] != null) {
-              prevHash = parsed['entryHash'] as String;
-              break;
+              if (chainedCount == 0) prevHash = parsed['entryHash'] as String;
+              chainedCount++;
             }
           } catch (_) {
             // Torn or legacy line, continue looking back
@@ -371,11 +397,8 @@ class AuditLogService {
         raf.closeSync();
       }
 
-      if (Platform.isLinux || Platform.isMacOS) {
-        try {
-          Process.runSync('chmod', ['600', file.path]);
-        } catch (_) {}
-      }
+      _chmod(file.path, '600');
+      _writeAnchor(currentEntryHash, chainedCount + 1);
 
       return chainedEntry;
     } catch (_) {
@@ -383,10 +406,75 @@ class AuditLogService {
     }
   }
 
-  /// Verifies integrity of the audit log hash chain.
-  /// Tolerates legacy unchained lines at the head and a torn last line.
-  Future<ChainIntegrityResult> verifyChainIntegrity() async {
-    final file = _logFile;
+  /// If the log does not end in a newline, either terminate a complete final
+  /// entry or drop a garbled torn fragment, so the next append starts clean.
+  static void _repairTornTail(File file) {
+    if (!file.existsSync()) return;
+    final bytes = file.readAsBytesSync();
+    if (bytes.isEmpty || bytes.last == 0x0A) return;
+
+    int lastNl = -1;
+    for (int i = bytes.length - 1; i >= 0; i--) {
+      if (bytes[i] == 0x0A) {
+        lastNl = i;
+        break;
+      }
+    }
+
+    final tail = utf8.decode(bytes.sublist(lastNl + 1), allowMalformed: true);
+    bool tailIsCompleteEntry = false;
+    try {
+      tailIsCompleteEntry = jsonDecode(tail) is Map;
+    } catch (_) {}
+
+    if (tailIsCompleteEntry) {
+      file.writeAsBytesSync(const [0x0A], mode: FileMode.append);
+    } else {
+      file.writeAsBytesSync(bytes.sublist(0, lastNl + 1), flush: true);
+    }
+  }
+
+  /// Writes the head-anchor (last entry hash + chained entry count) atomically.
+  void _writeAnchor(String entryHash, int count) {
+    try {
+      final tmpPath = '${_anchorFile.path}.tmp.${DateTime.now().microsecondsSinceEpoch}';
+      final tmpFile = File(tmpPath);
+      tmpFile.createSync();
+      _chmod(tmpPath, '600');
+      tmpFile.writeAsStringSync(
+        jsonEncode({'entryHash': entryHash, 'count': count}),
+        flush: true,
+      );
+      tmpFile.renameSync(_anchorFile.path);
+    } catch (_) {}
+  }
+
+  static ({String entryHash, int count})? _readAnchor(String path) {
+    final file = File(path);
+    if (!file.existsSync()) return null;
+    try {
+      final json = jsonDecode(file.readAsStringSync()) as Map<String, dynamic>;
+      final hash = json['entryHash'] as String?;
+      final count = (json['count'] as num?)?.toInt();
+      if (hash == null || count == null) return null;
+      return (entryHash: hash, count: count);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Verifies integrity of the audit log hash chain in a background Isolate.
+  Future<ChainIntegrityResult> verifyChainIntegrity() {
+    return Isolate.run(
+      () => _verifyChainSync(_logFile.path, _anchorFile.path),
+    );
+  }
+
+  /// Synchronous chain verification (runs inside [verifyChainIntegrity]'s Isolate).
+  /// Tolerates legacy unchained lines at the head and a torn last line, and uses
+  /// the head-anchor to detect tail truncation.
+  static ChainIntegrityResult _verifyChainSync(String logPath, String anchorPath) {
+    final file = File(logPath);
     if (!file.existsSync()) {
       return const ChainIntegrityResult(
         status: ChainIntegrityStatus.valid,
@@ -472,6 +560,29 @@ class AuditLogService {
       expectedPrevHash = entryHash;
       chainedCount++;
       totalValid++;
+    }
+
+    // Tail-truncation detection: the head-anchor records how many chained
+    // entries existed when the log was last appended to.
+    final anchor = _readAnchor(anchorPath);
+    if (anchor != null) {
+      if (chainedCount < anchor.count) {
+        return ChainIntegrityResult(
+          status: ChainIntegrityStatus.broken,
+          totalEntries: totalValid,
+          brokenLineNumber: chainedCount + 1,
+          failureReason:
+              'log truncated: head-anchor records ${anchor.count} chained entries, found $chainedCount',
+        );
+      }
+      if (chainedCount > 0 && expectedPrevHash != anchor.entryHash) {
+        return ChainIntegrityResult(
+          status: ChainIntegrityStatus.broken,
+          totalEntries: totalValid,
+          brokenLineNumber: chainedCount,
+          failureReason: 'last entry hash does not match head-anchor',
+        );
+      }
     }
 
     if (legacyCount > 0) {

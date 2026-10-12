@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import '../core/app_paths.dart';
 import '../models/device_profile.dart';
 import '../models/partition_info.dart';
 import '../models/sanitization_job.dart';
@@ -137,6 +138,13 @@ class RealVerificationReport {
 }
 
 class RealSanitizationService {
+  RealSanitizationService({required this.paths});
+
+  /// Dart is authoritative for the engine checkpoint directory: it exports
+  /// `ZT_CHECKPOINT_DIR=<paths.checkpointDir>` on spawn and never re-derives the
+  /// engine's own fallback logic.
+  final AppPaths paths;
+
   Process? _activeProcess;
 
   Process? get activeProcess => _activeProcess;
@@ -225,8 +233,15 @@ class RealSanitizationService {
     } catch (_) {}
   }
 
-  /// Spawn zt_engine binary for real-time sanitization, updating progress via callback.
-  Future<RealExecutionReport> executeSanitization({
+  /// Builds the exact `zt_engine sanitize ...` argument vector.
+  ///
+  /// Extracted so the CLI contract is unit-testable without spawning a process.
+  /// The partition-table fingerprint (SHA-256 over sorted
+  /// `"number:start:size\n"` lines in 512-byte sectors) is passed to EVERY
+  /// engine run that has a known partition table — partition and whole-disk
+  /// alike. The engine enforces it in partition mode and ignores it otherwise;
+  /// Dart never silently drops it.
+  List<String> buildSanitizeArgs({
     required DeviceProfile device,
     required SanitizationMethod method,
     required String confirmationToken,
@@ -234,17 +249,14 @@ class RealSanitizationService {
     PartitionInfo? targetPartition,
     bool dryRun = false,
     String? psid,
-    required Function(RealProgressEvent) onProgress,
-    required Function(String) onRawLog,
-  }) async {
-    final binary = await getBinaryPath();
+  }) {
     final cliMethod = mapMethodToCliArg(method, device);
-    
+
     // Map device or partition name to a linux path (e.g. /dev/sdb or /dev/sdb1).
     final String devPath = targetPartition != null
         ? targetPartition.devicePath
-        : (device.id.startsWith('real_') 
-            ? '/dev/${device.id.substring(5)}' 
+        : (device.id.startsWith('real_')
+            ? '/dev/${device.id.substring(5)}'
             : '/dev/null'); // safe fallback for simulator/dry run
 
     final List<String> args = [
@@ -262,9 +274,12 @@ class RealSanitizationService {
       args.add('--psid');
       args.add(psid);
     }
+
+    final fingerprint = device.partitionTableFingerprint ??
+        PartitionTableService.computeFingerprint(device.partitions);
+    final bool hasFingerprint = fingerprint.isNotEmpty;
+
     if (targetPartition != null) {
-      final fingerprint = device.partitionTableFingerprint ??
-          PartitionTableService.computeFingerprint(device.partitions);
       args.addAll([
         '--mode',
         'partition',
@@ -274,17 +289,53 @@ class RealSanitizationService {
         targetPartition.startSector.toString(),
         '--expected-size-sectors',
         targetPartition.sizeSectors.toString(),
-        '--expected-table-fingerprint',
-        fingerprint,
       ]);
+      if (hasFingerprint) {
+        args.addAll(['--expected-table-fingerprint', fingerprint]);
+      }
       if (targetPartition.partUuid != null && targetPartition.partUuid!.isNotEmpty) {
         args.addAll(['--expected-partuuid', targetPartition.partUuid!]);
       }
+    } else if (hasFingerprint) {
+      args.addAll(['--expected-table-fingerprint', fingerprint]);
     }
+
+    return args;
+  }
+
+  /// Spawn zt_engine binary for real-time sanitization, updating progress via callback.
+  Future<RealExecutionReport> executeSanitization({
+    required DeviceProfile device,
+    required SanitizationMethod method,
+    required String confirmationToken,
+    required String deviceSerial,
+    PartitionInfo? targetPartition,
+    bool dryRun = false,
+    String? psid,
+    required Function(RealProgressEvent) onProgress,
+    required Function(String) onRawLog,
+  }) async {
+    final binary = await getBinaryPath();
+    final List<String> args = buildSanitizeArgs(
+      device: device,
+      method: method,
+      confirmationToken: confirmationToken,
+      deviceSerial: deviceSerial,
+      targetPartition: targetPartition,
+      dryRun: dryRun,
+      psid: psid,
+    );
 
     onRawLog('EXECUTION: Launching $binary ${args.join(' ')}');
 
-    final Process process = await Process.start(binary, args);
+    final Process process = await Process.start(
+      binary,
+      args,
+      environment: {
+        ...Platform.environment,
+        'ZT_CHECKPOINT_DIR': paths.checkpointDir.path,
+      },
+    );
     _activeProcess = process;
     RealExecutionReport? finalReport;
     final StringBuffer stderrBuffer = StringBuffer();
@@ -333,7 +384,7 @@ class RealSanitizationService {
       final rawStderr = stderrBuffer.toString();
       return RealExecutionReport(
         success: exitCode == 0,
-        methodUsed: cliMethod,
+        methodUsed: mapMethodToCliArg(method, device),
         commandLog: ['$binary ${args.join(' ')}'],
         stdout: '',
         stderr: rawStderr.isNotEmpty ? rawStderr : 'Process exited with code $exitCode',

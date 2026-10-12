@@ -15,10 +15,16 @@ class WipeAuthorization {
   final DisposalIntent intent;
   final SanitizationMethod? overrideMethod;
 
+  /// The exact text the operator typed into the confirmation field. The token is
+  /// only ever constructed after that text matched the pinned device identity,
+  /// so this records which typed confirmation produced the authorization.
+  final String typedConfirmation;
+
   WipeAuthorization._({
     required this.authorizedAt,
     required this.deviceSerial,
     required this.intent,
+    required this.typedConfirmation,
     this.overrideMethod,
   });
 
@@ -28,11 +34,13 @@ class WipeAuthorization {
     required String deviceSerial,
     DisposalIntent intent = DisposalIntent.reuseMyself,
     SanitizationMethod? overrideMethod,
+    String typedConfirmation = '',
   }) {
     return WipeAuthorization._(
       authorizedAt: DateTime.now(),
       deviceSerial: deviceSerial,
       intent: intent,
+      typedConfirmation: typedConfirmation,
       overrideMethod: overrideMethod,
     );
   }
@@ -401,6 +409,7 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                             authorizedAt: DateTime.now(),
                             deviceSerial: widget.device.serialNumber,
                             intent: _intent,
+                            typedConfirmation: _serialController.text,
                             overrideMethod: SanitizationMethod.singlePassOverwrite,
                           );
                           Navigator.of(context).pop(ConfirmWipeResult(
@@ -513,6 +522,7 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                                 authorizedAt: DateTime.now(),
                                 deviceSerial: widget.device.serialNumber,
                                 intent: _intent,
+                                typedConfirmation: _serialController.text,
                               );
                               Navigator.of(context).pop(ConfirmWipeResult(
                                 intent: _intent,

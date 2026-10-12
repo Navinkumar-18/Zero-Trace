@@ -5,6 +5,47 @@ All notable changes to the Zero Trace project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - Partition Scope, Real Audit Log & Deterministic Assistant
+
+### Added
+- **Partition-scoped wiping** for removable media (overwrite methods only).
+  Partition certificates use a new certificate version (v3) whose signed payload
+  includes `scope` and the wiped-partition list; v1 and v2 certificates still
+  verify.
+- **Real audit log** (`lib/services/audit_log_service.dart`): entries are
+  hash-chained (`entryHash = SHA-256(previousHash || canonical JSON)`), a head
+  anchor file detects tail truncation, a torn final line is repaired on append,
+  and chain verification runs in an `Isolate`. Certificates and failure reports
+  are written as separate files (directory mode `0700`, files `0600`).
+- **History screen** in Simple mode (reachable from the Advanced drawer): last
+  100 entries, integrity row, "Hide simulated" filter, a collapsed "Legacy
+  entries, source unknown" section, and certificate / failure-report / PDF /
+  raw-JSON actions.
+- **Deterministic, offline assistant**: token-set intent routing (no first-match
+  substring ordering), new advisory handlers
+  (`partition_limitations`, `partition_overwrite`, `data_status`,
+  `command_refusal`), and knowledge-base wiring (`assets/knowledge`, loaded once
+  at startup). No reviewed knowledge entries ship yet, so answers come from the
+  built-in handlers.
+
+### Changed
+- Dart now exports `ZT_CHECKPOINT_DIR` when spawning `zt_engine`; the orphan
+  checker reads `<checkpointDir>/active_checkpoint.json`.
+- `active_job.json` gains a `methodKind` field (`overwrite | firmware | unknown`)
+  derived from the method enum, used for honest recovery wording.
+- Partition scoping is refused on non-removable (internal) disks in Dart.
+- The partition-table fingerprint is now passed to every engine run that has a
+  known partition table, not only partition-mode runs.
+
+### Fixed
+- Resolved the outstanding `flutter analyze` warnings and the `cargo clippy`
+  warnings without behaviour changes.
+
+### Security
+- Wipe entry points require a `WipeAuthorization` token that can only be minted
+  inside `confirm_wipe_dialog.dart`; a static-scan test asserts only the
+  allow-listed screen call site invokes them.
+
 ## [Unreleased] - Phase 1: Hardened Boot-Disk Protection
 
 ### Added

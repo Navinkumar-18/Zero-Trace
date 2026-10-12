@@ -72,6 +72,15 @@ class PolicyLayer {
 
     // Safety Rule 4: Partition mode method allowlist & target protection
     if (job.isPartitionScope) {
+      // Decision: partitions on INTERNAL disks are not wipeable. Partition-scoped
+      // wiping is for removable media only (strict rule); there is no override.
+      if (!job.device.isRemovable) {
+        return PolicyValidationResult(
+          isAllowed: false,
+          policyMessage: 'POLICY VIOLATION: Partition-scoped wiping is only permitted on removable media. Partitions on internal disks are not wipeable.',
+        );
+      }
+
       if (method != SanitizationMethod.singlePassOverwrite &&
           method != SanitizationMethod.multiPassOverwrite) {
         return PolicyValidationResult(

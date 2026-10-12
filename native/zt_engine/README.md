@@ -1,6 +1,6 @@
 # Zero Trace 2.0 — Rust Execution Engine (`zt_engine`)
 
-**NIST SP 800-88 Rev 1 & IEEE 2883:2022 compliant secure data sanitization engine.**
+**Secure data sanitization engine aligned with NIST SP 800-88 Rev. 1 and IEEE 2883:2022.**
 
 ## Overview
 
@@ -50,11 +50,11 @@ sudo cargo test --features loopdev_tests
 
 The execution engine has multiple layers of protection:
 
-1. **Boot-disk protection**: Reads `/proc/mounts` and refuses to operate on any device hosting `/`, `/boot`, or `/boot/efi`
+1. **Boot-disk protection**: Reads `/proc/self/mountinfo` (with a `/proc/mounts` fallback) and refuses to operate on any device hosting `/`, `/boot`, or `/boot/efi`
 2. **Confirmation token**: Every operation requires a `confirmation_token` that must exactly match the device serial number
 3. **Dry-run default**: All execution functions accept a `dry_run: bool` parameter — when `true`, commands are logged but never executed
 4. **Policy layer**: The Flutter PolicyLayer validates operations before they reach Rust
-5. **Serial re-entry dialog**: UI requires operator to retype the full device serial before real execution
+5. **Serial re-entry dialog**: The UI requires the operator to re-type the last 4 characters of the device serial (or path + size for drives with no usable serial) before real execution
 
 ## Supported Sanitization Methods
 
@@ -65,7 +65,15 @@ The execution engine has multiple layers of protection:
 | ATA Sanitize (Block/Crypto/Overwrite) | `hdparm --sanitize-*` | SATA SSDs |
 | TCG OPAL Cryptographic Erase | `sedutil-cli --revertTPer` | Self-Encrypting Drives |
 | eMMC Sanitize | `mmc sanitize` | eMMC embedded flash |
-| Software Overwrite (1-pass/3-pass/DoD) | `dd` | All block devices |
+| Software Overwrite (1-pass/3-pass/DoD) | Native direct-I/O writer | All block devices |
+
+## Certificate Signing (`certificate.rs`)
+
+`certificate.rs` implements HMAC-SHA256 and Ed25519 signing with key
+persistence, and is unit-tested. Note that the Flutter application signs its
+audit certificates with its own local **ECDSA P-256 / SHA-256** keypair (see the
+root `README.md`); this Rust module is not currently wired into the app's
+certificate flow.
 
 ## Ed25519 Key Storage
 

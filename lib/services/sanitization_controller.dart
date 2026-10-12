@@ -30,7 +30,7 @@ class SanitizationController extends ChangeNotifier {
   final PolicyLayer _policyLayer = PolicyLayer();
   final VerificationService _verificationService = VerificationService();
   final CertificateService _certificateService = CertificateService();
-  final RealSanitizationService _realSanitizeService = RealSanitizationService();
+  late final RealSanitizationService _realSanitizeService;
   late final AppPaths _appPaths;
   late final AuditLogService _auditLogService;
   late final JobStateFile _jobStateFile;
@@ -86,6 +86,7 @@ class SanitizationController extends ChangeNotifier {
     _auditLogService = AuditLogService(paths: _appPaths);
     _jobStateFile = JobStateFile(paths: _appPaths);
     _orphanChecker = OrphanedProcessChecker(paths: _appPaths);
+    _realSanitizeService = RealSanitizationService(paths: _appPaths);
     if (!deferInitialDiscovery) {
       refreshDevices();
     }
@@ -206,6 +207,24 @@ class SanitizationController extends ChangeNotifier {
     }
   }
 
+  /// Method kind stored in `active_job.json` for recovery wording. Derived from
+  /// the [SanitizationMethod] enum, never from the display string.
+  String _methodKind(SanitizationMethod method) {
+    switch (method) {
+      case SanitizationMethod.singlePassOverwrite:
+      case SanitizationMethod.multiPassOverwrite:
+        return 'overwrite';
+      case SanitizationMethod.cryptographicErase:
+      case SanitizationMethod.ataSecureErase:
+      case SanitizationMethod.ataSanitizeBlockErase:
+      case SanitizationMethod.nvmeSanitize:
+      case SanitizationMethod.emmcSanitize:
+        return 'firmware';
+      default:
+        return 'unknown';
+    }
+  }
+
   List<PartitionAuditOutcome>? _buildPartitionOutcomes(SanitizationJob job, bool success) {
     if (!job.isPartitionScope || job.targetPartition == null) return null;
     return [
@@ -243,6 +262,7 @@ class SanitizationController extends ChangeNotifier {
           methodClass: 'firmwareSanitize',
           standardReference: 'NIST SP 800-88 Rev. 1',
           nistCategory: 'INTERRUPTED',
+          outcome: 'interrupted',
           success: false,
           fingerprintHash: 'INTERRUPTED_ACKNOWLEDGED',
           entropyScore: 0.0,
@@ -287,6 +307,7 @@ class SanitizationController extends ChangeNotifier {
     _orphanResult = null;
     notifyListeners();
 
+    await _orphanChecker.removeEngineCheckpoint();
     await _jobStateFile.clearActiveJob();
   }
 
@@ -344,6 +365,7 @@ class SanitizationController extends ChangeNotifier {
         methodClass: _deriveMethodClass(job.effectiveMethod),
         standardReference: job.standardReference,
         nistCategory: 'INTERRUPTED',
+        outcome: 'cancelled',
         success: false,
         fingerprintHash: 'CANCELLED_PARTIALLY_WIPED',
         entropyScore: 0.0,
@@ -417,6 +439,7 @@ class SanitizationController extends ChangeNotifier {
         methodClass: _deriveMethodClass(job.effectiveMethod),
         standardReference: job.standardReference,
         nistCategory: 'INTERRUPTED',
+        outcome: 'interrupted',
         success: false,
         fingerprintHash: 'FORCE_STOPPED_UNVERIFIED',
         entropyScore: 0.0,
@@ -434,6 +457,8 @@ class SanitizationController extends ChangeNotifier {
       devicePath: job.device.id,
       deviceName: job.device.name,
       method: job.effectiveMethod.displayName,
+      methodKind: _methodKind(job.effectiveMethod),
+      deviceSize: job.device.capacityBytes,
       startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
     ));
 
@@ -457,6 +482,8 @@ class SanitizationController extends ChangeNotifier {
       devicePath: job.device.id,
       deviceName: job.device.name,
       method: job.effectiveMethod.displayName,
+      methodKind: _methodKind(job.effectiveMethod),
+      deviceSize: job.device.capacityBytes,
       startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
     ));
 
@@ -485,6 +512,7 @@ class SanitizationController extends ChangeNotifier {
         standardReference: job.standardReference,
         nistCategory: 'INTERRUPTED',
         success: false,
+        outcome: 'interrupted',
         fingerprintHash: isFirmware ? 'INTERRUPTED_FIRMWARE' : 'INTERRUPTED_PARTIALLY_WIPED',
         entropyScore: 0.0,
         sampleCount: 0,
@@ -802,10 +830,9 @@ class SanitizationController extends ChangeNotifier {
     }
   }
 
-  // Orchestrate simulated or real pipeline execution
-  @visibleForTesting
-  Future<void> runSanitizationPipelineForTesting() async => _runSanitizationPipeline();
-
+  // Orchestrate simulated or real pipeline execution.
+  // Deliberately private: the only way to reach it is startSimpleWipe(), which
+  // requires a WipeAuthorization minted inside confirm_wipe_dialog.dart.
   Future<void> _runSanitizationPipeline() async {
     if (_currentJob == null) return;
 
@@ -866,6 +893,8 @@ class SanitizationController extends ChangeNotifier {
               : (job.device.id.startsWith('real_') ? '/dev/${job.device.id.substring(5)}' : '/dev/sdb'),
           deviceName: job.device.name,
           method: job.effectiveMethod.displayName,
+          methodKind: _methodKind(job.effectiveMethod),
+          deviceSize: job.device.capacityBytes,
           startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
           partitionNumber: job.targetPartition?.partitionNumber,
           partitionStartSector: job.targetPartition?.startSector,
@@ -1102,6 +1131,7 @@ class SanitizationController extends ChangeNotifier {
             methodClass: _deriveMethodClass(job.effectiveMethod),
             standardReference: job.standardReference,
             nistCategory: job.effectiveNistCategoryDisplayName,
+            outcome: verificationPassed ? 'completed' : 'verify_failed',
             success: diskWipeSucceeded && verificationPassed,
             verificationPassed: verificationPassed,
             certificateId: _completedCertificate?.certificateId,
@@ -1148,6 +1178,7 @@ class SanitizationController extends ChangeNotifier {
             methodClass: _deriveMethodClass(job.effectiveMethod),
             standardReference: job.standardReference,
             nistCategory: job.effectiveNistCategoryDisplayName,
+            outcome: 'wipe_failed',
             success: false,
             verificationPassed: false,
             certificateId: report.certificateId,
@@ -1191,6 +1222,8 @@ class SanitizationController extends ChangeNotifier {
       devicePath: '/dev/sdb',
       deviceName: job.device.name,
       method: job.effectiveMethod.displayName,
+      methodKind: _methodKind(job.effectiveMethod),
+      deviceSize: job.device.capacityBytes,
       startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
     ));
 
@@ -1229,6 +1262,7 @@ class SanitizationController extends ChangeNotifier {
           methodClass: _deriveMethodClass(job.effectiveMethod),
           standardReference: job.standardReference,
           nistCategory: job.effectiveNistCategoryDisplayName,
+          outcome: 'wipe_failed',
           success: false,
           verificationPassed: false,
           certificateId: _completedCertificate!.certificateId,
@@ -1285,6 +1319,7 @@ class SanitizationController extends ChangeNotifier {
         methodClass: _deriveMethodClass(job.effectiveMethod),
         standardReference: job.standardReference,
         nistCategory: job.effectiveNistCategoryDisplayName,
+        outcome: 'completed',
         success: true,
         verificationPassed: true,
         certificateId: _completedCertificate!.certificateId,

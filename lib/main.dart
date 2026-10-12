@@ -2,12 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import 'core/routing/app_router.dart';
+import 'services/knowledge/knowledge_base.dart';
 import 'services/sanitization_controller.dart';
 import 'widgets/theme.dart';
 import 'widgets/window_close_guard.dart';
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await KnowledgeBase.initialize();
   runApp(const ZeroTraceApp());
 }
 

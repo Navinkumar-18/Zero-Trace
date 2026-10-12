@@ -9,6 +9,16 @@ class ActiveJobState {
   final String devicePath;
   final String deviceName;
   final String method;
+
+  /// Method kind derived from the [SanitizationMethod] enum, not the display
+  /// string: `overwrite`, `firmware`, or `unknown`. Files written before this
+  /// field existed default to `unknown`.
+  final String methodKind;
+
+  /// Total device size in bytes at the time the job started. Used to validate a
+  /// recovery checkpoint; `null` for files written before this field existed.
+  final int? deviceSize;
+
   final String startedAt;
   final String status;
   final int? partitionNumber;
@@ -23,6 +33,8 @@ class ActiveJobState {
     required this.devicePath,
     required this.deviceName,
     required this.method,
+    this.methodKind = 'unknown',
+    this.deviceSize,
     required this.startedAt,
     this.status = 'running',
     this.partitionNumber,
@@ -38,6 +50,8 @@ class ActiveJobState {
         'devicePath': devicePath,
         'deviceName': deviceName,
         'method': method,
+        'methodKind': methodKind,
+        if (deviceSize != null) 'deviceSize': deviceSize,
         'startedAt': startedAt,
         'status': status,
         if (partitionNumber != null) 'partitionNumber': partitionNumber,
@@ -48,12 +62,15 @@ class ActiveJobState {
       };
 
   factory ActiveJobState.fromJson(Map<String, dynamic> json) {
+    final rawKind = json['methodKind'] as String?;
     return ActiveJobState(
       jobId: json['jobId'] as String? ?? '',
       deviceSerial: json['deviceSerial'] as String? ?? '',
       devicePath: json['devicePath'] as String? ?? '',
       deviceName: json['deviceName'] as String? ?? '',
       method: json['method'] as String? ?? '',
+      methodKind: (rawKind == 'overwrite' || rawKind == 'firmware') ? rawKind! : 'unknown',
+      deviceSize: (json['deviceSize'] as num?)?.toInt(),
       startedAt: json['startedAt'] as String? ?? '',
       status: json['status'] as String? ?? 'running',
       partitionNumber: json['partitionNumber'] as int?,
@@ -92,6 +109,8 @@ class JobStateFile {
       devicePath: state.devicePath,
       deviceName: state.deviceName,
       method: state.method,
+      methodKind: state.methodKind,
+      deviceSize: state.deviceSize,
       startedAt: state.startedAt,
       status: 'interrupted',
       partitionNumber: state.partitionNumber,

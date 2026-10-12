@@ -243,7 +243,7 @@ void main() {
     });
 
     test('7. Cancellation state transitions without automatic SIGKILL', () {
-      final service = RealSanitizationService();
+      final service = RealSanitizationService(paths: tempPaths());
       // Ensure calling cancelActiveProcess does not trigger automatic kill
       service.cancelActiveProcess();
       expect(service.activeProcess, isNull);

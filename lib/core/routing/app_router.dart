@@ -9,6 +9,7 @@ import '../../services/sanitization_controller.dart';
 import '../../simple/simple_shell.dart';
 import '../../simple/drive_list_screen.dart';
 import '../../simple/drive_detail_screen.dart';
+import '../../simple/history_screen.dart';
 
 final GlobalKey<NavigatorState> _rootNavigatorKey = GlobalKey<NavigatorState>();
 final GlobalKey<NavigatorState> _shellNavigatorKey = GlobalKey<NavigatorState>(debugLabel: 'shell');
@@ -51,6 +52,16 @@ final GoRouter appRouter = GoRouter(
           pageBuilder: (context, state) => const NoTransitionPage(
             child: AiAssistantScreen(),
           ),
+        ),
+        GoRoute(
+          path: '/history',
+          pageBuilder: (context, state) => const NoTransitionPage(
+            child: HistoryScreen(),
+          ),
+        ),
+        GoRoute(
+          path: '/advanced/history',
+          redirect: (context, state) => '/history',
         ),
         GoRoute(
           path: '/advanced/settings',

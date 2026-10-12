@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 
 import '../models/device_profile.dart';
 import '../models/sanitization_support_level.dart';
+import '../models/untrusted_text.dart';
 import '../services/orphaned_process_checker.dart';
 import '../services/sanitization_controller.dart';
 import '../widgets/theme.dart';
@@ -208,8 +209,8 @@ class _DriveListScreenState extends State<DriveListScreen> {
                                 ),
                                 const SizedBox(height: 2),
                                 Text(
-                                  'Device ${orphanResult.activeJobState?.deviceName ?? "unknown"}: '
-                                  '${orphanResult.checkpointWording ?? "about 0 GB reported written at the last check, not verified"}. '
+                                  'Device ${UntrustedText(orphanResult.activeJobState?.deviceName ?? "unknown").sanitized}: '
+                                  '${orphanResult.checkpointWording ?? "progress could not be read"}. '
                                   'Check before reuse.',
                                   style: const TextStyle(
                                     color: AppTheme.textSecondary,

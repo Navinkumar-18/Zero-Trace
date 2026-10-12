@@ -111,13 +111,13 @@ class CertificateService {
         'executionMode': executionMode ?? 'simulated',
         'scope': scope ?? 'partial',
         'limitation': limitation ?? 'Partition wipe: partition table and unselected sectors are not overwritten',
-        if (partitionsWiped != null) 'partitionsWiped': partitionsWiped,
-        if (bytesOverwritten != null) 'bytesOverwritten': bytesOverwritten,
-        if (totalDeviceBytes != null) 'totalDeviceBytes': totalDeviceBytes,
+        'partitionsWiped': ?partitionsWiped,
+        'bytesOverwritten': ?bytesOverwritten,
+        'totalDeviceBytes': ?totalDeviceBytes,
         'evidenceHash': evidenceHash,
         'result': result,
         'timestamp': timestamp,
-        if (warningLine != null) 'warningLine': warningLine,
+        'warningLine': ?warningLine,
       };
     }
     return {
@@ -131,7 +131,7 @@ class CertificateService {
       'evidenceHash': evidenceHash,
       'result': result,
       'timestamp': timestamp,
-      if (warningLine != null) 'warningLine': warningLine,
+      'warningLine': ?warningLine,
     };
   }
 
@@ -251,7 +251,7 @@ class CertificateService {
 
     final bool isPartition = job.isPartitionScope;
     final int version = isPartition ? 3 : 2;
-    final String? scope = isPartition ? 'partial' : 'full';
+    final String scope = isPartition ? 'partial' : 'full';
     final String? limitation = isPartition
         ? 'Partition wipe: partition table and unselected sectors are not overwritten'
         : null;
@@ -265,7 +265,7 @@ class CertificateService {
           ]
         : null;
     final int? bytesOverwritten = isPartition ? job.targetPartition?.sizeBytes : null;
-    final int? totalDeviceBytes = job.device.capacityBytes;
+    final int totalDeviceBytes = job.device.capacityBytes;
 
     final Map<String, dynamic> payloadToSign = buildSigningPayload(
       certVersion: version,

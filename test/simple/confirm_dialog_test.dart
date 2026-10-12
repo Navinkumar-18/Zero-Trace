@@ -277,6 +277,64 @@ void main() {
     expect(find.text('Drive identity changed or disconnected.'), findsOneWidget);
   });
 
+  testWidgets('Confirm dialog mints a WipeAuthorization pinning identity, typed confirmation and timestamp', (tester) async {
+    tester.view.physicalSize = const Size(1920, 1080);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final controller = SanitizationController(
+      enableAutoPolling: false,
+      deferInitialDiscovery: true,
+    );
+    addTearDown(() => controller.dispose());
+    controller.setMockDevices([usbDevice]);
+
+    ConfirmWipeResult? result;
+    final before = DateTime.now();
+
+    await tester.pumpWidget(
+      ChangeNotifierProvider<SanitizationController>.value(
+        value: controller,
+        child: MaterialApp(
+          home: Scaffold(
+            body: Builder(
+              builder: (ctx) => ElevatedButton(
+                onPressed: () async {
+                  result = await showDialog<ConfirmWipeResult>(
+                    context: ctx,
+                    builder: (_) => const SimpleConfirmDialog(device: usbDevice),
+                  );
+                },
+                child: const Text('Open Dialog'),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Open Dialog'));
+    await tester.pumpAndSettle();
+
+    await tester.enterText(find.byType(TextField), '1494');
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.widgetWithText(ElevatedButton, 'SECURE WIPE'));
+    await tester.pumpAndSettle();
+
+    final after = DateTime.now();
+    expect(result, isNotNull);
+    final auth = result!.authorization;
+    expect(auth.deviceSerial, usbDevice.serialNumber);
+    expect(auth.typedConfirmation, '1494');
+    expect(auth.authorizedAt.isBefore(before), isFalse);
+    expect(auth.authorizedAt.isAfter(after), isFalse);
+  });
+
   testWidgets('SIMULATION banner is displayed in confirm dialog (Item 5)', (tester) async {
     const simDevice = DeviceProfile(
       id: 'sdb',
