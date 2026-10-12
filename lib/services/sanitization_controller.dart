@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 
+import '../core/app_paths.dart';
 import '../models/certificate.dart';
 import '../models/device_profile.dart';
 import '../models/partition_info.dart';
@@ -30,7 +31,10 @@ class SanitizationController extends ChangeNotifier {
   final VerificationService _verificationService = VerificationService();
   final CertificateService _certificateService = CertificateService();
   final RealSanitizationService _realSanitizeService = RealSanitizationService();
-  final AuditLogService _auditLogService = AuditLogService();
+  late final AppPaths _appPaths;
+  late final AuditLogService _auditLogService;
+  late final JobStateFile _jobStateFile;
+  late final OrphanedProcessChecker _orphanChecker;
 
   List<DeviceProfile> _devices = [];
   DeviceProfile? _selectedDevice;
@@ -77,7 +81,11 @@ class SanitizationController extends ChangeNotifier {
 
   bool _isDisposed = false;
 
-  SanitizationController({bool enableAutoPolling = true, bool deferInitialDiscovery = false}) {
+  SanitizationController({AppPaths? appPaths, bool enableAutoPolling = true, bool deferInitialDiscovery = false}) {
+    _appPaths = appPaths ?? AppPaths.production();
+    _auditLogService = AuditLogService(paths: _appPaths);
+    _jobStateFile = JobStateFile(paths: _appPaths);
+    _orphanChecker = OrphanedProcessChecker(paths: _appPaths);
     if (!deferInitialDiscovery) {
       refreshDevices();
     }
@@ -212,7 +220,7 @@ class SanitizationController extends ChangeNotifier {
   }
 
   Future<void> _checkForOrphansOnStartup() async {
-    final result = await OrphanedProcessChecker.checkForOrphan();
+    final result = await _orphanChecker.checkForOrphan();
     if (_isDisposed) return;
     if (result.status != OrphanCheckStatus.none) {
       _orphanResult = result;
@@ -279,7 +287,7 @@ class SanitizationController extends ChangeNotifier {
     _orphanResult = null;
     notifyListeners();
 
-    await JobStateFile.clearActiveJob();
+    await _jobStateFile.clearActiveJob();
   }
 
   /// Whether the currently running job can be safely cancelled.
@@ -376,7 +384,7 @@ class SanitizationController extends ChangeNotifier {
       return d;
     }).toList();
 
-    await JobStateFile.clearActiveJob();
+    await _jobStateFile.clearActiveJob();
     notifyListeners();
   }
 
@@ -420,7 +428,7 @@ class SanitizationController extends ChangeNotifier {
     );
 
     // Save interrupted state so checkpoint stays and discovery/recovery detects it
-    await JobStateFile.recordInterrupted(ActiveJobState(
+    await _jobStateFile.recordInterrupted(ActiveJobState(
       jobId: job.jobId,
       deviceSerial: job.device.serialNumber,
       devicePath: job.device.id,
@@ -443,7 +451,7 @@ class SanitizationController extends ChangeNotifier {
     final job = _currentJob!;
 
     // Save interrupted state to JobStateFile so next launch displays interrupted card
-    await JobStateFile.recordInterrupted(ActiveJobState(
+    await _jobStateFile.recordInterrupted(ActiveJobState(
       jobId: job.jobId,
       deviceSerial: job.device.serialNumber,
       devicePath: job.device.id,
@@ -651,7 +659,7 @@ class SanitizationController extends ChangeNotifier {
               partitions: _buildPartitionOutcomes(job, false),
             ),
           );
-          JobStateFile.clearActiveJob();
+          _jobStateFile.clearActiveJob();
         }
       }
       if (!isJobRunning) {
@@ -850,7 +858,7 @@ class SanitizationController extends ChangeNotifier {
         job.currentStageDescription = 'Executing real-hardware sanitization...';
         notifyListeners();
 
-        await JobStateFile.saveActiveJob(ActiveJobState(
+        await _jobStateFile.saveActiveJob(ActiveJobState(
           jobId: job.jobId,
           deviceSerial: job.device.serialNumber,
           devicePath: job.isPartitionScope
@@ -950,7 +958,7 @@ class SanitizationController extends ChangeNotifier {
             _addLog('ERROR: Sanitization command failed with code ${report.exitCode}');
             _addLog('ERROR Details: ${report.stderr}');
           }
-          await JobStateFile.clearActiveJob();
+          await _jobStateFile.clearActiveJob();
           notifyListeners();
           return;
         }
@@ -1110,7 +1118,7 @@ class SanitizationController extends ChangeNotifier {
           _addLog('WARNING: Audit log write failed: $auditErr');
         }
 
-        await JobStateFile.clearActiveJob();
+        await _jobStateFile.clearActiveJob();
         notifyListeners();
       } catch (e) {
         job.status = JobStatus.failed;
@@ -1153,7 +1161,7 @@ class SanitizationController extends ChangeNotifier {
           ));
         } catch (_) {}
 
-        await JobStateFile.clearActiveJob();
+        await _jobStateFile.clearActiveJob();
         notifyListeners();
       }
       return;
@@ -1177,7 +1185,7 @@ class SanitizationController extends ChangeNotifier {
     job.currentStageDescription = 'Executing ${job.effectiveMethod.displayName}...';
     _addLog('EXECUTION: Invoking controller command payload [Simulated Engine]...');
 
-    await JobStateFile.saveActiveJob(ActiveJobState(
+    await _jobStateFile.saveActiveJob(ActiveJobState(
       jobId: job.jobId,
       deviceSerial: job.device.serialNumber,
       devicePath: '/dev/sdb',
@@ -1234,7 +1242,7 @@ class SanitizationController extends ChangeNotifier {
         ));
       } catch (_) {}
 
-      await JobStateFile.clearActiveJob();
+      await _jobStateFile.clearActiveJob();
       notifyListeners();
       return;
     }
@@ -1290,7 +1298,7 @@ class SanitizationController extends ChangeNotifier {
       ));
     } catch (_) {}
 
-    await JobStateFile.clearActiveJob();
+    await _jobStateFile.clearActiveJob();
     notifyListeners();
   }
 

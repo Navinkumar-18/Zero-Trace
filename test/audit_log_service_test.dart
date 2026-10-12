@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:zero_trace/core/app_paths.dart';
 import 'package:zero_trace/models/certificate.dart';
 import 'package:zero_trace/services/audit_log_service.dart';
 
@@ -11,7 +12,12 @@ void main() {
 
     setUp(() async {
       tempDir = await Directory.systemTemp.createTemp('zt_audit_test_');
-      service = AuditLogService(customBaseDirectory: tempDir.path);
+      service = AuditLogService(
+        paths: AppPaths(
+          baseDir: tempDir,
+          checkpointDir: Directory('${tempDir.path}/checkpoints'),
+        ),
+      );
     });
 
     tearDown(() async {

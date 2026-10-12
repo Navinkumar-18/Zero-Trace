@@ -1,7 +1,9 @@
+import 'dart:io';
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:zero_trace/core/app_paths.dart';
 import 'package:zero_trace/models/device_profile.dart';
 import 'package:zero_trace/models/sanitization_job.dart';
 import 'package:zero_trace/services/job_state_file.dart';
@@ -11,6 +13,21 @@ import 'package:zero_trace/widgets/window_close_guard.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  late Directory tempDir;
+
+  setUp(() {
+    tempDir = Directory.systemTemp.createTempSync('zt_wcg_');
+  });
+
+  tearDown(() {
+    if (tempDir.existsSync()) tempDir.deleteSync(recursive: true);
+  });
+
+  AppPaths paths() => AppPaths(
+        baseDir: tempDir,
+        checkpointDir: Directory('${tempDir.path}/checkpoints'),
+      );
 
   const testDevice = DeviceProfile(
     id: 'sdb',
@@ -25,6 +42,7 @@ void main() {
   group('WindowCloseGuard - AppLifecycleListener(onExitRequested)', () {
     testWidgets('allows exit when no wipe is running', (tester) async {
       final controller = SanitizationController(
+        appPaths: paths(),
         enableAutoPolling: false,
         deferInitialDiscovery: true,
       );
@@ -49,6 +67,7 @@ void main() {
 
     testWidgets('cancels exit when a wipe is running and user declines confirmation', (tester) async {
       final controller = SanitizationController(
+        appPaths: paths(),
         enableAutoPolling: false,
         deferInitialDiscovery: true,
       );
@@ -105,6 +124,7 @@ void main() {
 
     testWidgets('confirmed exit during overwrite records interrupted in JobStateFile and marks job interrupted (Item 6a)', (tester) async {
       final controller = SanitizationController(
+        appPaths: paths(),
         enableAutoPolling: false,
         deferInitialDiscovery: true,
       );
@@ -156,15 +176,15 @@ void main() {
       expect(controller.currentJob?.currentStageDescription, contains('Interrupted'));
 
       // JobStateFile records "interrupted"
-      final savedJob = await JobStateFile.readActiveJob();
+      final savedJob = await JobStateFile(paths: paths()).readActiveJob();
       expect(savedJob, isNotNull);
       expect(savedJob!.status, 'interrupted');
       expect(savedJob.jobId, 'job-overwrite-exit');
 
       // Next launch triggers orphan check result as interrupted
-      final orphanResult = await OrphanedProcessChecker.checkForOrphan();
+      final orphanResult = await OrphanedProcessChecker(paths: paths()).checkForOrphan();
       expect(orphanResult.status, OrphanCheckStatus.interrupted);
-      await JobStateFile.clearActiveJob();
+      await JobStateFile(paths: paths()).clearActiveJob();
       await tester.pumpWidget(const SizedBox());
     });
 
@@ -180,6 +200,7 @@ void main() {
       );
 
       final controller = SanitizationController(
+        appPaths: paths(),
         enableAutoPolling: false,
         deferInitialDiscovery: true,
       );
@@ -238,12 +259,12 @@ void main() {
       );
 
       // JobStateFile records "interrupted"
-      final savedJob = await JobStateFile.readActiveJob();
+      final savedJob = await JobStateFile(paths: paths()).readActiveJob();
       expect(savedJob, isNotNull);
       expect(savedJob!.status, 'interrupted');
       expect(savedJob.jobId, 'job-firmware-exit');
 
-      await JobStateFile.clearActiveJob();
+      await JobStateFile(paths: paths()).clearActiveJob();
       await tester.pumpWidget(const SizedBox());
     });
   });

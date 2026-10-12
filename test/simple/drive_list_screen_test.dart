@@ -1,6 +1,8 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
+import 'package:zero_trace/core/app_paths.dart';
 import 'package:zero_trace/models/device_profile.dart';
 import 'package:zero_trace/services/job_state_file.dart';
 import 'package:zero_trace/services/orphaned_process_checker.dart';
@@ -8,6 +10,21 @@ import 'package:zero_trace/services/sanitization_controller.dart';
 import 'package:zero_trace/simple/drive_list_screen.dart';
 
 void main() {
+  late Directory tempDir;
+
+  setUp(() {
+    tempDir = Directory.systemTemp.createTempSync('zt_drive_list_');
+  });
+
+  tearDown(() {
+    if (tempDir.existsSync()) tempDir.deleteSync(recursive: true);
+  });
+
+  AppPaths tempPaths() => AppPaths(
+        baseDir: tempDir,
+        checkpointDir: Directory('${tempDir.path}/checkpoints'),
+      );
+
   const usbDevice = DeviceProfile(
     id: 'sdb',
     name: 'SanDisk Cruzer Blade',
@@ -69,7 +86,7 @@ void main() {
       tester.view.resetDevicePixelRatio();
     });
 
-    final controller = SanitizationController(enableAutoPolling: false);
+    final controller = SanitizationController(appPaths: tempPaths(), enableAutoPolling: false);
     addTearDown(() => controller.dispose());
     controller.setMockDevices([usbDevice, internalSsd]);
 
@@ -100,7 +117,7 @@ void main() {
       tester.view.resetDevicePixelRatio();
     });
 
-    final controller = SanitizationController(enableAutoPolling: false);
+    final controller = SanitizationController(appPaths: tempPaths(), enableAutoPolling: false);
     addTearDown(() => controller.dispose());
     controller.setMockDevices([systemDrive]);
 
@@ -123,7 +140,7 @@ void main() {
       tester.view.resetDevicePixelRatio();
     });
 
-    final controller = SanitizationController(enableAutoPolling: false);
+    final controller = SanitizationController(appPaths: tempPaths(), enableAutoPolling: false);
     addTearDown(() => controller.dispose());
     controller.setMockDevices([unsupportedRaid]);
 
@@ -145,7 +162,7 @@ void main() {
       tester.view.resetDevicePixelRatio();
     });
 
-    final controller = SanitizationController(enableAutoPolling: false);
+    final controller = SanitizationController(appPaths: tempPaths(), enableAutoPolling: false);
     addTearDown(() => controller.dispose());
     await controller.toggleRealMode(false);
 
@@ -163,7 +180,7 @@ void main() {
       tester.view.resetDevicePixelRatio();
     });
 
-    final controller = SanitizationController(enableAutoPolling: false);
+    final controller = SanitizationController(appPaths: tempPaths(), enableAutoPolling: false);
     addTearDown(() => controller.dispose());
     controller.setMockDevices([usbDevice]);
     controller.setMockOrphanResult(OrphanCheckResult(
@@ -197,7 +214,7 @@ void main() {
       tester.view.resetDevicePixelRatio();
     });
 
-    final controller = SanitizationController(enableAutoPolling: false);
+    final controller = SanitizationController(appPaths: tempPaths(), enableAutoPolling: false);
     addTearDown(() => controller.dispose());
     controller.setMockDevices([usbDevice]);
     controller.setMockOrphanResult(OrphanCheckResult(
@@ -243,7 +260,7 @@ void main() {
       disabledReason: 'Unknown drive type – sanitization unsupported',
     );
 
-    final controller = SanitizationController(enableAutoPolling: false);
+    final controller = SanitizationController(appPaths: tempPaths(), enableAutoPolling: false);
     addTearDown(() => controller.dispose());
     controller.setMockDevices([unknownDriveType]);
 
@@ -332,7 +349,7 @@ void main() {
         isSystemDisk: false,
       );
 
-      final controller = SanitizationController(enableAutoPolling: false);
+      final controller = SanitizationController(appPaths: tempPaths(), enableAutoPolling: false);
       addTearDown(() => controller.dispose());
       controller.setMockDevices([usbDevice, emmc]);
 

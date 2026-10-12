@@ -1,5 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
+
+import '../core/app_paths.dart';
 import 'job_state_file.dart';
 
 enum OrphanCheckStatus {
@@ -50,12 +52,19 @@ class OrphanCheckResult {
 }
 
 class OrphanedProcessChecker {
+  final AppPaths paths;
+  final JobStateFile _jobState;
+
+  OrphanedProcessChecker({required this.paths})
+      : _jobState = JobStateFile(paths: paths);
+
   static String sanitizeSerial(String serial) {
     return serial.replaceAll(RegExp(r'[^a-zA-Z0-9_\-]'), '');
   }
 
   /// Prefer engine-side checkpoint file `/tmp/zt_checkpoint_<serial>.json` to JobStateFile.
-  static Future<EngineCheckpoint?> readEngineCheckpoint(String serial) async {
+  /// NOTE: the engine checkpoint path is a separate task; left unchanged for now.
+  Future<EngineCheckpoint?> readEngineCheckpoint(String serial) async {
     final sanitized = sanitizeSerial(serial);
     if (sanitized.isEmpty) return null;
     final file = File('/tmp/zt_checkpoint_$sanitized.json');
@@ -69,7 +78,7 @@ class OrphanedProcessChecker {
     return null;
   }
 
-  static Future<void> removeEngineCheckpoint(String serial) async {
+  Future<void> removeEngineCheckpoint(String serial) async {
     final sanitized = sanitizeSerial(serial);
     if (sanitized.isEmpty) return;
     final file = File('/tmp/zt_checkpoint_$sanitized.json');
@@ -80,8 +89,8 @@ class OrphanedProcessChecker {
     }
   }
 
-  static Future<OrphanCheckResult> checkForOrphan() async {
-    final state = await JobStateFile.readActiveJob();
+  Future<OrphanCheckResult> checkForOrphan() async {
+    final state = await _jobState.readActiveJob();
     if (state == null) {
       return OrphanCheckResult(status: OrphanCheckStatus.none);
     }
@@ -90,7 +99,7 @@ class OrphanedProcessChecker {
     final checkpoint = await readEngineCheckpoint(state.deviceSerial);
     final bytesDone = checkpoint?.bytesDone;
     final bytesTotal = checkpoint?.bytesTotal;
-    
+
     final gbDone = bytesDone != null ? (bytesDone / 1e9).toStringAsFixed(1) : '0';
     // Exact requested wording: "about X GB reported written at the last check, not verified"
     final checkpointWording = 'about $gbDone GB reported written at the last check, not verified';

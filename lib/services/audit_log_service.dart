@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:crypto/crypto.dart';
 
+import '../core/app_paths.dart';
 import '../models/certificate.dart';
 
 class PartitionAuditOutcome {
@@ -253,38 +254,20 @@ class AuditLogService {
   static const String genesisHash =
       '0000000000000000000000000000000000000000000000000000000000000000';
 
-  final String? customBaseDirectory;
+  final AppPaths paths;
 
-  AuditLogService({this.customBaseDirectory});
+  AuditLogService({required this.paths});
 
-  Directory _getBaseDir() {
-    if (customBaseDirectory != null) {
-      final dir = Directory(customBaseDirectory!);
-      if (!dir.existsSync()) dir.createSync(recursive: true);
-      return dir;
-    }
-    final home = Platform.environment['HOME'] ??
-        Platform.environment['USERPROFILE'] ??
-        '/root';
-    final dir = Directory('$home/.zero_trace');
-    if (!dir.existsSync()) {
-      dir.createSync(recursive: true);
-    }
-    return dir;
-  }
+  File get _logFile => paths.auditLogFile;
 
-  File _getLogFile() {
-    return File('${_getBaseDir().path}/audit_log.jsonl');
-  }
-
-  Directory _getCertificatesDir() {
-    final dir = Directory('${_getBaseDir().path}/certificates');
+  Directory get _certificatesDir {
+    final dir = paths.certificatesDir;
     if (!dir.existsSync()) dir.createSync(recursive: true);
     return dir;
   }
 
-  Directory _getReportsDir() {
-    final dir = Directory('${_getBaseDir().path}/reports');
+  Directory get _reportsDir {
+    final dir = paths.reportsDir;
     if (!dir.existsSync()) dir.createSync(recursive: true);
     return dir;
   }
@@ -300,7 +283,7 @@ class AuditLogService {
     final tmpFile = File('$targetPath.tmp.${DateTime.now().microsecondsSinceEpoch}');
     tmpFile.writeAsStringSync(content, flush: true);
 
-    if (!Platform.environment.containsKey('FLUTTER_TEST') && (Platform.isLinux || Platform.isMacOS)) {
+    if (Platform.isLinux || Platform.isMacOS) {
       try {
         Process.runSync('chmod', ['600', tmpFile.path]);
       } catch (_) {}
@@ -311,7 +294,7 @@ class AuditLogService {
 
   /// Persists certificate to certificates/ directory with mode 0600 and returns (File, SHA-256).
   Future<(File, String)> saveCertificate(SanitizationCertificate cert) async {
-    final targetPath = '${_getCertificatesDir().path}/${cert.certificateId}.json';
+    final targetPath = '${_certificatesDir.path}/${cert.certificateId}.json';
     final content = jsonEncode(cert.toJson());
     final file = await _writeAtomic(targetPath, content);
     final fileSha = sha256.convert(file.readAsBytesSync()).toString();
@@ -320,7 +303,7 @@ class AuditLogService {
 
   /// Persists failure report to reports/ directory with mode 0600 and returns (File, SHA-256).
   Future<(File, String)> saveFailureReport(SanitizationCertificate report) async {
-    final targetPath = '${_getReportsDir().path}/${report.certificateId}.json';
+    final targetPath = '${_reportsDir.path}/${report.certificateId}.json';
     final content = jsonEncode(report.toJson());
     final file = await _writeAtomic(targetPath, content);
     final fileSha = sha256.convert(file.readAsBytesSync()).toString();
@@ -330,12 +313,12 @@ class AuditLogService {
   /// Loads certificate or failure report by ID from disk.
   Future<SanitizationCertificate?> getCertificateById(String certificateId) async {
     try {
-      final certFile = File('${_getCertificatesDir().path}/$certificateId.json');
+      final certFile = File('${_certificatesDir.path}/$certificateId.json');
       if (certFile.existsSync()) {
         final json = jsonDecode(certFile.readAsStringSync());
         return SanitizationCertificate.fromJson(Map<String, dynamic>.from(json));
       }
-      final reportFile = File('${_getReportsDir().path}/$certificateId.json');
+      final reportFile = File('${_reportsDir.path}/$certificateId.json');
       if (reportFile.existsSync()) {
         final json = jsonDecode(reportFile.readAsStringSync());
         return SanitizationCertificate.fromJson(Map<String, dynamic>.from(json));
@@ -347,7 +330,8 @@ class AuditLogService {
   /// Appends a new sanitization operation entry to the hash-chained audit log.
   Future<AuditLogEntry> appendEntry(AuditLogEntry entry) async {
     try {
-      final file = _getLogFile();
+      paths.baseDir.createSync(recursive: true);
+      final file = _logFile;
 
       // Find the last chained entry's hash to determine previousHash
       String prevHash = genesisHash;
@@ -378,21 +362,16 @@ class AuditLogService {
 
       final line = '${jsonEncode(chainedEntry.toJson())}\n';
       final raf = file.openSync(mode: FileMode.append);
-      final shouldLock = !Platform.environment.containsKey('FLUTTER_TEST');
       try {
-        if (shouldLock) {
-          raf.lockSync(FileLock.exclusive);
-        }
+        raf.lockSync(FileLock.exclusive);
         raf.writeStringSync(line);
         raf.flushSync();
       } finally {
-        if (shouldLock) {
-          raf.unlockSync();
-        }
+        raf.unlockSync();
         raf.closeSync();
       }
 
-      if (!Platform.environment.containsKey('FLUTTER_TEST') && (Platform.isLinux || Platform.isMacOS)) {
+      if (Platform.isLinux || Platform.isMacOS) {
         try {
           Process.runSync('chmod', ['600', file.path]);
         } catch (_) {}
@@ -407,7 +386,7 @@ class AuditLogService {
   /// Verifies integrity of the audit log hash chain.
   /// Tolerates legacy unchained lines at the head and a torn last line.
   Future<ChainIntegrityResult> verifyChainIntegrity() async {
-    final file = _getLogFile();
+    final file = _logFile;
     if (!file.existsSync()) {
       return const ChainIntegrityResult(
         status: ChainIntegrityStatus.valid,
@@ -515,7 +494,7 @@ class AuditLogService {
     bool includeSimulated = false,
   }) async {
     try {
-      final file = _getLogFile();
+      final file = _logFile;
       if (!file.existsSync()) return [];
 
       final lines = file.readAsLinesSync();

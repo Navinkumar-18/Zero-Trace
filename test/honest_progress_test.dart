@@ -1,5 +1,7 @@
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:zero_trace/core/app_paths.dart';
 import 'package:zero_trace/models/device_profile.dart';
 import 'package:zero_trace/models/sanitization_job.dart';
 import 'package:zero_trace/services/real_sanitization_service.dart';
@@ -7,6 +9,21 @@ import 'package:zero_trace/services/sanitization_controller.dart';
 import 'package:zero_trace/services/job_state_file.dart';
 
 void main() {
+  late Directory tempDir;
+
+  setUp(() {
+    tempDir = Directory.systemTemp.createTempSync('zt_honest_');
+  });
+
+  tearDown(() {
+    if (tempDir.existsSync()) tempDir.deleteSync(recursive: true);
+  });
+
+  AppPaths tempPaths() => AppPaths(
+        baseDir: tempDir,
+        checkpointDir: Directory('${tempDir.path}/checkpoints'),
+      );
+
   group('Honest Progress and Telemetry Tests', () {
     final sampleDevice = DeviceProfile(
       id: 'real_sdb',
@@ -238,6 +255,7 @@ void main() {
 
     test('8. Force stop transitions job to "interrupted, state unknown" and checkpoint stays', () async {
       final controller = SanitizationController(
+        appPaths: tempPaths(),
         enableAutoPolling: false,
         deferInitialDiscovery: true,
       );
@@ -278,14 +296,14 @@ void main() {
       expect(controller.currentJob?.currentStageDescription, 'interrupted, state unknown');
 
       // Verify checkpoint stays on disk
-      final activeJob = await JobStateFile.readActiveJob();
+      final activeJob = await JobStateFile(paths: tempPaths()).readActiveJob();
       expect(activeJob, isNotNull);
       expect(activeJob!.jobId, 'job-force-stop-test');
       expect(activeJob.status, 'interrupted');
       expect(activeJob.deviceSerial, 'FORCE-1234-TEST');
 
       // Clean up test state file
-      await JobStateFile.clearActiveJob();
+      await JobStateFile(paths: tempPaths()).clearActiveJob();
     });
   });
 }

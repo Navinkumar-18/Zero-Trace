@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import '../core/app_paths.dart';
+
 class ActiveJobState {
   final String jobId;
   final String deviceSerial;
@@ -63,25 +65,27 @@ class ActiveJobState {
   }
 }
 
+/// Persists the single in-flight (or interrupted) job marker to
+/// `${AppPaths.baseDir}/active_job.json`.
+///
+/// The directory comes from the injected [AppPaths]; the class never resolves
+/// `HOME` itself. Reads and clears never create the state directory.
 class JobStateFile {
-  static File _getFile() {
-    final home = Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'] ?? '/root';
-    final directory = Directory('$home/.zero_trace');
-    if (!directory.existsSync()) {
-      directory.createSync(recursive: true);
-    }
-    return File('${directory.path}/active_job.json');
-  }
+  final AppPaths paths;
 
-  static Future<void> saveActiveJob(ActiveJobState state) async {
+  JobStateFile({required this.paths});
+
+  Future<void> saveActiveJob(ActiveJobState state) async {
     try {
-      final file = _getFile();
+      final baseDir = paths.baseDir;
+      baseDir.createSync(recursive: true);
+      final file = File('${baseDir.path}/active_job.json');
       file.writeAsStringSync(jsonEncode(state.toJson()), flush: true);
     } catch (_) {}
   }
 
   /// Records an interrupted job state for recovery on subsequent application launches.
-  static Future<void> recordInterrupted(ActiveJobState state) async {
+  Future<void> recordInterrupted(ActiveJobState state) async {
     final interrupted = ActiveJobState(
       jobId: state.jobId,
       deviceSerial: state.deviceSerial,
@@ -99,9 +103,9 @@ class JobStateFile {
     await saveActiveJob(interrupted);
   }
 
-  static Future<ActiveJobState?> readActiveJob() async {
+  Future<ActiveJobState?> readActiveJob() async {
     try {
-      final file = _getFile();
+      final file = File('${paths.baseDir.path}/active_job.json');
       if (!file.existsSync()) return null;
       final content = file.readAsStringSync();
       if (content.trim().isEmpty) return null;
@@ -111,9 +115,9 @@ class JobStateFile {
     }
   }
 
-  static Future<void> clearActiveJob() async {
+  Future<void> clearActiveJob() async {
     try {
-      final file = _getFile();
+      final file = File('${paths.baseDir.path}/active_job.json');
       if (file.existsSync()) {
         file.deleteSync();
       }

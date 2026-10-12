@@ -1,4 +1,6 @@
+import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:zero_trace/core/app_paths.dart';
 import 'package:zero_trace/models/device_profile.dart';
 import 'package:zero_trace/models/sanitization_job.dart';
 import 'package:zero_trace/services/job_state_file.dart';
@@ -7,6 +9,20 @@ import 'package:zero_trace/services/sanitization_controller.dart';
 import 'package:zero_trace/simple/confirm_wipe_dialog.dart';
 
 void main() {
+  late Directory tempDir;
+
+  setUp(() {
+    tempDir = Directory.systemTemp.createTempSync('zt_wipe_method_');
+  });
+
+  tearDown(() {
+    if (tempDir.existsSync()) tempDir.deleteSync(recursive: true);
+  });
+
+  AppPaths tempPaths() => AppPaths(
+        baseDir: tempDir,
+        checkpointDir: Directory('${tempDir.path}/checkpoints'),
+      );
   const sataSsd = DeviceProfile(
     id: 'sda',
     name: 'Crucial MX500 500GB',
@@ -44,7 +60,7 @@ void main() {
 
   group('Item 1: Strongest engine-supported method selection in startSimpleWipe', () {
     test('SATA drive always selects ATA Secure Erase regardless of disposal intent', () {
-      final controller = SanitizationController(enableAutoPolling: false, deferInitialDiscovery: true);
+      final controller = SanitizationController(appPaths: tempPaths(), enableAutoPolling: false, deferInitialDiscovery: true);
       addTearDown(() => controller.dispose());
       controller.setMockDevices([sataSsd]);
 
@@ -60,7 +76,7 @@ void main() {
     });
 
     test('NVMe drive always selects NVMe Sanitize regardless of disposal intent', () {
-      final controller = SanitizationController(enableAutoPolling: false, deferInitialDiscovery: true);
+      final controller = SanitizationController(appPaths: tempPaths(), enableAutoPolling: false, deferInitialDiscovery: true);
       addTearDown(() => controller.dispose());
       controller.setMockDevices([nvmeSsd]);
 
@@ -76,7 +92,7 @@ void main() {
     });
 
     test('USB flash drive selects singlePassOverwrite for internal reuse, recommends destruction for disposal/resale', () {
-      final controller = SanitizationController(enableAutoPolling: false, deferInitialDiscovery: true);
+      final controller = SanitizationController(appPaths: tempPaths(), enableAutoPolling: false, deferInitialDiscovery: true);
       addTearDown(() => controller.dispose());
       controller.setMockDevices([usbFlash]);
 
@@ -93,7 +109,7 @@ void main() {
     });
 
     test('startSimpleWipe uses auto-selected strongest method even with reuseMyself intent', () async {
-      final controller = SanitizationController(enableAutoPolling: false, deferInitialDiscovery: true);
+      final controller = SanitizationController(appPaths: tempPaths(), enableAutoPolling: false, deferInitialDiscovery: true);
       addTearDown(() => controller.dispose());
       controller.setMockDevices([sataSsd]);
 
@@ -114,7 +130,7 @@ void main() {
 
   group('Item 8: Interrupted run dismiss marks drive partially wiped and preserves audit', () {
     test('acknowledgeOrphan marks target drive partially wiped and hides orphan banner', () {
-      final controller = SanitizationController(enableAutoPolling: false, deferInitialDiscovery: true);
+      final controller = SanitizationController(appPaths: tempPaths(), enableAutoPolling: false, deferInitialDiscovery: true);
       addTearDown(() => controller.dispose());
       controller.setMockDevices([usbFlash]);
 
