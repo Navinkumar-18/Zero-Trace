@@ -1,0 +1,15 @@
+{
+  "success": true,
+  "method_used": "Partition BLKDISCARD (TRIM/UNMAP)",
+  "command_log": [
+    "[DRY RUN] [guard] partition geometry and table fingerprint verified for /dev/sda3 (1048576 bytes)",
+    "[DRY RUN] BLKDISCARD plan for /dev/sda3: 1 command(s), 1048576 bytes (granularity 512, max 0)"
+  ],
+  "stdout": "[DRY RUN] Partition discard simulated successfully",
+  "stderr": "",
+  "exit_code": 0,
+  "duration_ms": 0,
+  "dry_run": true,
+  "bytes_written": 0,
+  "io_mode": "dry_run"
+}

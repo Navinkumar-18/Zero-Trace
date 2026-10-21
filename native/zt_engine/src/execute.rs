@@ -11,10 +11,9 @@
 //! - Streams ProgressEvents for real-time UI updates
 
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,38 +23,17 @@ use std::time::Instant;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use sha2::{Digest, Sha256};
-use thiserror::Error;
 use tokio::sync::mpsc;
 
-// ---------------------------------------------------------------------------
-// Error types
-// ---------------------------------------------------------------------------
+// Phase C: the guard chain now lives in `crate::guard` over `crate::backend`
+// facts; these thin wrappers keep the historic signatures for every existing
+// caller and test while delegating to the single shared chain.
+use crate::backend::linux::LinuxBackend;
+pub use crate::types::{
+    dev_major, dev_minor, is_mount_unmountable_allowlisted, parse_major_minor, BlockWriter,
+    BootEnvironment, ExecuteError, GuardIdentity, PartitionTargetParams, ValidatedPartitionTarget,
+};
 
-#[derive(Error, Debug)]
-pub enum ExecuteError {
-    #[error("Boot disk protection: refusing to operate on OS root device {0}")]
-    BootDiskProtection(String),
-    #[error("Confirmation token mismatch: expected serial of target device")]
-    ConfirmationMismatch,
-    #[error("Command execution failed: {0}")]
-    CommandFailed(String),
-    #[error("Device not found: {0}")]
-    DeviceNotFound(String),
-    #[error("Unsupported operation: {0}")]
-    UnsupportedOperation(String),
-    #[error("IO error: {0}")]
-    IoError(#[from] io::Error),
-    #[error("Hardware I/O error (EIO): {0}")]
-    HardwareIo(String),
-    #[error("Device disconnected (ENODEV): {0}")]
-    DeviceDisconnected(String),
-    #[error("Premature end of device (ENOSPC): {0}")]
-    PrematureEndOfDevice(String),
-    #[error("Progress channel closed")]
-    ChannelClosed,
-    #[error("Identity mismatch: {0}")]
-    IdentityMismatch(String),
-}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -146,16 +124,6 @@ pub struct ExecutionReport {
     pub io_mode: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct GuardIdentity {
-    pub canonical_path: String,
-    pub st_rdev: libc::dev_t,
-    pub major: u32,
-    pub minor: u32,
-    pub is_block: bool,
-    pub device_serial: String,
-    pub st_ino: u64,
-}
 
 // ---------------------------------------------------------------------------
 // Safety checks & Hardened Boot-Disk Protection
@@ -179,54 +147,7 @@ impl Default for FsContext {
     }
 }
 
-/// Helper to decode major number from st_rdev / dev_t.
-fn dev_major(dev: libc::dev_t) -> u32 {
-    (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)) as u32
-}
 
-/// Helper to decode minor number from st_rdev / dev_t.
-fn dev_minor(dev: libc::dev_t) -> u32 {
-    ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32
-}
-
-/// Parse a "major:minor" decimal ASCII string into a (major, minor) tuple.
-fn parse_major_minor(s: &str) -> Option<(u32, u32)> {
-    let trimmed = s.trim();
-    let parts: Vec<&str> = trimmed.split(':').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let maj = parts[0].trim().parse::<u32>().ok()?;
-    let min = parts[1].trim().parse::<u32>().ok()?;
-    Some((maj, min))
-}
-
-/// Determine if a mount point is allowlisted as an unmountable target.
-/// Only mounts under /mnt, /media, or /run/media/* are unmountable.
-/// Live-media mounts (/run/live/medium, /run/archiso, etc.) are explicitly protected.
-pub fn is_mount_unmountable_allowlisted(mount_point: &str) -> bool {
-    // Explicitly protect live-media mounts
-    if mount_point.starts_with("/run/live")
-        || mount_point.starts_with("/run/archiso")
-        || mount_point.contains("/live/")
-        || mount_point.contains("/archiso/")
-        || mount_point.contains("/casper/")
-    {
-        return false;
-    }
-
-    if mount_point == "/mnt" || mount_point.starts_with("/mnt/") {
-        return true;
-    }
-    if mount_point == "/media" || mount_point.starts_with("/media/") {
-        return true;
-    }
-    if mount_point == "/run/media" || mount_point.starts_with("/run/media/") {
-        return true;
-    }
-
-    false
-}
 
 /// Canonicalize target device path, resolving symlinks such as /dev/disk/by-id/*
 pub fn canonicalize_device_path(
@@ -290,27 +211,6 @@ pub fn canonicalize_device_path(
     }
 }
 
-// Hardened boot-disk and system mount protection.
-// Checks the device and all associated partitions/stacks against mountinfo and swaps.
-// ---------------------------------------------------
-// A3b: boot environment (normal install vs live medium vs container)
-// ---------------------------------------------------
-
-/// What kind of system the engine is running on. Affects which disks are
-/// considered wipeable:
-/// - `Normal`: installed system; the disk hosting `/` (and its partitions)
-///   is protected.
-/// - `Live`: booted from a live medium (overlay/squashfs root + live marker
-///   on the kernel cmdline); internal disks become wipeable, but the live
-///   medium itself and anything still mounted/swap-active stay protected.
-/// - `Container`: overlay root with no live marker — refuse everything
-///   (fail closed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BootEnvironment {
-    Normal,
-    Live,
-    Container,
-}
 
 /// Kernel cmdline markers that identify a live boot.
 const LIVE_CMDLINE_MARKERS: &[&str] = &[
@@ -373,429 +273,12 @@ pub fn detect_boot_environment_ctx(ctx: &FsContext) -> Result<BootEnvironment, E
     }
 }
 
-// ---------------------------------------------------
-// Mount & swap protection scanning (shared by guard checks)
-// ---------------------------------------------------
-
-/// Result of scanning mountinfo + swaps for protected devices.
-struct MountProtectionState {
-    protected_devs: HashMap<(u32, u32), String>,
-    protected_names: HashSet<String>,
-    has_root_mount: bool,
-}
-
-/// Parse mountinfo (with fallbacks) and /proc/swaps, collecting every
-/// device that must never be a destructive target.
-///
-/// `boot_env` matters for A3b: in `Live` mode the overlay root itself has no
-/// backing block device and must not trip the anonymous-device fail-closed
-/// check; the live medium's own mounts (e.g. /run/live/medium, /cdrom) are
-/// still recorded as protected via the normal non-allowlisted-mount path.
-fn scan_mount_and_swap_protection(
-    ctx: &FsContext,
-    dry_run: bool,
-    boot_env: BootEnvironment,
-) -> Result<MountProtectionState, ExecuteError> {
-    // 2. Parse /proc/self/mountinfo
-    let mountinfo_path = ctx.proc_root.join("self/mountinfo");
-    let mountinfo_content = if mountinfo_path.exists() {
-        fs::read_to_string(&mountinfo_path)
-            .map_err(|e| ExecuteError::BootDiskProtection(format!("Cannot read mountinfo: {}", e)))?
-    } else {
-        // Fallback to /proc/mountinfo or /proc/mounts
-        let alt = ctx.proc_root.join("mountinfo");
-        let alt_mounts = ctx.proc_root.join("mounts");
-        if alt.exists() {
-            fs::read_to_string(&alt)
-                .map_err(|e| ExecuteError::BootDiskProtection(format!("Cannot read mountinfo: {}", e)))?
-        } else if alt_mounts.exists() {
-            fs::read_to_string(&alt_mounts)
-                .map_err(|e| ExecuteError::BootDiskProtection(format!("Cannot read mounts: {}", e)))?
-        } else {
-            return Err(ExecuteError::BootDiskProtection("No mountinfo or mounts file found: fail closed".to_string()));
-        }
-    };
-
-    let mut protected_devs: HashMap<(u32, u32), String> = HashMap::new();
-    let mut protected_names: HashSet<String> = HashSet::new();
-    let mut has_root_mount = false;
-
-    // Track mounts for swap file resolution
-    let mut active_mounts: Vec<(String, (u32, u32))> = Vec::new();
-
-    // Exempt virtual in-memory pseudo-filesystems from anonymous device check
-    let exempt_pseudo_fs: HashSet<&str> = [
-        "tmpfs", "devtmpfs", "proc", "sysfs", "cgroup", "cgroup2",
-        "ramfs", "devpts", "pstore", "securityfs", "tracefs", "debugfs",
-        "mqueue", "hugetlbfs", "autofs", "fusectl", "configfs", "efivarfs",
-        "bpf", "squashfs", "nsfs", "pipefs", "sockfs", "rpc_pipefs",
-    ].into_iter().collect();
-
-    for line in mountinfo_content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.len() < 5 {
-            return Err(ExecuteError::BootDiskProtection(format!("Corrupt mountinfo line: {}", line)));
-        }
-
-        let mm_str = parts[2];
-        let mount_point = parts[4];
-
-        if mount_point == "/" {
-            has_root_mount = true;
-        }
-
-        // Find separator "-"
-        let dash_pos = parts.iter().position(|&p| p == "-");
-        let (fs_type, mount_source) = if let Some(pos) = dash_pos {
-            let ft = parts.get(pos + 1).copied().unwrap_or("");
-            let ms = parts.get(pos + 2).copied().unwrap_or("");
-            (ft, ms)
-        } else {
-            let ft = parts.get(2).copied().unwrap_or("");
-            let ms = parts.first().copied().unwrap_or("");
-            (ft, ms)
-        };
-
-        let mm = parse_major_minor(mm_str);
-        if let Some(pair) = mm {
-            active_mounts.push((mount_point.to_string(), pair));
-        }
-
-        let unmountable = is_mount_unmountable_allowlisted(mount_point);
-        if !unmountable {
-            if let Some((maj, min)) = mm {
-                if maj != 0 {
-                    protected_devs.insert((maj, min), format!("protected mount '{}'", mount_point));
-                } else if fs_type == "btrfs" {
-                    let mut btrfs_resolved = false;
-                    let btrfs_sys = ctx.sys_root.join("fs/btrfs");
-                    if btrfs_sys.exists() {
-                        if let Ok(entries) = fs::read_dir(&btrfs_sys) {
-                            for entry in entries.flatten() {
-                                let devices_dir = entry.path().join("devices");
-                                if devices_dir.exists() {
-                                    if let Ok(dev_entries) = fs::read_dir(&devices_dir) {
-                                        for dev_entry in dev_entries.flatten() {
-                                            let d_name = dev_entry.file_name().to_string_lossy().to_string();
-                                            protected_names.insert(d_name.clone());
-                                            let d_dev = ctx.sys_root.join("class/block").join(&d_name).join("dev");
-                                            if let Ok(dev_c) = fs::read_to_string(&d_dev) {
-                                                if let Some(dev_mm) = parse_major_minor(&dev_c) {
-                                                    protected_devs.insert(dev_mm, format!("btrfs device '{}' for protected mount '{}'", d_name, mount_point));
-                                                    btrfs_resolved = true;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if mount_source.starts_with("/dev/") {
-                        let src_name = mount_source.rsplit('/').next().unwrap_or(mount_source);
-                        protected_names.insert(src_name.to_string());
-                        let d_dev = ctx.sys_root.join("class/block").join(src_name).join("dev");
-                        if let Ok(dev_c) = fs::read_to_string(&d_dev) {
-                            if let Some(dev_mm) = parse_major_minor(&dev_c) {
-                                protected_devs.insert(dev_mm, format!("btrfs source '{}' for protected mount '{}'", src_name, mount_point));
-                                btrfs_resolved = true;
-                            }
-                        }
-                    }
-
-                    if !btrfs_resolved {
-                        return Err(ExecuteError::BootDiskProtection(format!(
-                            "Btrfs protected mount '{}' has unresolvable backing device(s): refusing destructive operation (fail closed)",
-                            mount_point
-                        )));
-                    }
-                } else if mount_source.starts_with("/dev/") {
-                    if let Ok(canon_src) = canonicalize_device_path(mount_source, dry_run, ctx) {
-                        let src_name = canon_src.rsplit('/').next().unwrap_or(&canon_src);
-                        protected_names.insert(src_name.to_string());
-                        let src_dev = ctx.sys_root.join("class/block").join(src_name).join("dev");
-                        if let Ok(c) = fs::read_to_string(&src_dev) {
-                            if let Some(src_mm) = parse_major_minor(&c) {
-                                protected_devs.insert(src_mm, format!("mount source '{}' for protected mount '{}'", mount_source, mount_point));
-                            }
-                        }
-                    }
-                } else if !(exempt_pseudo_fs.contains(fs_type)
-                    || fs_type.starts_with("fuse")
-                    || fs_type == "binfmt_misc"
-                    || (boot_env == BootEnvironment::Live && mount_point == "/"))
-                {
-                    return Err(ExecuteError::BootDiskProtection(format!(
-                        "Protected mount '{}' of type '{}' has anonymous device (major 0) with no backing block device: fail closed",
-                        mount_point, fs_type
-                    )));
-                }
-            }
-
-            if mount_source.starts_with("/dev/") {
-                if let Ok(canon_src) = canonicalize_device_path(mount_source, dry_run, ctx) {
-                    let src_name = canon_src.rsplit('/').next().unwrap_or(&canon_src);
-                    protected_names.insert(src_name.to_string());
-                    let src_dev = ctx.sys_root.join("class/block").join(src_name).join("dev");
-                    if let Ok(c) = fs::read_to_string(&src_dev) {
-                        if let Some(src_mm) = parse_major_minor(&c) {
-                            protected_devs.insert(src_mm, format!("mount source '{}' for protected mount '{}'", mount_source, mount_point));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 3. Parse /proc/swaps
-    let swaps_path = ctx.proc_root.join("swaps");
-    if swaps_path.exists() {
-        if let Ok(swaps_content) = fs::read_to_string(&swaps_path) {
-            for line in swaps_content.lines().skip(1) {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                if parts.is_empty() {
-                    continue;
-                }
-                let swap_target = parts[0];
-                let swap_type = parts.get(1).copied().unwrap_or("partition");
-
-                if swap_type == "partition" {
-                    if let Ok(canon_swap) = canonicalize_device_path(swap_target, dry_run, ctx) {
-                        let swap_name = canon_swap.rsplit('/').next().unwrap_or(&canon_swap);
-                        protected_names.insert(swap_name.to_string());
-                        let dev_path = ctx.sys_root.join("class/block").join(swap_name).join("dev");
-                        if let Ok(c) = fs::read_to_string(&dev_path) {
-                            if let Some(mm) = parse_major_minor(&c) {
-                                protected_devs.insert(mm, format!("active swap partition '{}'", swap_target));
-                            }
-                        }
-                    }
-                } else if swap_type == "file" {
-                    let mut swap_resolved = false;
-                    if ctx.proc_root == Path::new("/proc") {
-                        if let Ok(meta) = fs::metadata(swap_target) {
-                            let dev = meta.dev();
-                            let mm = (dev_major(dev), dev_minor(dev));
-                            protected_devs.insert(mm, format!("backing device for active swap file '{}'", swap_target));
-                            swap_resolved = true;
-                        }
-                    }
-                    if !swap_resolved {
-                        let mut best_prefix = "";
-                        let mut best_mm = None;
-                        for (mp, mm) in &active_mounts {
-                            if swap_target.starts_with(mp) && mp.len() > best_prefix.len() {
-                                best_prefix = mp;
-                                best_mm = Some(*mm);
-                            }
-                        }
-                        if let Some(mm) = best_mm {
-                            protected_devs.insert(mm, format!("backing mount '{}' for active swap file '{}'", best_prefix, swap_target));
-                            swap_resolved = true;
-                        }
-                    }
-                    if !swap_resolved {
-                        return Err(ExecuteError::BootDiskProtection(format!(
-                            "Active swap file '{}' backing device cannot be resolved: fail closed",
-                            swap_target
-                        )));
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(MountProtectionState {
-        protected_devs,
-        protected_names,
-        has_root_mount,
-    })
-}
-
 pub fn check_boot_disk_protection_ctx(
     device: &str,
     dry_run: bool,
     ctx: &FsContext,
 ) -> Result<(), ExecuteError> {
-    // 1. Canonicalize the target path
-    let canonical = canonicalize_device_path(device, dry_run, ctx)?;
-    let target_name = canonical
-        .rsplit('/')
-        .next()
-        .unwrap_or(&canonical)
-        .to_string();
-
-    // A3b: classify the boot environment before applying mount rules.
-    let boot_env = detect_boot_environment_ctx(ctx)?;
-    if boot_env == BootEnvironment::Container {
-        return Err(ExecuteError::BootDiskProtection(
-            "Container or overlayfs root environment detected: refusing destructive operation (fail closed)".to_string(),
-        ));
-    }
-
-    let state = scan_mount_and_swap_protection(ctx, dry_run, boot_env)?;
-    if !state.has_root_mount {
-        return Err(ExecuteError::BootDiskProtection(
-            "Invalid mount environment: no root '/' mount point found in mountinfo".to_string(),
-        ));
-    }
-    let protected_devs = state.protected_devs;
-    let protected_names = state.protected_names;
-
-    // 4. Resolve target in sysfs
-    let target_block_dir = ctx.sys_root.join("class/block").join(&target_name);
-    if !target_block_dir.exists() {
-        if dry_run {
-            if protected_names.contains(&target_name) {
-                return Err(ExecuteError::BootDiskProtection(format!(
-                    "Device '{}' matches a protected mount source/device",
-                    target_name
-                )));
-            }
-            return Ok(());
-        } else {
-            return Err(ExecuteError::DeviceNotFound(format!(
-                "Device '{}' not found in sysfs ({})",
-                target_name,
-                target_block_dir.display()
-            )));
-        }
-    }
-
-    // 5. Gather physical/partition family of target
-    let mut family_devices: HashSet<String> = HashSet::new();
-    family_devices.insert(target_name.clone());
-
-    let part_file = target_block_dir.join("partition");
-    let is_partition = part_file.exists();
-
-    if is_partition {
-        let mut parent_disk_opt = None;
-        if let Ok(link) = fs::read_link(&target_block_dir) {
-            if let Some(parent) = link.parent() {
-                if let Some(p_name) = parent.file_name() {
-                    let p_str = p_name.to_string_lossy().to_string();
-                    if p_str != "block" && ctx.sys_root.join("class/block").join(&p_str).exists() {
-                        parent_disk_opt = Some(p_str);
-                    }
-                }
-            }
-        }
-        if parent_disk_opt.is_none() {
-            if target_name.starts_with("nvme") || target_name.starts_with("mmcblk") {
-                if let Some(idx) = target_name.rfind('p') {
-                    let candidate = &target_name[..idx];
-                    if ctx.sys_root.join("class/block").join(candidate).exists() {
-                        parent_disk_opt = Some(candidate.to_string());
-                    }
-                }
-            } else {
-                let candidate = target_name.trim_end_matches(|c: char| c.is_ascii_digit());
-                if !candidate.is_empty() && ctx.sys_root.join("class/block").join(candidate).exists() {
-                    parent_disk_opt = Some(candidate.to_string());
-                }
-            }
-        }
-
-        if let Some(parent_disk) = parent_disk_opt {
-            family_devices.insert(parent_disk.clone());
-            if let Ok(entries) = fs::read_dir(ctx.sys_root.join("class/block")) {
-                for entry in entries.flatten() {
-                    let dev = entry.file_name().to_string_lossy().to_string();
-                    if entry.path().join("partition").exists()
-                        && dev.starts_with(&parent_disk)
-                        && (dev[parent_disk.len()..].starts_with('p')
-                            || dev[parent_disk.len()..].chars().next().is_some_and(|c| c.is_ascii_digit()))
-                    {
-                        family_devices.insert(dev);
-                    }
-                }
-            }
-        }
-    } else {
-        if let Ok(entries) = fs::read_dir(ctx.sys_root.join("class/block")) {
-            for entry in entries.flatten() {
-                let dev = entry.file_name().to_string_lossy().to_string();
-                if entry.path().join("partition").exists()
-                    && dev.starts_with(&target_name)
-                    && (dev[target_name.len()..].starts_with('p')
-                        || dev[target_name.len()..].chars().next().is_some_and(|c| c.is_ascii_digit()))
-                {
-                    family_devices.insert(dev);
-                }
-            }
-        }
-    }
-
-    // 6. Transitive graph traversal of holders and slaves
-    let mut queue: VecDeque<String> = family_devices.into_iter().collect();
-    let mut visited: HashSet<String> = HashSet::new();
-
-    while let Some(curr) = queue.pop_front() {
-        if !visited.insert(curr.clone()) {
-            continue;
-        }
-
-        let holders_dir = ctx.sys_root.join("class/block").join(&curr).join("holders");
-        if holders_dir.exists() {
-            if let Ok(entries) = fs::read_dir(&holders_dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if !visited.contains(&name) {
-                        queue.push_back(name);
-                    }
-                }
-            }
-        }
-
-        let slaves_dir = ctx.sys_root.join("class/block").join(&curr).join("slaves");
-        if slaves_dir.exists() {
-            if let Ok(entries) = fs::read_dir(&slaves_dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if !visited.contains(&name) {
-                        queue.push_back(name);
-                    }
-                }
-            }
-        }
-    }
-
-    // 7. Check all visited devices against protected mounts and names
-    for dev in &visited {
-        if protected_names.contains(dev) {
-            return Err(ExecuteError::BootDiskProtection(format!(
-                "Refusing operation: target '{}' (associated with member '{}') matches a protected device/mount",
-                device, dev
-            )));
-        }
-
-        let dev_file = ctx.sys_root.join("class/block").join(dev).join("dev");
-        if dev_file.exists() {
-            let content = fs::read_to_string(&dev_file)
-                .map_err(|e| ExecuteError::BootDiskProtection(format!("Cannot read sysfs dev file for {}: {}", dev, e)))?;
-            let mm = parse_major_minor(&content)
-                .ok_or_else(|| ExecuteError::BootDiskProtection(format!("Corrupt dev file for device {}: '{}'", dev, content.trim())))?;
-
-            if let Some(reason) = protected_devs.get(&mm) {
-                return Err(ExecuteError::BootDiskProtection(format!(
-                    "Refusing operation: target '{}' (associated with device '{}' [{}:{}]) is protected: {}",
-                    device, dev, mm.0, mm.1, reason
-                )));
-            }
-        }
-    }
-
-    Ok(())
+    crate::guard::check_boot_disk_protection(&LinuxBackend::new(ctx.clone()), device, dry_run)
 }
 
 /// Convenience entry point for checking boot disk protection against system proc/sys/dev.
@@ -810,45 +293,7 @@ pub fn verify_exclusive_access_and_recheck(
     dry_run: bool,
     ctx: &FsContext,
 ) -> Result<(), ExecuteError> {
-    if dry_run {
-        return check_boot_disk_protection_ctx(device, true, ctx);
-    }
-
-    let canonical = canonicalize_device_path(device, false, ctx)?;
-    let c_path = std::ffi::CString::new(canonical.clone())
-        .map_err(|e| ExecuteError::CommandFailed(format!("Invalid path CString: {}", e)))?;
-
-    unsafe {
-        let fd = libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_EXCL | libc::O_CLOEXEC);
-        if fd < 0 {
-            let err = std::io::Error::last_os_error();
-            return Err(map_open_excl_error(err, device));
-        }
-
-        let mut stat_buf: libc::stat = std::mem::zeroed();
-        let res = libc::fstat(fd, &mut stat_buf);
-        libc::close(fd);
-
-        if res < 0 {
-            return Err(ExecuteError::CommandFailed(format!(
-                "fstat failed on device {}: {}",
-                device,
-                std::io::Error::last_os_error()
-            )));
-        }
-
-        let mode = stat_buf.st_mode;
-        let is_blk = (mode & libc::S_IFMT) == libc::S_IFBLK;
-        let is_reg = (mode & libc::S_IFMT) == libc::S_IFREG;
-        if !is_blk && !is_reg {
-            return Err(ExecuteError::UnsupportedOperation(format!(
-                "Device {} is neither a block device nor a regular file",
-                device
-            )));
-        }
-    }
-
-    check_boot_disk_protection_ctx(device, false, ctx)
+    crate::guard::verify_exclusive_access_and_recheck(&LinuxBackend::new(ctx.clone()), device, dry_run)
 }
 
 /// Inspects device and captures guard identity (canonical path, st_rdev, major, minor, is_block, serial).
@@ -858,33 +303,7 @@ pub fn get_guard_identity(
     device_serial: &str,
     ctx: &FsContext,
 ) -> Result<GuardIdentity, ExecuteError> {
-    let canonical = canonicalize_device_path(device, dry_run, ctx)?;
-    if dry_run {
-        return Ok(GuardIdentity {
-            canonical_path: canonical,
-            st_rdev: 0,
-            major: 0,
-            minor: 0,
-            is_block: true,
-            device_serial: device_serial.to_string(),
-            st_ino: 0,
-        });
-    }
-
-    let meta = fs::metadata(&canonical)
-        .map_err(|e| ExecuteError::DeviceNotFound(format!("Cannot stat {}: {}", canonical, e)))?;
-    let rdev = meta.rdev();
-    let is_block = (meta.mode() & libc::S_IFMT) == libc::S_IFBLK;
-
-    Ok(GuardIdentity {
-        canonical_path: canonical,
-        st_rdev: rdev,
-        major: dev_major(rdev),
-        minor: dev_minor(rdev),
-        is_block,
-        device_serial: device_serial.to_string(),
-        st_ino: meta.ino(),
-    })
+    crate::guard::get_guard_identity(&LinuxBackend::new(ctx.clone()), device, dry_run, device_serial)
 }
 
 /// Re-checks boot disk protection against system mountinfo using an opened device's major:minor dev_t.
@@ -892,44 +311,12 @@ pub fn recheck_protection_by_dev_t(
     dev: libc::dev_t,
     ctx: &FsContext,
 ) -> Result<(), ExecuteError> {
-    let maj = dev_major(dev);
-    let min = dev_minor(dev);
-
-    let mountinfo_path = ctx.proc_root.join("self/mountinfo");
-    let content = if mountinfo_path.exists() {
-        fs::read_to_string(&mountinfo_path)
-            .map_err(|e| ExecuteError::BootDiskProtection(format!("Cannot read mountinfo: {}", e)))?
-    } else {
-        return Ok(());
-    };
-
-    for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 5 { continue; }
-        let mm_str = parts[2];
-        let mount_point = parts[4];
-        if is_mount_unmountable_allowlisted(mount_point) {
-            continue;
-        }
-        if let Some((m_maj, m_min)) = parse_major_minor(mm_str) {
-            if m_maj == maj && m_min == min {
-                return Err(ExecuteError::BootDiskProtection(format!(
-                    "Opened file descriptor matches protected mount '{}' ({}:{}): aborting destructive write",
-                    mount_point, maj, min
-                )));
-            }
-        }
-    }
-
-    Ok(())
+    crate::guard::recheck_protection_by_dev_t(&LinuxBackend::new(ctx.clone()), dev)
 }
 
 /// Verify the confirmation token matches expected value.
 fn verify_confirmation(token: &str, expected_serial: &str) -> Result<(), ExecuteError> {
-    if token.trim() != expected_serial.trim() {
-        return Err(ExecuteError::ConfirmationMismatch);
-    }
-    Ok(())
+    crate::guard::verify_confirmation(token, expected_serial)
 }
 
 /// Send an indeterminate progress event for firmware operations.
@@ -2007,14 +1394,6 @@ impl Drop for AlignedBuffer {
     }
 }
 
-pub trait BlockWriter: Send + Sync {
-    fn write_chunk(&mut self, offset: u64, data: &[u8]) -> Result<usize, io::Error>;
-    fn sync_data(&mut self) -> Result<(), io::Error>;
-    fn flush_buffers(&mut self) -> Result<(), io::Error>;
-    fn total_size(&self) -> Result<u64, io::Error>;
-    fn logical_block_size(&self) -> u32 { 512 }
-    fn io_mode(&self) -> &'static str;
-}
 
 const BLKGETSIZE64: libc::c_ulong = 0x80081272;
 const BLKSSZGET: libc::c_ulong = 0x1268;
@@ -3097,14 +2476,6 @@ pub fn validate_partition_method(method: &str) -> Result<EngineMethod, ExecuteEr
     Ok(engine_method)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartitionTargetParams {
-    pub expected_partition_num: u32,
-    pub expected_start_sector: u64,
-    pub expected_size_sectors: u64,
-    pub expected_partuuid: Option<String>,
-    pub expected_table_fingerprint: String,
-}
 
 /// Calculates the SHA-256 fingerprint of the partition table on the parent disk.
 /// Sorted ascending by partition number: format "{part_num}:{start_sector}:{size_sectors}\n".
@@ -3112,41 +2483,7 @@ pub fn compute_partition_table_fingerprint(
     parent_disk: &str,
     ctx: &FsContext,
 ) -> Result<String, ExecuteError> {
-    let parent_name = parent_disk.strip_prefix("/dev/").unwrap_or(parent_disk);
-    let class_block = ctx.sys_root.join("class/block");
-    let mut parts: Vec<(u32, u64, u64)> = Vec::new();
-
-    if let Ok(entries) = fs::read_dir(&class_block) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with(parent_name)
-                && (name[parent_name.len()..].starts_with('p')
-                    || name[parent_name.len()..].chars().next().is_some_and(|c| c.is_ascii_digit()))
-            {
-                let part_file = entry.path().join("partition");
-                if part_file.exists() {
-                    let num_str = fs::read_to_string(&part_file).unwrap_or_default();
-                    if let Ok(num) = num_str.trim().parse::<u32>() {
-                        let start_str = fs::read_to_string(entry.path().join("start")).unwrap_or_default();
-                        let size_str = fs::read_to_string(entry.path().join("size")).unwrap_or_default();
-                        let start = start_str.trim().parse::<u64>().unwrap_or(0);
-                        let size = size_str.trim().parse::<u64>().unwrap_or(0);
-                        parts.push((num, start, size));
-                    }
-                }
-            }
-        }
-    }
-
-    parts.sort_by_key(|p| p.0);
-
-    let mut canonical_text = String::new();
-    for (num, start, size) in parts {
-        canonical_text.push_str(&format!("{}:{}:{}\n", num, start, size));
-    }
-
-    let hash = format!("{:x}", Sha256::digest(canonical_text.as_bytes()));
-    Ok(hash)
+    crate::guard::compute_partition_table_fingerprint(&LinuxBackend::new(ctx.clone()), parent_disk)
 }
 
 /// Check if a target partition is an MBR extended container partition.
@@ -3155,49 +2492,7 @@ pub fn is_mbr_extended_partition(
     parent_disk: &str,
     ctx: &FsContext,
 ) -> Result<bool, ExecuteError> {
-    let part_name = device.strip_prefix("/dev/").unwrap_or(device);
-    let class_block = ctx.sys_root.join("class/block");
-    let part_dir = class_block.join(part_name);
-
-    if part_dir.join("subpartition").exists() {
-        return Ok(true);
-    }
-
-    let parent_canonical = canonicalize_device_path(parent_disk, false, ctx).unwrap_or_else(|_| parent_disk.to_string());
-    let parent_file_path = if ctx.dev_root != Path::new("/dev") {
-        let rel = parent_disk.strip_prefix("/dev/").unwrap_or(parent_disk);
-        ctx.dev_root.join(rel)
-    } else {
-        PathBuf::from(&parent_canonical)
-    };
-    if let Ok(mut file) = fs::File::open(&parent_file_path) {
-        use std::io::Read;
-        let mut mbr = [0u8; 512];
-        if file.read_exact(&mut mbr).is_ok() && mbr[510] == 0x55 && mbr[511] == 0xAA {
-            let start_str = fs::read_to_string(part_dir.join("start")).unwrap_or_default();
-            let target_start = start_str.trim().parse::<u32>().unwrap_or(0);
-            let part_num_str = fs::read_to_string(part_dir.join("partition")).unwrap_or_default();
-            let target_num = part_num_str.trim().parse::<u32>().ok();
-            for i in 0..4 {
-                let entry_offset = 446 + i * 16;
-                let sys_ind = mbr[entry_offset + 4];
-                let start_lba = u32::from_le_bytes([
-                    mbr[entry_offset + 8],
-                    mbr[entry_offset + 9],
-                    mbr[entry_offset + 10],
-                    mbr[entry_offset + 11],
-                ]);
-                let matches_start = target_start != 0 && target_start == start_lba;
-                let matches_num = target_num == Some(i as u32 + 1);
-                if (sys_ind == 0x05 || sys_ind == 0x0f || sys_ind == 0x85)
-                    && (matches_start || matches_num || (target_start == 0 && target_num.is_none()))
-                {
-                    return Ok(true);
-                }
-            }
-        }
-    }
-    Ok(false)
+    crate::guard::is_mbr_extended_partition(&LinuxBackend::new(ctx.clone()), device, parent_disk)
 }
 
 /// Safely unmounts active filesystems on the target partition and any active holders.
@@ -3208,113 +2503,17 @@ pub fn unmount_target_partition_and_holders(
     command_log: &mut Vec<String>,
     ctx: &FsContext,
 ) -> Result<(String, String), ExecuteError> {
-    let mut stdout_accum = String::new();
-    let mut stderr_accum = String::new();
-
-    if dry_run {
-        command_log.push(format!("[DRY RUN] Would check mounts and unmount partition {} and its holders", target_partition));
-        return Ok((stdout_accum, stderr_accum));
-    }
-
-    let target_name = target_partition.strip_prefix("/dev/").unwrap_or(target_partition);
-    let target_canonical = canonicalize_device_path(target_partition, dry_run, ctx)?;
-
-    // 1. Resolve holders from /sys/class/block/<dev>/holders
-    let holders_dir = ctx.sys_root.join("class/block").join(target_name).join("holders");
-    let mut holders = Vec::new();
-    if holders_dir.exists() {
-        if let Ok(entries) = fs::read_dir(&holders_dir) {
-            for entry in entries.flatten() {
-                let h_name = entry.file_name().to_string_lossy().to_string();
-                holders.push(h_name);
-            }
-        }
-    }
-
-    let mounts_content = fs::read_to_string(ctx.proc_root.join("mounts")).unwrap_or_default();
-
-    for holder in &holders {
-        let holder_dev = format!("/dev/{}", holder);
-        let mut is_mounted = false;
-        for line in mounts_content.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if !parts.is_empty() && (parts[0] == holder_dev || parts[0].ends_with(holder)) {
-                is_mounted = true;
-                break;
-            }
-        }
-        if is_mounted {
-            command_log.push(format!("[UNMOUNT] Unmounting active holder: {}", holder_dev));
-            let (stdout, stderr, code) = run_cmd("umount", &["-f", &holder_dev], dry_run, command_log)?;
-            stdout_accum.push_str(&stdout);
-            stderr_accum.push_str(&stderr);
-            if code != 0 {
-                return Err(ExecuteError::CommandFailed(format!(
-                    "Target partition {} is held by active holder '{}' which cannot be unmounted",
-                    target_partition, holder_dev
-                )));
-            }
-        }
-    }
-
-    let mut is_target_mounted = false;
-    for line in mounts_content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if !parts.is_empty() && (parts[0] == target_partition || parts[0] == target_canonical) {
-            is_target_mounted = true;
-            break;
-        }
-    }
-
-    if is_target_mounted {
-        command_log.push(format!("[UNMOUNT] Unmounting active partition: {}", target_partition));
-        let (stdout, stderr, code) = run_cmd("umount", &["-f", target_partition], dry_run, command_log)?;
-        stdout_accum.push_str(&stdout);
-        stderr_accum.push_str(&stderr);
-        if code != 0 {
-            return Err(ExecuteError::CommandFailed(format!(
-                "Failed to unmount partition {}: {}", target_partition, stderr
-            )));
-        }
-    }
-
-    Ok((stdout_accum, stderr_accum))
+    crate::guard::unmount_target_partition_and_holders(
+        &LinuxBackend::new(ctx.clone()),
+        target_partition,
+        dry_run,
+        command_log,
+    )
 }
 
 /// Resolves the parent disk device name from a partition device path or name.
 pub fn resolve_parent_disk(device: &str, ctx: &FsContext) -> Result<String, ExecuteError> {
-    let target_name = device.strip_prefix("/dev/").unwrap_or(device);
-    let target_block_dir = ctx.sys_root.join("class/block").join(target_name);
-
-    if let Ok(link) = fs::read_link(&target_block_dir) {
-        if let Some(parent) = link.parent() {
-            if let Some(p_name) = parent.file_name() {
-                let p_str = p_name.to_string_lossy().to_string();
-                if p_str != "block" && ctx.sys_root.join("class/block").join(&p_str).exists() {
-                    return Ok(p_str);
-                }
-            }
-        }
-    }
-
-    if target_name.starts_with("nvme") || target_name.starts_with("mmcblk") {
-        if let Some(idx) = target_name.rfind('p') {
-            let candidate = &target_name[..idx];
-            if ctx.sys_root.join("class/block").join(candidate).exists() {
-                return Ok(candidate.to_string());
-            }
-        }
-    } else {
-        let candidate = target_name.trim_end_matches(|c: char| c.is_ascii_digit());
-        if !candidate.is_empty() && ctx.sys_root.join("class/block").join(candidate).exists() {
-            return Ok(candidate.to_string());
-        }
-    }
-
-    Err(ExecuteError::DeviceNotFound(format!(
-        "Cannot resolve parent disk for partition {}",
-        device
-    )))
+    crate::guard::resolve_parent_disk(&LinuxBackend::new(ctx.clone()), device)
 }
 
 /// Maps raw OS open/lock errors into appropriate ExecuteError.
@@ -3335,62 +2534,9 @@ pub fn map_open_excl_error(err: io::Error, path: &str) -> ExecuteError {
 
 /// Resolves the parent disk's serial number for a partition device node.
 pub fn resolve_parent_serial(device: &str, ctx: &FsContext) -> Result<String, ExecuteError> {
-    let parent_name = resolve_parent_disk(device, ctx)?;
-    let parent_dir = ctx.sys_root.join("class/block").join(&parent_name);
-
-    for path in &[
-        parent_dir.join("device/serial"),
-        parent_dir.join("serial"),
-    ] {
-        if let Ok(content) = fs::read_to_string(path) {
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                return Ok(trimmed.to_string());
-            }
-        }
-    }
-
-    let uevent_paths = [
-        parent_dir.join("device/uevent"),
-        parent_dir.join("uevent"),
-    ];
-    for uevent_path in &uevent_paths {
-        if let Ok(uevent) = fs::read_to_string(uevent_path) {
-            for line in uevent.lines() {
-                if let Some(s) = line.strip_prefix("ID_SERIAL_SHORT=")
-                    .or_else(|| line.strip_prefix("ID_SERIAL="))
-                    .or_else(|| line.strip_prefix("SERIAL=")) {
-                    let trimmed = s.trim();
-                    if !trimmed.is_empty() {
-                        return Ok(trimmed.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    Err(ExecuteError::DeviceNotFound(format!(
-        "Cannot resolve serial for parent disk {} of partition {}",
-        parent_name, device
-    )))
+    crate::guard::resolve_parent_serial(&LinuxBackend::new(ctx.clone()), device)
 }
 
-/// Performs sector-aligned overwrite on a specific partition node.
-/// Enforces partition method allowlist, sysfs geometry match, parent serial check,
-/// partition table fingerprint invariance, targeted unmount of holders,
-/// and bounds enforcement via PartitionRangeWriter.
-#[allow(clippy::too_many_arguments)]
-/// Validated partition target: geometry cross-checked against sysfs, PARTUUID
-/// and partition-table fingerprint, MBR extended containers refused, sizes
-/// aligned to the logical block size, plus the pinned guard identity.
-/// Shared by the partition overwrite and A6 discard execution paths.
-pub struct ValidatedPartitionTarget {
-    pub parent_name: String,
-    pub start_bytes: u64,
-    pub size_bytes: u64,
-    pub logical_block_size: u64,
-    pub guard_identity: GuardIdentity,
-}
 
 /// Validate a partition-mode target before any destructive open:
 /// sysfs geometry (number/start/size), optional PARTUUID, partition table
@@ -3403,121 +2549,10 @@ pub fn validate_partition_target(
     dry_run: bool,
     device_serial: &str,
 ) -> Result<ValidatedPartitionTarget, ExecuteError> {
-    let target_name = device.strip_prefix("/dev/").unwrap_or(device);
-    let class_block = ctx.sys_root.join("class/block");
-    let part_dir = class_block.join(target_name);
-
-    // Sysfs geometry validation: partition, start, size
-    let part_file = part_dir.join("partition");
-    if !part_file.exists() {
-        return Err(ExecuteError::UnsupportedOperation(format!(
-            "Target '{}' is not recognized as a partition in sysfs ({})",
-            device, part_dir.display()
-        )));
-    }
-    let actual_num: u32 = fs::read_to_string(&part_file)
-        .unwrap_or_default()
-        .trim()
-        .parse()
-        .map_err(|_| ExecuteError::IdentityMismatch("Corrupt sysfs partition file".into()))?;
-    if actual_num != params.expected_partition_num {
-        return Err(ExecuteError::IdentityMismatch(format!(
-            "Partition number mismatch: expected {}, got sysfs partition {}",
-            params.expected_partition_num, actual_num
-        )));
-    }
-
-    let actual_start: u64 = fs::read_to_string(part_dir.join("start"))
-        .unwrap_or_default()
-        .trim()
-        .parse()
-        .map_err(|_| ExecuteError::IdentityMismatch("Corrupt sysfs start file".into()))?;
-    if actual_start != params.expected_start_sector {
-        return Err(ExecuteError::IdentityMismatch(format!(
-            "Partition start sector mismatch: expected {}, got sysfs start {}",
-            params.expected_start_sector, actual_start
-        )));
-    }
-
-    let actual_size: u64 = fs::read_to_string(part_dir.join("size"))
-        .unwrap_or_default()
-        .trim()
-        .parse()
-        .map_err(|_| ExecuteError::IdentityMismatch("Corrupt sysfs size file".into()))?;
-    if actual_size != params.expected_size_sectors {
-        return Err(ExecuteError::IdentityMismatch(format!(
-            "Partition size sectors mismatch: expected {}, got sysfs size {}",
-            params.expected_size_sectors, actual_size
-        )));
-    }
-
-    // Optional PARTUUID check
-    if let Some(expected_uuid) = &params.expected_partuuid {
-        let uevent = fs::read_to_string(part_dir.join("uevent")).unwrap_or_default();
-        let mut found_uuid = None;
-        for line in uevent.lines() {
-            if let Some(uuid) = line.strip_prefix("PARTUUID=") {
-                found_uuid = Some(uuid.trim().to_string());
-                break;
-            }
-        }
-        if let Some(actual_uuid) = found_uuid {
-            if !actual_uuid.eq_ignore_ascii_case(expected_uuid) {
-                return Err(ExecuteError::IdentityMismatch(format!(
-                    "PARTUUID mismatch: expected {}, got sysfs {}",
-                    expected_uuid, actual_uuid
-                )));
-            }
-        }
-    }
-
-    // Resolve parent disk and check partition table fingerprint
-    let parent_name = resolve_parent_disk(device, ctx)?;
-    let actual_fingerprint = compute_partition_table_fingerprint(&parent_name, ctx)?;
-    if actual_fingerprint != params.expected_table_fingerprint {
-        return Err(ExecuteError::IdentityMismatch(format!(
-            "Partition table changed: expected fingerprint {}, got sysfs {}",
-            params.expected_table_fingerprint, actual_fingerprint
-        )));
-    }
-
-    // Refuse MBR extended container partitions
-    let parent_path = format!("/dev/{}", parent_name);
-    if is_mbr_extended_partition(device, &parent_path, ctx)? {
-        return Err(ExecuteError::UnsupportedOperation(format!(
-            "Refusing operation: target '{}' is an MBR extended container partition",
-            device
-        )));
-    }
-
-    // Logical block size alignment validation
-    let lbs: u64 = fs::read_to_string(ctx.sys_root.join("class/block").join(&parent_name).join("queue/logical_block_size"))
-        .or_else(|_| fs::read_to_string(part_dir.join("queue/logical_block_size")))
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(512);
-
-    let start_bytes = actual_start.checked_mul(512).ok_or_else(|| {
-        ExecuteError::UnsupportedOperation("Partition start sector overflow".into())
-    })?;
-    let size_bytes = actual_size.checked_mul(512).ok_or_else(|| {
-        ExecuteError::UnsupportedOperation("Partition size sector overflow".into())
-    })?;
-    if start_bytes % lbs != 0 || size_bytes % lbs != 0 {
-        return Err(ExecuteError::UnsupportedOperation(format!(
-            "Partition start or size is not aligned to logical block size ({})",
-            lbs
-        )));
-    }
-
-    let guard_identity = get_guard_identity(device, dry_run, device_serial, ctx)?;
-
-    Ok(ValidatedPartitionTarget {
-        parent_name,
-        start_bytes,
-        size_bytes,
-        logical_block_size: lbs,
-        guard_identity,
+    let backend = LinuxBackend::new(ctx.clone());
+    let target = crate::guard::validate_partition_target(&backend, device, params, dry_run, device_serial)?;
+    target.to_legacy_partition_target().ok_or_else(|| {
+        ExecuteError::UnsupportedOperation("validated target is not partition-scoped".to_string())
     })
 }
 

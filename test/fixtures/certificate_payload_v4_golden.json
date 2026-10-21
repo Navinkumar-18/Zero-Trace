@@ -1,0 +1,29 @@
+{
+  "certVersion": 4,
+  "certificateId": "ZT-CERT-GOLDEN-0000001",
+  "jobId": "JOB-GOLDEN-001",
+  "deviceSerial": "GOLDEN-SERIAL-1234",
+  "method": "singlePassOverwrite",
+  "sanitizationCategory": "Clear",
+  "executionMode": "real",
+  "sanitizationLevel": "Clear",
+  "scope": "partial",
+  "limitation": "Partition wipe: partition table and unselected sectors are not overwritten",
+  "partitions": [
+    {
+      "name": "sda3",
+      "partition_number": 3,
+      "start_sector": 8192,
+      "size_bytes": 1048576
+    }
+  ],
+  "stepsExecuted": [
+    "[DRY RUN] [guard] partition geometry and table fingerprint verified"
+  ],
+  "bytesOverwritten": 1048576,
+  "totalDeviceBytes": 512110190592,
+  "bootEnvironment": "live",
+  "evidenceHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "result": "SUCCESS",
+  "timestamp": "2026-01-01T00:00:00.000"
+}

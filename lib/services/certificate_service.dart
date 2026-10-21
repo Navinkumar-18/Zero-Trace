@@ -11,6 +11,7 @@ import '../models/device_profile.dart';
 import '../models/partition_info.dart';
 import '../models/sanitization_job.dart';
 import '../models/sanitization_support_level.dart';
+import 'platform_backend.dart';
 
 class CertificateService {
   late pc.ECPrivateKey _privateKey;
@@ -101,6 +102,10 @@ class CertificateService {
     // The disk model stays a recorded display field; the serial is the signed
     // device identity.
     String? bootEnvironment,
+    // C7: issuing platform + engine backend name, signed only when present
+    // so pre-C7 v4 certificates keep verifying byte-identically.
+    String? platform,
+    String? backend,
   }) {
     if (certVersion == 1) {
       return {
@@ -130,6 +135,8 @@ class CertificateService {
         'bytesOverwritten': ?bytesOverwritten,
         'totalDeviceBytes': ?totalDeviceBytes,
         'bootEnvironment': ?bootEnvironment,
+        'platform': ?platform,
+        'backend': ?backend,
         'evidenceHash': evidenceHash,
         'result': result,
         'timestamp': timestamp,
@@ -289,6 +296,11 @@ class CertificateService {
     final busType = job.device.busType;
     final timestampStr = (job.endTime ?? now).toIso8601String();
 
+    // C7: identity of the issuing platform backend (Linux today) — signed
+    // into every newly issued v4 certificate. Older certificates simply
+    // lack these fields and still verify byte-identically.
+    final issuingBackend = currentPlatformBackend();
+
     final bool isPartition = job.isPartitionScope;
     // A7: every newly issued certificate uses payload v4 (scope, partitions[],
     // ordered steps executed, sanitization level, limitations). Older v1–v3
@@ -357,6 +369,8 @@ class CertificateService {
       bytesOverwritten: bytesOverwritten,
       totalDeviceBytes: totalDeviceBytes,
       bootEnvironment: bootEnvironment,
+      platform: issuingBackend.platformName,
+      backend: issuingBackend.backendId,
     );
 
     final String payloadJson = jsonEncode(payloadToSign);
@@ -396,6 +410,8 @@ class CertificateService {
       bytesOverwritten: bytesOverwritten,
       totalDeviceBytes: totalDeviceBytes,
       bootEnvironment: bootEnvironment,
+      platform: issuingBackend.platformName,
+      backend: issuingBackend.backendId,
     );
   }
 
@@ -440,6 +456,9 @@ class CertificateService {
     final totalDeviceBytes = (certJson['totalDeviceBytes'] as num?)?.toInt();
     // B5: optional signed boot-environment claim; absent on pre-B5 v4 certs.
     final bootEnvironment = certJson['bootEnvironment'] as String?;
+    // C7: optional signed platform/backend claim; absent on pre-C7 certs.
+    final platform = certJson['platform'] as String?;
+    final backend = certJson['backend'] as String?;
 
     final evidenceHash = (certJson['evidence'] is Map)
         ? certJson['evidence']['evidenceHash'] as String? ?? ''
@@ -470,6 +489,8 @@ class CertificateService {
       bytesOverwritten: bytesOverwritten,
       totalDeviceBytes: totalDeviceBytes,
       bootEnvironment: bootEnvironment,
+      platform: platform,
+      backend: backend,
     );
 
     return _verifySignature(jsonEncode(payload), signature);

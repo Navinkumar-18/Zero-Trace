@@ -31,6 +31,33 @@ Zero Trace 2.0 is a media-aware, research-backed secure sanitization and verific
 
 ---
 
+## Platform Support
+
+Phase C introduced one shared guard chain and one UI, with platform-specific
+disk access behind the `BlockBackend` interface
+(`native/zt_engine/src/backend.rs`). Backends only report facts; every safety
+decision lives in the shared guard chain (`native/zt_engine/src/guard.rs`).
+
+| Platform | Engine backend | Device discovery | UI actions | Status |
+| :--- | :--- | :--- | :--- | :--- |
+| **Linux** (x86_64) | `LinuxBackend` — real sysfs/proc facts, O_EXCL exclusive access, raw I/O | `lsblk` via `LinuxPlatformBackend` | Fully enabled | **Supported** — the only shipping platform; all tests run here |
+| **Windows** (x86_64-pc-windows-gnu) | `UnsupportedBackend` stub — returns `Unsupported`, zero capability flags | Returns an empty list | Disabled with the reason *"Not available on this platform"* | Compile-only stub; gated by CI `cargo check` |
+| **Android** (aarch64-linux-android) | `UnsupportedBackend` stub — returns `Unsupported`, zero capability flags | Returns an empty list | Disabled with the reason *"Not available on this platform"* | Compile-only stub; gated by CI `cargo check` |
+| **Anything else** | `UnsupportedBackend` stub (fail closed) | Returns an empty list | Disabled with the reason *"Not available on this platform*" | Refused |
+
+Notes:
+
+- A backend can never write without a guard-minted `ValidatedTarget`
+  (private constructor; proven by a `compile_fail` doc test), so stub
+  platforms are denied at compile time, not just at runtime.
+- `DETECT_REPORT` output carries additive `platform` and `capabilities`
+  fields; v4 certificates carry signed `platform`/`backend` fields only when
+  present, so all older certificates verify byte-identically.
+- See `AGENTS.md` for the backend layout, test counts, golden-fixture rules
+  and the known legacy-writer caveat.
+
+---
+
 ## Known Limitations
 
 1. **Flash Media Wear Remapping:** Overwrite operations cannot reach hidden or wear-remapped flash blocks on SD cards and USB thumb drives. For Confidential or Restricted data on flash media without firmware-level purge support, physical destruction is recommended per NIST SP 800-88.

@@ -34,6 +34,10 @@ jobs:
       - name: flutter test
         run: flutter test
 
+      # C8: Linux desktop build smoke — the only shipping platform backend.
+      - name: flutter build linux (smoke)
+        run: flutter build linux --debug
+
   rust:
     name: Cargo clippy & test
     runs-on: ubuntu-24.04
@@ -58,3 +62,32 @@ jobs:
       # explicitly out of scope for automation.
       - name: cargo test
         run: cargo test
+
+  rust-cross:
+    name: Cargo check (Windows / Android stub targets)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: native/zt_engine
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu,aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/zt_engine
+
+      # C5/C8: the shared guard chain + backend trait and the compile-only
+      # Windows/Android stub backends must keep building on both targets.
+      # Only lib+bins are checked — the integration tests exercise Linux
+      # sysfs/proc paths and are Linux-only by design.
+      - name: cargo check (x86_64-pc-windows-gnu)
+        run: cargo check --target x86_64-pc-windows-gnu
+
+      - name: cargo check (aarch64-linux-android)
+        run: cargo check --target aarch64-linux-android

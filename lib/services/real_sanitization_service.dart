@@ -5,7 +5,7 @@ import '../core/app_paths.dart';
 import '../models/device_profile.dart';
 import '../models/partition_info.dart';
 import '../models/sanitization_job.dart';
-import 'engine_binary_resolver.dart';
+import 'platform_backend.dart';
 import 'partition_table_service.dart';
 
 class RealExecutionReport {
@@ -150,9 +150,11 @@ class RealSanitizationService {
 
   Process? get activeProcess => _activeProcess;
 
-  /// Resolves the compiled zt_engine binary path (delegates to the shared
-  /// resolver so discovery enrichment and execution use the same binary).
-  Future<String> getBinaryPath() => resolveEngineBinaryPath();
+  /// Resolves the compiled zt_engine binary path through the platform
+  /// backend (C6) so discovery enrichment and execution always agree on
+  /// which engine runs; unsupported platforms refuse with a clear reason.
+  Future<String> getBinaryPath() =>
+      currentPlatformBackend().resolveEngineBinaryPath();
 
   /// Maps the recommended sanitization method to the corresponding CLI action parameter.
   String mapMethodToCliArg(SanitizationMethod method, DeviceProfile device) {

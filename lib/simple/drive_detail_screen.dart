@@ -8,6 +8,7 @@ import '../models/sanitization_job.dart';
 import '../models/sanitization_support_level.dart';
 import '../models/storage_capability.dart';
 import '../services/sanitization_controller.dart';
+import '../services/platform_backend.dart';
 import '../widgets/theme.dart';
 import 'certificate_dialog.dart';
 import 'confirm_wipe_dialog.dart';
@@ -699,10 +700,17 @@ class DriveDetailScreen extends StatelessWidget {
     required bool hasCert,
     required bool verifyPassed,
   }) {
+    // C6: platform capability gate — unsupported platforms disable the
+    // engine-dependent actions and show the reason inline (the action is
+    // never hidden silently).
+    final platform = currentPlatformBackend();
+    final platformSupported = platform.isSupported;
+
     // State machine for button enable/disable
-    final canWipe = !isRunning && (!isFinished || isFailed);
+    final canWipe = platformSupported && !isRunning && (!isFinished || isFailed);
     // Verify is enabled ONLY when the wipe itself completed
-    final canVerify = !isRunning && (isCompleted || (isFailed && wipeCompleted));
+    final canVerify =
+        platformSupported && !isRunning && (isCompleted || (isFailed && wipeCompleted));
     final canCert = hasCert;
 
     return Column(
@@ -737,6 +745,14 @@ class DriveDetailScreen extends StatelessWidget {
                 : null,
           ),
         ),
+        if (!platformSupported) ...[
+          const SizedBox(height: 8),
+          Text(
+            platform.unsupportedReason,
+            textAlign: TextAlign.center,
+            style: const TextStyle(color: AppTheme.textMuted, fontSize: 12),
+          ),
+        ],
         const SizedBox(height: 10),
 
         Row(

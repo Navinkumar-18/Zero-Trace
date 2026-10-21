@@ -12,8 +12,8 @@ import 'certificate_service.dart';
 import 'classification_service.dart';
 import 'device_intelligence_service.dart';
 import 'device_simulator.dart';
-import 'engine_binary_resolver.dart';
 import 'policy_layer.dart';
+import 'platform_backend.dart';
 import 'recommendation_service.dart';
 import 'risk_scoring_service.dart';
 import 'verification_service.dart';
@@ -38,6 +38,12 @@ class SanitizationController extends ChangeNotifier {
   late final AuditLogService _auditLogService;
   late final JobStateFile _jobStateFile;
   late final OrphanedProcessChecker _orphanChecker;
+
+  /// C6: platform backend for discovery + engine-binary resolution. On
+  /// Linux it wraps this controller's own [DeviceIntelligenceService] so
+  /// scan state (`lastScanError`, results) stays shared exactly as before;
+  /// on other platforms it is the unsupported stub.
+  late final PlatformBackend _platformBackend;
 
   List<DeviceProfile> _devices = [];
   DeviceProfile? _selectedDevice;
@@ -103,6 +109,9 @@ class SanitizationController extends ChangeNotifier {
 
   SanitizationController({AppPaths? appPaths, bool enableAutoPolling = true, bool deferInitialDiscovery = false}) {
     _appPaths = appPaths ?? AppPaths.production();
+    _platformBackend = Platform.isLinux
+        ? LinuxPlatformBackend(discovery: _intelligenceService)
+        : resolvePlatformBackend();
     _auditLogService = AuditLogService(paths: _appPaths);
     _jobStateFile = JobStateFile(paths: _appPaths);
     _orphanChecker = OrphanedProcessChecker(paths: _appPaths);
@@ -670,7 +679,7 @@ class SanitizationController extends ChangeNotifier {
 
   Future<void> refreshDevices({bool silent = false}) async {
     if (_isMockingDevices || _isDisposed) return;
-    final freshDevices = await _intelligenceService.discoverDevices(realMode: _isRealMode);
+    final freshDevices = await _platformBackend.discoverDevices(realMode: _isRealMode);
     if (_isMockingDevices || _isDisposed) return;
 
     // Check if device list changed
@@ -812,7 +821,7 @@ class SanitizationController extends ChangeNotifier {
     }
 
     try {
-      final bin = await resolveEngineBinaryPath();
+      final bin = await _platformBackend.resolveEngineBinaryPath();
       final res =
           await Process.run(bin, ['probe-windows', partition.devicePath])
               .timeout(const Duration(seconds: 30));

@@ -1,5 +1,6 @@
 import '../models/partition_info.dart';
 import '../models/sanitization_job.dart';
+import 'platform_backend.dart';
 
 class PolicyValidationResult {
   final bool isAllowed;
@@ -9,6 +10,15 @@ class PolicyValidationResult {
 }
 
 class PolicyLayer {
+  /// Platform capability source (C6). Defaults to the process platform;
+  /// injectable so tests can exercise unsupported-platform behavior on any
+  /// host. On Linux every gate below passes and the historic validation
+  /// order and messages are unchanged.
+  PolicyLayer({PlatformBackend? platform})
+      : _platform = platform ?? currentPlatformBackend();
+
+  final PlatformBackend _platform;
+
   // Strict Whitelist of allowable action tokens
   static const Set<SanitizationMethod> _whitelistedMethods = {
     SanitizationMethod.cryptographicErase,
@@ -43,8 +53,59 @@ class PolicyLayer {
     return false;
   }
 
+  /// Maps a method to the backend capability that must be enabled
+  /// (mirrors which Rust engine path performs it). On Linux all flags are
+  /// true, so this always returns true there.
+  bool _methodSupportedByPlatform(SanitizationMethod method) {
+    final caps = _platform.capabilities;
+    switch (method) {
+      case SanitizationMethod.singlePassOverwrite:
+      case SanitizationMethod.multiPassOverwrite:
+        return caps.rawWrite;
+      case SanitizationMethod.ataSecureErase:
+      case SanitizationMethod.ataSanitizeBlockErase:
+      case SanitizationMethod.cryptographicErase:
+        return caps.secureErase;
+      case SanitizationMethod.nvmeSanitize:
+      case SanitizationMethod.emmcSanitize:
+        return caps.sanitize;
+      case SanitizationMethod.physicalDestructionRecommended:
+      case SanitizationMethod.unsupportedFlagForDestroy:
+        return caps.rawWrite && caps.secureErase && caps.sanitize;
+    }
+  }
+
   PolicyValidationResult validateOperation(SanitizationJob job) {
     final method = job.effectiveMethod;
+
+    // C6: platform gate — unsupported platforms refuse every destructive
+    // action with the spec reason (Linux: isSupported is true, no-op).
+    if (!_platform.isSupported) {
+      return PolicyValidationResult(
+        isAllowed: false,
+        policyMessage: _platform.unsupportedReason,
+      );
+    }
+
+    // C6: capability flags — a method the backend cannot perform is refused
+    // (Linux reports every capability true, so this never fires there).
+    if (!_methodSupportedByPlatform(method)) {
+      return PolicyValidationResult(
+        isAllowed: false,
+        policyMessage:
+            'Not supported on this platform: ${method.name} (backend capability disabled).',
+      );
+    }
+
+    // C6: partition-scoped wipes need backend partition scope.
+    if ((job.targetPartitions.isNotEmpty || job.targetPartition != null) &&
+        !_platform.capabilities.partitionScope) {
+      return PolicyValidationResult(
+        isAllowed: false,
+        policyMessage:
+            'Not supported on this platform: partition-scoped wipe (backend capability disabled).',
+      );
+    }
 
     // Safety Rule 2: Root disk & protected system mount check
     // (Advisory check in Dart; Rust zt_engine execute.rs is the ultimate kernel authority)

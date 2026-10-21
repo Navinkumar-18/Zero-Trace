@@ -110,6 +110,13 @@ class SanitizationCertificate {
   /// booted from a live medium when it did not.
   final String? bootEnvironment;
 
+  /// C7 (v4): platform and engine backend that issued this certificate
+  /// (e.g. "linux"/"linux"). Signed when present so the issuing-platform
+  /// claim cannot be forged after the fact; absent on pre-C7 certificates
+  /// so they still round-trip and verify byte-identically.
+  final String? platform;
+  final String? backend;
+
   SanitizationCertificate({
     this.certVersion = 2,
     required this.certificateId,
@@ -145,6 +152,8 @@ class SanitizationCertificate {
     this.sanitizationLevel,
     this.stepsExecuted,
     this.bootEnvironment,
+    this.platform,
+    this.backend,
   }) : simulationDisclaimer = simulationDisclaimer ??
             (executionMode == 'simulated'
                 ? 'SIMULATED, not a valid sanitization record'
@@ -216,6 +225,8 @@ class SanitizationCertificate {
           ?.map((e) => e.toString())
           .toList(),
       bootEnvironment: json['bootEnvironment'] as String?,
+      platform: json['platform'] as String?,
+      backend: json['backend'] as String?,
     );
   }
 
@@ -255,6 +266,10 @@ class SanitizationCertificate {
         // omitted when absent so pre-B5 v4 certificates still round-trip.
         if (certVersion >= 4 && bootEnvironment != null)
           'bootEnvironment': bootEnvironment,
+        // C7: signed platform/backend identity of the issuer; omitted when
+        // absent so pre-C7 certificates round-trip byte-identically.
+        if (certVersion >= 4 && platform != null) 'platform': platform,
+        if (certVersion >= 4 && backend != null) 'backend': backend,
         'startTime': startTime.toIso8601String(),
         'endTime': endTime.toIso8601String(),
         'timestamp': endTime.toIso8601String(),
