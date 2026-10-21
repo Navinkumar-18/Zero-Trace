@@ -8,7 +8,6 @@ use tempfile::{NamedTempFile, TempDir};
 use tokio::sync::mpsc;
 
 use sha2::{Digest, Sha256};
-use zt_engine::certificate::{sign_certificate, verify_ed25519_signature, SigningMethod};
 use zt_engine::execute::*;
 use zt_engine::verify::{verify_device_scoped, VerificationReport};
 
@@ -24,8 +23,8 @@ fn test_partition_mode_method_allowlist_iterates_all_variants() {
         .count();
 
     assert_eq!(
-        allowed_count, 3,
-        "Partition mode must allow EXACTLY 3 methods: overwrite-zero, overwrite-random, overwrite-3pass"
+        allowed_count, 4,
+        "Partition mode must allow EXACTLY 4 methods: overwrite-zero, overwrite-random, overwrite-3pass, discard"
     );
 
     for method in EngineMethod::ALL {
@@ -34,7 +33,11 @@ fn test_partition_mode_method_allowlist_iterates_all_variants() {
         let validation_res = validate_partition_method(cli_name);
 
         match method {
-            EngineMethod::OverwriteZero | EngineMethod::OverwriteRandom | EngineMethod::Overwrite3Pass => {
+            EngineMethod::OverwriteZero
+            | EngineMethod::OverwriteRandom
+            | EngineMethod::Overwrite3Pass
+            // A6: discard targets an explicit partition range natively
+            | EngineMethod::Discard => {
                 assert!(
                     is_allowed,
                     "Expected method {:?} ({}) to be allowed in partition mode",
@@ -197,65 +200,7 @@ async fn test_partition_table_fingerprint_mismatch_refused() {
 }
 
 // =========================================================================
-// 3. Certificate v3 Tamper Detection Test
-// =========================================================================
-
-#[test]
-fn test_certificate_v3_tamper_detection() {
-    let key_dir = TempDir::new().unwrap();
-    let key_file = key_dir.path().join("ed25519.key");
-
-    let canonical_payload = r#"{"certificate_version":3,"device_path":"/dev/sdb1","device_serial":"ABC12345","limitation":"Partition wipe: partition table and unselected sectors are not overwritten","partitions_wiped":[{"partition_number":1,"size_bytes":104857600,"start_sector":2048}],"scope":"partial","timestamp_utc":"2026-10-05T12:00:00Z"}"#;
-
-    let cert = sign_certificate(
-        canonical_payload,
-        SigningMethod::Ed25519,
-        Some(key_file.to_str().unwrap()),
-        "ABC12345",
-    ).expect("Signing should succeed");
-
-    let pub_key = cert.public_key_hex.as_ref().expect("Ed25519 cert must have public key");
-    let initial_verify = verify_ed25519_signature(&cert.payload_json, &cert.signature_hex, pub_key).unwrap();
-    assert!(initial_verify, "Signature must verify on untampered payload");
-
-    // 1. Tamper with scope: "partial" -> "full"
-    let tampered_scope = canonical_payload.replace(r#""scope":"partial""#, r#""scope":"full""#);
-    let verify_scope_tamper = verify_ed25519_signature(&tampered_scope, &cert.signature_hex, pub_key).unwrap();
-    assert!(
-        !verify_scope_tamper,
-        "Tampering with certificate scope MUST break signature verification"
-    );
-
-    // 2. Tamper with partition list
-    let tampered_parts = canonical_payload.replace(r#""partition_number":1"#, r#""partition_number":2"#);
-    let verify_parts_tamper = verify_ed25519_signature(&tampered_parts, &cert.signature_hex, pub_key).unwrap();
-    assert!(
-        !verify_parts_tamper,
-        "Tampering with wiped partition list MUST break signature verification"
-    );
-
-    // 3. Tamper with limitation line
-    let tampered_limit = canonical_payload.replace(
-        "Partition wipe: partition table and unselected sectors are not overwritten",
-        "Whole disk sanitized"
-    );
-    let verify_limit_tamper = verify_ed25519_signature(&tampered_limit, &cert.signature_hex, pub_key).unwrap();
-    assert!(
-        !verify_limit_tamper,
-        "Tampering with limitation line MUST break signature verification"
-    );
-
-    // 4. A v3 certificate payload cannot be parsed as legacy v1 or v2 without certificate_version: 3
-    let v1_tampered = canonical_payload.replace(r#""certificate_version":3,"#, r#""certificate_version":1,"#);
-    let verify_v1_tamper = verify_ed25519_signature(&v1_tampered, &cert.signature_hex, pub_key).unwrap();
-    assert!(
-        !verify_v1_tamper,
-        "Changing certificate version inside payload MUST break signature verification"
-    );
-}
-
-// =========================================================================
-// 4. MBR Extended Container & Active Holder Refusal (DOS vs GPT Fixtures)
+// 3. MBR Extended Container & Active Holder Refusal (DOS vs GPT Fixtures)
 // =========================================================================
 
 #[test]
@@ -583,6 +528,95 @@ fn test_scoped_verification_report_fields() {
     assert_eq!(report.sample_count, 10);
     assert_eq!(report.samples.len(), 10);
     assert!(report.samples.iter().all(|s| s.is_zero));
+}
+
+#[test]
+fn test_scoped_verification_fails_when_partition_range_still_has_data() {
+    // A8: the partition range still holds 0xAA (the wipe never happened) —
+    // scoped verification must FAIL, not error away.
+    let tmp = NamedTempFile::new().unwrap();
+    let partition_size: u64 = 1_048_576; // 1 MiB
+    fs::write(tmp.path(), vec![0xAAu8; partition_size as usize]).unwrap();
+
+    let report = verify_device_scoped(
+        tmp.path().to_str().unwrap(),
+        partition_size,
+        8 * partition_size,
+        "SER_VERIFY",
+        "overwrite-zero",
+        Some(16),
+        true, // expect_zeros
+        None,
+    )
+    .expect("Scoped verification executes and reports a failed result");
+
+    assert!(
+        !report.pass,
+        "A non-zero partition range MUST fail scoped verification"
+    );
+    assert!(report.samples.iter().any(|s| !s.is_zero));
+    assert_eq!(report.bytes_overwritten, partition_size);
+}
+
+#[test]
+fn test_scoped_verification_samples_stay_inside_partition_range() {
+    // A8: 2 MiB backing image — first 1 MiB zeroed (the wiped partition), the
+    // tail 0xAA (sibling partition data). Scoped verification samples ONLY
+    // within [0, partition_size) and must therefore pass.
+    let tmp = NamedTempFile::new().unwrap();
+    let partition_size: u64 = 1_048_576;
+    let total_device_size: u64 = 2 * partition_size;
+    let mut data = vec![0xAAu8; total_device_size as usize];
+    data[..partition_size as usize].fill(0);
+    fs::write(tmp.path(), &data).unwrap();
+
+    let report = verify_device_scoped(
+        tmp.path().to_str().unwrap(),
+        partition_size,
+        total_device_size,
+        "SER_VERIFY",
+        "overwrite-zero",
+        Some(25),
+        true,
+        None,
+    )
+    .expect("Scoped verification should succeed");
+
+    assert!(
+        report.pass,
+        "Bytes outside the partition range must never affect scoped verification"
+    );
+    assert!(report.samples.iter().all(|s| s.offset < partition_size));
+    assert!(report.samples.iter().all(|s| s.is_zero));
+    assert_eq!(report.total_device_bytes, total_device_size);
+}
+
+#[test]
+fn test_scoped_verification_fails_closed_when_device_shrank_below_partition() {
+    // A8: the partition claims 4 MiB but the backing device is only 1 MiB
+    // (device swap / shrink race). Reads past EOF error out per sample, so the
+    // verification fails closed instead of passing on stale geometry.
+    let tmp = NamedTempFile::new().unwrap();
+    let claimed_partition_size: u64 = 4 * 1_048_576;
+    fs::write(tmp.path(), vec![0u8; 1_048_576]).unwrap();
+
+    let report = verify_device_scoped(
+        tmp.path().to_str().unwrap(),
+        claimed_partition_size,
+        claimed_partition_size,
+        "SER_VERIFY",
+        "overwrite-zero",
+        Some(8),
+        true,
+        None,
+    )
+    .expect("Scoped verification reports a failed result rather than aborting");
+
+    assert!(
+        !report.pass,
+        "Reads past the end of a shrunken device must fail the verification"
+    );
+    assert!(report.samples.iter().any(|s| !s.is_zero));
 }
 
 // =========================================================================

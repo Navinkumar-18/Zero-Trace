@@ -7,7 +7,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::time::Instant;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 use tokio::sync::mpsc;
 
 use rand::RngCore;
@@ -766,11 +766,15 @@ async fn test_cancel_via_real_sigterm_signal() {
 
     // Parent test process: spawn child test worker in isolated OS process
     let current_exe = std::env::current_exe().expect("Must get current exe");
+    // Isolate the checkpoint state dir so the cancel path does not touch the
+    // developer's real ~/.local/state/zero_trace (mtime side effect in tests).
+    let ckpt_dir = TempDir::new().expect("Must create isolated checkpoint dir");
     let mut child = std::process::Command::new(current_exe)
         .arg("test_cancel_via_real_sigterm_signal")
         .arg("--exact")
         .arg("--nocapture")
         .env("ZT_TEST_SIGTERM_WORKER", "1")
+        .env("ZT_CHECKPOINT_DIR", ckpt_dir.path())
         .spawn()
         .expect("Must spawn child test worker");
 

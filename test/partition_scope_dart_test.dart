@@ -308,7 +308,7 @@ void main() {
       expect(result.policyMessage, contains('Partition mode only allows overwrite methods'));
     });
 
-    test('refuses partition scope on an internal (non-removable) disk', () {
+    test('allows internal non-system partitions (A3 relaxation)', () {
       final policy = PolicyLayer();
       final internalDevice = const DeviceProfile(
         id: 'real_sda',
@@ -336,8 +336,81 @@ void main() {
       );
 
       final result = policy.validateOperation(job);
+      expect(result.isAllowed, isTrue,
+          reason: 'A3: non-system partitions on internal disks are wipeable');
+    });
+
+    test('refuses partition scope on the system/live disk', () {
+      final policy = PolicyLayer();
+      final systemDevice = const DeviceProfile(
+        id: 'real_sda',
+        name: 'Internal SATA SSD',
+        serialNumber: 'INT123',
+        mediaType: MediaType.sataSsd,
+        busType: 'SATA',
+        capacityBytes: 512000000000,
+        isRemovable: false,
+        isSystemDisk: true,
+      );
+
+      final job = SanitizationJob(
+        jobId: 'JOB-PART-SYS',
+        device: systemDevice,
+        dataSensitivity: DataSensitivity.internal,
+        deviceCondition: DeviceCondition.functional,
+        disposalPath: DisposalPath.internalReuse,
+        riskScore: 0.3,
+        targetCategory: NistCategory.clear,
+        recommendedMethod: SanitizationMethod.singlePassOverwrite,
+        standardReference: 'NIST Clear',
+        explanationText: 'Overwrite',
+        targetPartition: safePartition,
+      );
+
+      final result = policy.validateOperation(job);
       expect(result.isAllowed, isFalse);
-      expect(result.policyMessage, contains('only permitted on removable media'));
+      // Device-level Safety Rule 2 fires first for system disks; either
+      // message means the system/live disk was refused.
+      expect(
+        result.policyMessage,
+        anyOf(contains('system/live disk'), contains('system boot disk')),
+      );
+    });
+
+    test('refuses partitions holding system paths', () {
+      final policy = PolicyLayer();
+      final homePartition = const PartitionInfo(
+        partitionNumber: 3,
+        name: 'sdb3',
+        devicePath: '/dev/sdb3',
+        startSector: 616448,
+        sizeSectors: 409600,
+        sizeBytes: 209715200,
+        label: UntrustedText('HOME'),
+        mountPoint: '/home',
+        isMounted: true,
+        isMountAllowed: false,
+        isProtected: true,
+        isActiveSwap: false,
+      );
+
+      final job = SanitizationJob(
+        jobId: 'JOB-PART-HOME',
+        device: device,
+        dataSensitivity: DataSensitivity.internal,
+        deviceCondition: DeviceCondition.functional,
+        disposalPath: DisposalPath.internalReuse,
+        riskScore: 0.3,
+        targetCategory: NistCategory.clear,
+        recommendedMethod: SanitizationMethod.singlePassOverwrite,
+        standardReference: 'NIST Clear',
+        explanationText: 'Overwrite',
+        targetPartition: homePartition,
+      );
+
+      final result = policy.validateOperation(job);
+      expect(result.isAllowed, isFalse);
+      expect(result.policyMessage, contains('system path'));
     });
 
     test('refuses operation on protected partition', () {
@@ -444,7 +517,7 @@ void main() {
       verifiedPassed: true,
     );
 
-    test('issues certVersion 3 with partial scope and partition list', () {
+    test('issues certVersion 4 with partial scope and partition list', () {
       final cert = certService.generateCertificate(
         job: job,
         evidence: evidence,
@@ -454,16 +527,19 @@ void main() {
         verificationEntropyScore: 0.0,
       );
 
-      expect(cert.certVersion, 3);
+      expect(cert.certVersion, 4);
       expect(cert.scope, 'partial');
       expect(cert.limitation, contains('Partition wipe'));
       expect(cert.partitionsWiped, isNotNull);
       expect(cert.partitionsWiped!.length, 1);
+      expect(cert.partitionsWiped![0]['name'], 'sdb1');
       expect(cert.partitionsWiped![0]['partition_number'], 1);
       expect(cert.partitionsWiped![0]['start_sector'], 2048);
       expect(cert.partitionsWiped![0]['size_bytes'], 104857600);
       expect(cert.bytesOverwritten, 104857600);
       expect(cert.totalDeviceBytes, 16000000000);
+      // A7: partition wipes are Clear-level by definition
+      expect(cert.sanitizationLevel, 'Clear');
 
       // Signature verification on untampered cert
       final isValid = certService.verifyCertificateSignature(cert.toJson());
@@ -492,7 +568,8 @@ void main() {
       );
 
       final certJson = cert.toJson();
-      certJson['partitionsWiped'] = [
+      // v4 stores the list under 'partitions'
+      certJson['partitions'] = [
         {'partition_number': 2, 'start_sector': 4096, 'size_bytes': 200000000}
       ]; // Tampered
 

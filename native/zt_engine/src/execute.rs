@@ -290,21 +290,103 @@ pub fn canonicalize_device_path(
     }
 }
 
-/// Hardened boot-disk and system mount protection.
-/// Checks the device and all associated partitions/stacks against mountinfo and swaps.
-pub fn check_boot_disk_protection_ctx(
-    device: &str,
-    dry_run: bool,
-    ctx: &FsContext,
-) -> Result<(), ExecuteError> {
-    // 1. Canonicalize the target path
-    let canonical = canonicalize_device_path(device, dry_run, ctx)?;
-    let target_name = canonical
-        .rsplit('/')
-        .next()
-        .unwrap_or(&canonical)
-        .to_string();
+// Hardened boot-disk and system mount protection.
+// Checks the device and all associated partitions/stacks against mountinfo and swaps.
+// ---------------------------------------------------
+// A3b: boot environment (normal install vs live medium vs container)
+// ---------------------------------------------------
 
+/// What kind of system the engine is running on. Affects which disks are
+/// considered wipeable:
+/// - `Normal`: installed system; the disk hosting `/` (and its partitions)
+///   is protected.
+/// - `Live`: booted from a live medium (overlay/squashfs root + live marker
+///   on the kernel cmdline); internal disks become wipeable, but the live
+///   medium itself and anything still mounted/swap-active stay protected.
+/// - `Container`: overlay root with no live marker — refuse everything
+///   (fail closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BootEnvironment {
+    Normal,
+    Live,
+    Container,
+}
+
+/// Kernel cmdline markers that identify a live boot.
+const LIVE_CMDLINE_MARKERS: &[&str] = &[
+    "boot=live", "casper", "archiso", "livecd", "boot=archiso", "livemedia",
+];
+
+/// Detect the boot environment from mountinfo (root fs type) and
+/// /proc/cmdline (live markers). Fail closed: unreadable state that still
+/// shows an overlay root is classified as `Container`.
+pub fn detect_boot_environment_ctx(ctx: &FsContext) -> Result<BootEnvironment, ExecuteError> {
+    // Find the root mount's fs type from mountinfo.
+    let mountinfo_path = ctx.proc_root.join("self/mountinfo");
+    let alt = ctx.proc_root.join("mountinfo");
+    let content = if mountinfo_path.exists() {
+        fs::read_to_string(&mountinfo_path).ok()
+    } else if alt.exists() {
+        fs::read_to_string(&alt).ok()
+    } else {
+        None
+    };
+
+    let mut root_is_overlay = false;
+    if let Some(content) = content {
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 5 || parts[4] != "/" {
+                continue;
+            }
+            let dash_pos = parts.iter().position(|&p| p == "-");
+            if let Some(pos) = dash_pos {
+                let fs_type = parts.get(pos + 1).copied().unwrap_or("");
+                let source = parts.get(pos + 2).copied().unwrap_or("");
+                if fs_type == "overlay" || fs_type == "aufs" || source == "overlay" {
+                    root_is_overlay = true;
+                }
+            }
+        }
+    }
+
+    if !root_is_overlay {
+        return Ok(BootEnvironment::Normal);
+    }
+
+    // Overlay root: live medium or container? Ask the kernel cmdline.
+    let cmdline = fs::read_to_string(ctx.proc_root.join("cmdline")).unwrap_or_default();
+    let is_live = LIVE_CMDLINE_MARKERS.iter().any(|m| cmdline.contains(m));
+    if is_live {
+        Ok(BootEnvironment::Live)
+    } else {
+        Ok(BootEnvironment::Container)
+    }
+}
+
+// ---------------------------------------------------
+// Mount & swap protection scanning (shared by guard checks)
+// ---------------------------------------------------
+
+/// Result of scanning mountinfo + swaps for protected devices.
+struct MountProtectionState {
+    protected_devs: HashMap<(u32, u32), String>,
+    protected_names: HashSet<String>,
+    has_root_mount: bool,
+}
+
+/// Parse mountinfo (with fallbacks) and /proc/swaps, collecting every
+/// device that must never be a destructive target.
+///
+/// `boot_env` matters for A3b: in `Live` mode the overlay root itself has no
+/// backing block device and must not trip the anonymous-device fail-closed
+/// check; the live medium's own mounts (e.g. /run/live/medium, /cdrom) are
+/// still recorded as protected via the normal non-allowlisted-mount path.
+fn scan_mount_and_swap_protection(
+    ctx: &FsContext,
+    dry_run: bool,
+    boot_env: BootEnvironment,
+) -> Result<MountProtectionState, ExecuteError> {
     // 2. Parse /proc/self/mountinfo
     let mountinfo_path = ctx.proc_root.join("self/mountinfo");
     let mountinfo_content = if mountinfo_path.exists() {
@@ -328,7 +410,6 @@ pub fn check_boot_disk_protection_ctx(
     let mut protected_devs: HashMap<(u32, u32), String> = HashMap::new();
     let mut protected_names: HashSet<String> = HashSet::new();
     let mut has_root_mount = false;
-    let mut root_is_overlay = false;
 
     // Track mounts for swap file resolution
     let mut active_mounts: Vec<(String, (u32, u32))> = Vec::new();
@@ -370,10 +451,6 @@ pub fn check_boot_disk_protection_ctx(
             let ms = parts.first().copied().unwrap_or("");
             (ft, ms)
         };
-
-        if mount_point == "/" && (fs_type == "overlay" || fs_type == "aufs" || mount_source == "overlay") {
-            root_is_overlay = true;
-        }
 
         let mm = parse_major_minor(mm_str);
         if let Some(pair) = mm {
@@ -439,7 +516,11 @@ pub fn check_boot_disk_protection_ctx(
                             }
                         }
                     }
-                } else if !exempt_pseudo_fs.contains(fs_type) && !fs_type.starts_with("fuse") && fs_type != "binfmt_misc" {
+                } else if !(exempt_pseudo_fs.contains(fs_type)
+                    || fs_type.starts_with("fuse")
+                    || fs_type == "binfmt_misc"
+                    || (boot_env == BootEnvironment::Live && mount_point == "/"))
+                {
                     return Err(ExecuteError::BootDiskProtection(format!(
                         "Protected mount '{}' of type '{}' has anonymous device (major 0) with no backing block device: fail closed",
                         mount_point, fs_type
@@ -460,18 +541,6 @@ pub fn check_boot_disk_protection_ctx(
                 }
             }
         }
-    }
-
-    if !has_root_mount {
-        return Err(ExecuteError::BootDiskProtection(
-            "Invalid mount environment: no root '/' mount point found in mountinfo".to_string(),
-        ));
-    }
-
-    if root_is_overlay {
-        return Err(ExecuteError::BootDiskProtection(
-            "Container or overlayfs root environment detected: refusing destructive operation (fail closed)".to_string(),
-        ));
     }
 
     // 3. Parse /proc/swaps
@@ -535,6 +604,43 @@ pub fn check_boot_disk_protection_ctx(
             }
         }
     }
+
+    Ok(MountProtectionState {
+        protected_devs,
+        protected_names,
+        has_root_mount,
+    })
+}
+
+pub fn check_boot_disk_protection_ctx(
+    device: &str,
+    dry_run: bool,
+    ctx: &FsContext,
+) -> Result<(), ExecuteError> {
+    // 1. Canonicalize the target path
+    let canonical = canonicalize_device_path(device, dry_run, ctx)?;
+    let target_name = canonical
+        .rsplit('/')
+        .next()
+        .unwrap_or(&canonical)
+        .to_string();
+
+    // A3b: classify the boot environment before applying mount rules.
+    let boot_env = detect_boot_environment_ctx(ctx)?;
+    if boot_env == BootEnvironment::Container {
+        return Err(ExecuteError::BootDiskProtection(
+            "Container or overlayfs root environment detected: refusing destructive operation (fail closed)".to_string(),
+        ));
+    }
+
+    let state = scan_mount_and_swap_protection(ctx, dry_run, boot_env)?;
+    if !state.has_root_mount {
+        return Err(ExecuteError::BootDiskProtection(
+            "Invalid mount environment: no root '/' mount point found in mountinfo".to_string(),
+        ));
+    }
+    let protected_devs = state.protected_devs;
+    let protected_names = state.protected_names;
 
     // 4. Resolve target in sysfs
     let target_block_dir = ctx.sys_root.join("class/block").join(&target_name);
@@ -1393,6 +1499,465 @@ pub async fn emmc_sanitize(
         dry_run,
         bytes_written: 0,
         io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
+    })
+}
+
+// ---------------------------------------------------------------------------
+// A6: Removable-media discard execution (blkdiscard-style BLKDISCARD ioctls)
+// ---------------------------------------------------------------------------
+
+/// `linux/fs.h`: `BLKDISCARD = _IO(0x12, 119)` — kernel TRIM/UNMAP of a byte
+/// range. Issued natively (no external blkdiscard binary) behind the same
+/// guard chain as every other execution path.
+const BLKDISCARD: libc::c_ulong = 0x1277;
+
+/// One aligned BLKDISCARD command range (byte offsets relative to the opened
+/// block-device node — for partitions, relative to the partition start).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscardChunk {
+    pub start: u64,
+    pub len: u64,
+}
+
+/// Build the ordered list of BLKDISCARD commands covering
+/// `[range_start, range_start + range_len)`.
+///
+/// The range is aligned inward to `granularity` (unaligned head/tail bytes are
+/// not discarded — callers pass sector-aligned whole-device or partition
+/// ranges) and split into commands of at most `max_chunk` bytes
+/// (`max_chunk == 0` → a single command for the whole aligned range).
+/// Pure function: unit-tested without hardware.
+pub fn build_discard_chunks(
+    range_start: u64,
+    range_len: u64,
+    granularity: u64,
+    max_chunk: u64,
+) -> Result<Vec<DiscardChunk>, ExecuteError> {
+    let gran = granularity.max(1);
+    let range_end = range_start.checked_add(range_len).ok_or_else(|| {
+        ExecuteError::UnsupportedOperation("Discard range overflows 64-bit byte space".into())
+    })?;
+
+    // Align inward: start rounds up, end rounds down.
+    let aligned_start = range_start
+        .checked_add(gran - 1)
+        .map(|v| v / gran * gran)
+        .ok_or_else(|| {
+            ExecuteError::UnsupportedOperation("Discard range start overflows during alignment".into())
+        })?;
+    let aligned_end = (range_end / gran) * gran;
+
+    if aligned_end <= aligned_start {
+        return Err(ExecuteError::UnsupportedOperation(format!(
+            "Discard range [{}, {}) contains no full {}-byte discard block",
+            range_start, range_end, gran
+        )));
+    }
+
+    let step = if max_chunk == 0 {
+        aligned_end - aligned_start
+    } else {
+        ((max_chunk / gran).max(1)) * gran
+    };
+
+    let mut chunks = Vec::new();
+    let mut cursor = aligned_start;
+    while cursor < aligned_end {
+        let len = step.min(aligned_end - cursor);
+        chunks.push(DiscardChunk { start: cursor, len });
+        cursor += len;
+    }
+    Ok(chunks)
+}
+
+/// A6: read `(granularity_bytes, max_bytes_per_cmd)` for `device` from sysfs.
+/// Missing/zero attributes degrade to (logical block size | 512, 0 = single
+/// command covering the whole range), mirroring blkdiscard's fallbacks.
+pub fn read_discard_geometry(device: &str, ctx: &FsContext) -> (u64, u64) {
+    fn queue_attr(node_dir: &Path, attr: &str) -> Option<u64> {
+        fs::read_to_string(node_dir.join("queue").join(attr))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    }
+
+    let name = device.strip_prefix("/dev/").unwrap_or(device);
+    let class_block = ctx.sys_root.join("class/block");
+    let node_dir = class_block.join(name);
+
+    let mut granularity = queue_attr(&node_dir, "discard_granularity").unwrap_or(0);
+    let mut max_chunk = queue_attr(&node_dir, "discard_max_bytes").unwrap_or(0);
+
+    // Partition nodes usually carry no queue/ dir of their own: fall back to
+    // the parent disk's queue settings.
+    let is_partition = node_dir.join("partition").exists();
+    if (granularity == 0 || max_chunk == 0) && is_partition {
+        if let Ok(parent) = resolve_parent_disk(device, ctx) {
+            let parent_dir = class_block.join(&parent);
+            if granularity == 0 {
+                granularity = queue_attr(&parent_dir, "discard_granularity").unwrap_or(0);
+            }
+            if max_chunk == 0 {
+                max_chunk = queue_attr(&parent_dir, "discard_max_bytes").unwrap_or(0);
+            }
+            if granularity == 0 {
+                granularity = queue_attr(&parent_dir, "logical_block_size").unwrap_or(0);
+            }
+        }
+    }
+
+    if granularity == 0 {
+        granularity = queue_attr(&node_dir, "logical_block_size").unwrap_or(512);
+    }
+    (granularity.max(1), max_chunk)
+}
+
+/// Issue a single BLKDISCARD command; translate kernel refusals into typed errors.
+fn issue_discard_chunk(
+    fd: libc::c_int,
+    device: &str,
+    chunk: DiscardChunk,
+) -> Result<(), ExecuteError> {
+    let mut range: [u64; 2] = [chunk.start, chunk.len];
+    let ret = unsafe { libc::ioctl(fd, BLKDISCARD, range.as_mut_ptr()) };
+    if ret == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EOPNOTSUPP) | Some(libc::ENOTTY) | Some(libc::ENOSYS) => {
+            Err(ExecuteError::UnsupportedOperation(format!(
+                "BLKDISCARD is not supported on {} (device does not advertise discard)",
+                device
+            )))
+        }
+        Some(libc::EPERM) | Some(libc::EACCES) => Err(ExecuteError::CommandFailed(format!(
+            "BLKDISCARD on {} was denied by the kernel (root privileges required): {}",
+            device, err
+        ))),
+        Some(libc::EINVAL) => Err(ExecuteError::UnsupportedOperation(format!(
+            "Kernel rejected BLKDISCARD range [{}, {}) on {} (alignment or granularity): {}",
+            chunk.start,
+            chunk.start + chunk.len,
+            device,
+            err
+        ))),
+        _ => Err(ExecuteError::IoError(err)),
+    }
+}
+
+/// Execute the ordered BLKDISCARD plan on an open fd, logging every step into
+/// [command_log] and emitting per-chunk progress events.
+async fn run_discard_plan(
+    fd: libc::c_int,
+    device: &str,
+    chunks: &[DiscardChunk],
+    tx: &mpsc::Sender<ProgressEvent>,
+    command_log: &mut Vec<String>,
+) -> Result<u64, ExecuteError> {
+    let total: u64 = chunks.iter().map(|c| c.len).sum();
+    let n = chunks.len();
+    let mut done = 0u64;
+    for (i, chunk) in chunks.iter().enumerate() {
+        issue_discard_chunk(fd, device, *chunk)?;
+        done += chunk.len;
+        command_log.push(format!(
+            "[discard] BLKDISCARD {} range=[{}, {}) chunk {}/{} ({} bytes)",
+            device,
+            chunk.start,
+            chunk.start + chunk.len,
+            i + 1,
+            n,
+            chunk.len
+        ));
+        send_detailed_progress(
+            tx,
+            ExecutionPhase::FirmwareCommand,
+            done,
+            total,
+            Some(done as f32 / total as f32 * 100.0),
+            0.0,
+            None,
+            &format!(
+                "BLKDISCARD chunk {}/{} complete ({} bytes)",
+                i + 1,
+                n,
+                chunk.len
+            ),
+            false,
+        )
+        .await;
+    }
+    Ok(done)
+}
+
+/// A6: whole-device discard (native BLKDISCARD equivalent of `blkdiscard`).
+pub async fn discard_erase(
+    device: &str,
+    confirmation_token: &str,
+    device_serial: &str,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> Result<ExecutionReport, ExecuteError> {
+    discard_erase_ctx(
+        device,
+        confirmation_token,
+        device_serial,
+        dry_run,
+        tx,
+        &FsContext::default(),
+    )
+    .await
+}
+
+pub async fn discard_erase_ctx(
+    device: &str,
+    confirmation_token: &str,
+    device_serial: &str,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+    ctx: &FsContext,
+) -> Result<ExecutionReport, ExecuteError> {
+    let start = Instant::now();
+    let mut command_log = Vec::new();
+    let method_name = "BLKDISCARD (TRIM/UNMAP)".to_string();
+    let step_prefix = if dry_run { "[DRY RUN] " } else { "" };
+
+    // 1. Guard chain — identical to every other execution path.
+    check_boot_disk_protection_ctx(device, dry_run, ctx)?;
+    verify_confirmation(confirmation_token, device_serial)?;
+    let guard_identity = get_guard_identity(device, dry_run, device_serial, ctx)?;
+    command_log.push(format!(
+        "{}[guard] boot-disk protection and confirmation verified for {}",
+        step_prefix, device
+    ));
+
+    let (granularity, max_chunk) = read_discard_geometry(device, ctx);
+
+    // 2. Dry-run: plan from sysfs geometry — no unmounts, no device opens.
+    if dry_run {
+        let name = device.strip_prefix("/dev/").unwrap_or(device);
+        let size_bytes = fs::read_to_string(ctx.sys_root.join("class/block").join(name).join("size"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|sectors| sectors.saturating_mul(512));
+        match size_bytes {
+            Some(size) if size > 0 => {
+                let chunks = build_discard_chunks(0, size, granularity, max_chunk)?;
+                command_log.push(format!(
+                    "[DRY RUN] BLKDISCARD plan for {}: {} command(s), {} bytes (granularity {}, max {})",
+                    device,
+                    chunks.len(),
+                    size,
+                    granularity,
+                    max_chunk
+                ));
+            }
+            _ => {
+                command_log.push(format!(
+                    "[DRY RUN] BLKDISCARD plan for {}: full device (sysfs size unavailable)",
+                    device
+                ));
+            }
+        }
+        send_detailed_progress(&tx, ExecutionPhase::FirmwareCommand, 0, 0, None, 0.0, None,
+            "[DRY RUN] Simulated BLKDISCARD complete", false).await;
+        send_detailed_progress(&tx, ExecutionPhase::Flushing, 0, 0, None, 0.0, None,
+            "[DRY RUN] Cache flush simulated", false).await;
+        return Ok(ExecutionReport {
+            success: true,
+            method_used: method_name,
+            command_log,
+            stdout: "[DRY RUN] Discard simulated successfully".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
+            dry_run: true,
+            bytes_written: 0,
+            io_mode: "dry_run".to_string(),
+        });
+    }
+
+    send_detailed_progress(&tx, ExecutionPhase::Preparing, 0, 0, None, 0.0, Some(5),
+        "Unmounting filesystems on target device...", false).await;
+
+    // 3. Unmount any active partitions on the device
+    let (_stdout, _stderr) = unmount_device_if_mounted(device, false, &mut command_log);
+
+    // 4. Verify exclusive access and re-check boot protection post-unmount
+    verify_exclusive_access_and_recheck(device, false, ctx)?;
+    command_log.push(format!("[guard] exclusive access verified on {}", device));
+
+    // 5. Open with O_EXCL + fd identity validation (same open as overwrite paths)
+    let mut writer = DirectBlockWriter::open(&guard_identity.canonical_path, &guard_identity)?;
+    let size_bytes = writer.total_size().map_err(ExecuteError::IoError)?;
+    let chunks = build_discard_chunks(0, size_bytes, granularity, max_chunk)?;
+    command_log.push(format!(
+        "[discard] plan {}: {} BLKDISCARD command(s) for {} bytes (granularity {}, max {})",
+        device,
+        chunks.len(),
+        size_bytes,
+        granularity,
+        max_chunk
+    ));
+
+    // 6. Ordered BLKDISCARD execution over the whole device
+    let fd = writer.file.as_raw_fd();
+    let discarded = run_discard_plan(fd, device, &chunks, &tx, &mut command_log).await?;
+
+    // 7. Flush the page cache so no stale data remains cached
+    writer.flush_buffers().map_err(ExecuteError::IoError)?;
+    command_log.push(format!("[flush] BLKFLSBUF on {}", device));
+
+    send_detailed_progress(&tx, ExecutionPhase::Verification, discarded, size_bytes,
+        Some(100.0), 0.0, None,
+        "BLKDISCARD complete. Ready for post-verification.", false).await;
+
+    Ok(ExecutionReport {
+        success: true,
+        method_used: method_name,
+        command_log,
+        stdout: format!("BLKDISCARD completed: {} bytes discarded", discarded),
+        stderr: String::new(),
+        exit_code: 0,
+        duration_ms: start.elapsed().as_millis() as u64,
+        dry_run: false,
+        bytes_written: discarded,
+        io_mode: "discard".to_string(),
+    })
+}
+
+/// A6: partition-range discard — same geometry/fingerprint guard chain as
+/// partition overwrite, then BLKDISCARD over the partition node only.
+pub async fn discard_erase_partition(
+    device: &str,
+    confirmation_token: &str,
+    device_serial: &str,
+    params: &PartitionTargetParams,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> Result<ExecutionReport, ExecuteError> {
+    discard_erase_partition_ctx(
+        device,
+        confirmation_token,
+        device_serial,
+        params,
+        dry_run,
+        tx,
+        &FsContext::default(),
+    )
+    .await
+}
+
+pub async fn discard_erase_partition_ctx(
+    device: &str,
+    confirmation_token: &str,
+    device_serial: &str,
+    params: &PartitionTargetParams,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+    ctx: &FsContext,
+) -> Result<ExecutionReport, ExecuteError> {
+    let start = Instant::now();
+    let mut command_log = Vec::new();
+    let method_name = "Partition BLKDISCARD (TRIM/UNMAP)".to_string();
+    let step_prefix = if dry_run { "[DRY RUN] " } else { "" };
+
+    // 1. Authoritative safety check: parent disk and target partition
+    check_boot_disk_protection_ctx(device, dry_run, ctx)?;
+    verify_confirmation(confirmation_token, device_serial)?;
+
+    // 2. Shared partition validation: sysfs geometry, PARTUUID, table
+    //    fingerprint, MBR extended refusal, logical-block alignment, identity
+    let target = validate_partition_target(device, params, ctx, dry_run, device_serial)?;
+    command_log.push(format!(
+        "{}[guard] partition geometry and table fingerprint verified for {} ({} bytes)",
+        step_prefix, device, target.size_bytes
+    ));
+
+    let (granularity, max_chunk) = read_discard_geometry(device, ctx);
+
+    // 3. Dry-run: plan only — no unmounts, no device opens.
+    if dry_run {
+        let chunks = build_discard_chunks(0, target.size_bytes, granularity, max_chunk)?;
+        command_log.push(format!(
+            "[DRY RUN] BLKDISCARD plan for {}: {} command(s), {} bytes (granularity {}, max {})",
+            device,
+            chunks.len(),
+            target.size_bytes,
+            granularity,
+            max_chunk
+        ));
+        send_detailed_progress(&tx, ExecutionPhase::FirmwareCommand, 0, 0, None, 0.0, None,
+            "[DRY RUN] Simulated partition BLKDISCARD complete", false).await;
+        send_detailed_progress(&tx, ExecutionPhase::Flushing, 0, 0, None, 0.0, None,
+            "[DRY RUN] Cache flush simulated", false).await;
+        return Ok(ExecutionReport {
+            success: true,
+            method_used: method_name,
+            command_log,
+            stdout: "[DRY RUN] Partition discard simulated successfully".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
+            dry_run: true,
+            bytes_written: 0,
+            io_mode: "dry_run".to_string(),
+        });
+    }
+
+    send_detailed_progress(&tx, ExecutionPhase::Preparing, 0, 0, None, 0.0, Some(5),
+        "Unmounting filesystems on target partition...", false).await;
+
+    // 4. Targeted unmount: target partition & holders only
+    let (_stdout, _stderr) = unmount_target_partition_and_holders(device, false, &mut command_log, ctx)?;
+
+    // 5. Verify exclusive access on the partition node
+    verify_exclusive_access_and_recheck(device, false, ctx)?;
+    command_log.push(format!("[guard] exclusive access verified on {}", device));
+
+    // 6. Open with O_EXCL + identity checks; cross-check BLKGETSIZE64 vs sysfs
+    let mut writer = DirectBlockWriter::open(&target.guard_identity.canonical_path, &target.guard_identity)?;
+    let actual_size = writer.total_size().map_err(ExecuteError::IoError)?;
+    if actual_size != target.size_bytes {
+        return Err(ExecuteError::IdentityMismatch(format!(
+            "BLKGETSIZE64 size ({}) does not match sysfs size ({})",
+            actual_size, target.size_bytes
+        )));
+    }
+
+    let chunks = build_discard_chunks(0, target.size_bytes, granularity, max_chunk)?;
+    command_log.push(format!(
+        "[discard] plan {}: {} BLKDISCARD command(s) for {} bytes (granularity {}, max {})",
+        device,
+        chunks.len(),
+        target.size_bytes,
+        granularity,
+        max_chunk
+    ));
+
+    // 7. Ordered BLKDISCARD execution over the partition range only
+    let fd = writer.file.as_raw_fd();
+    let discarded = run_discard_plan(fd, device, &chunks, &tx, &mut command_log).await?;
+
+    // 8. Flush the page cache
+    writer.flush_buffers().map_err(ExecuteError::IoError)?;
+    command_log.push(format!("[flush] BLKFLSBUF on {}", device));
+
+    send_detailed_progress(&tx, ExecutionPhase::Verification, discarded, target.size_bytes,
+        Some(100.0), 0.0, None,
+        "Partition BLKDISCARD complete. Ready for post-verification.", false).await;
+
+    Ok(ExecutionReport {
+        success: true,
+        method_used: method_name,
+        command_log,
+        stdout: format!("Partition BLKDISCARD completed: {} bytes discarded", discarded),
+        stderr: String::new(),
+        exit_code: 0,
+        duration_ms: start.elapsed().as_millis() as u64,
+        dry_run: false,
+        bytes_written: discarded,
+        io_mode: "discard".to_string(),
     })
 }
 
@@ -2432,6 +2997,8 @@ pub enum EngineMethod {
     NvmeSanitizeCrypto,
     OpalRevert,
     EmmcSanitize,
+    /// A6: kernel TRIM/UNMAP (blkdiscard-style) over a device or partition range.
+    Discard,
     OverwriteZero,
     OverwriteRandom,
     Overwrite3Pass,
@@ -2447,6 +3014,7 @@ impl EngineMethod {
         EngineMethod::NvmeSanitizeCrypto,
         EngineMethod::OpalRevert,
         EngineMethod::EmmcSanitize,
+        EngineMethod::Discard,
         EngineMethod::OverwriteZero,
         EngineMethod::OverwriteRandom,
         EngineMethod::Overwrite3Pass,
@@ -2462,6 +3030,7 @@ impl EngineMethod {
             EngineMethod::NvmeSanitizeCrypto => "nvme-sanitize-crypto",
             EngineMethod::OpalRevert => "opal-revert",
             EngineMethod::EmmcSanitize => "emmc-sanitize",
+            EngineMethod::Discard => "discard",
             EngineMethod::OverwriteZero => "overwrite-zero",
             EngineMethod::OverwriteRandom => "overwrite-random",
             EngineMethod::Overwrite3Pass => "overwrite-3pass",
@@ -2478,6 +3047,7 @@ impl EngineMethod {
             "nvme-sanitize-crypto" => Some(EngineMethod::NvmeSanitizeCrypto),
             "opal-revert" => Some(EngineMethod::OpalRevert),
             "emmc-sanitize" => Some(EngineMethod::EmmcSanitize),
+            "discard" => Some(EngineMethod::Discard),
             "overwrite-zero" => Some(EngineMethod::OverwriteZero),
             "overwrite-random" => Some(EngineMethod::OverwriteRandom),
             "overwrite-3pass" => Some(EngineMethod::Overwrite3Pass),
@@ -2488,7 +3058,11 @@ impl EngineMethod {
     pub fn is_allowed_in_partition_mode(&self) -> bool {
         matches!(
             self,
-            EngineMethod::OverwriteZero | EngineMethod::OverwriteRandom | EngineMethod::Overwrite3Pass
+            EngineMethod::OverwriteZero
+                | EngineMethod::OverwriteRandom
+                | EngineMethod::Overwrite3Pass
+                // A6: BLKDISCARD targets an explicit byte range natively.
+                | EngineMethod::Discard
         )
     }
 }
@@ -2497,6 +3071,8 @@ pub const ALLOWED_PARTITION_METHODS: &[&str] = &[
     "overwrite-zero",
     "overwrite-random",
     "overwrite-3pass",
+    // A6
+    "discard",
 ];
 
 pub fn validate_partition_method(method: &str) -> Result<EngineMethod, ExecuteError> {
@@ -2505,7 +3081,7 @@ pub fn validate_partition_method(method: &str) -> Result<EngineMethod, ExecuteEr
     })?;
     if !engine_method.is_allowed_in_partition_mode() {
         return Err(ExecuteError::UnsupportedOperation(format!(
-            "Method '{}' is not allowed in partition mode. Partition mode only allows overwrite methods (overwrite-zero, overwrite-random, overwrite-3pass).",
+            "Method '{}' is not allowed in partition mode. Partition mode only allows overwrite methods (overwrite-zero, overwrite-random, overwrite-3pass) and discard.",
             method
         )));
     }
@@ -2795,53 +3371,34 @@ pub fn resolve_parent_serial(device: &str, ctx: &FsContext) -> Result<String, Ex
 /// partition table fingerprint invariance, targeted unmount of holders,
 /// and bounds enforcement via PartitionRangeWriter.
 #[allow(clippy::too_many_arguments)]
-pub async fn software_overwrite_partition(
-    device: &str,
-    passes: u8,
-    pattern: OverwritePattern,
-    confirmation_token: &str,
-    device_serial: &str,
-    params: &PartitionTargetParams,
-    dry_run: bool,
-    tx: mpsc::Sender<ProgressEvent>,
-) -> Result<ExecutionReport, ExecuteError> {
-    software_overwrite_partition_ctx(
-        device,
-        passes,
-        pattern,
-        confirmation_token,
-        device_serial,
-        params,
-        dry_run,
-        tx,
-        &FsContext::default(),
-    ).await
+/// Validated partition target: geometry cross-checked against sysfs, PARTUUID
+/// and partition-table fingerprint, MBR extended containers refused, sizes
+/// aligned to the logical block size, plus the pinned guard identity.
+/// Shared by the partition overwrite and A6 discard execution paths.
+pub struct ValidatedPartitionTarget {
+    pub parent_name: String,
+    pub start_bytes: u64,
+    pub size_bytes: u64,
+    pub logical_block_size: u64,
+    pub guard_identity: GuardIdentity,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn software_overwrite_partition_ctx(
+/// Validate a partition-mode target before any destructive open:
+/// sysfs geometry (number/start/size), optional PARTUUID, partition table
+/// fingerprint, MBR extended container refusal, logical-block alignment and
+/// the pinned guard identity. Called by both partition overwrite and discard.
+pub fn validate_partition_target(
     device: &str,
-    passes: u8,
-    pattern: OverwritePattern,
-    confirmation_token: &str,
-    device_serial: &str,
     params: &PartitionTargetParams,
-    dry_run: bool,
-    tx: mpsc::Sender<ProgressEvent>,
     ctx: &FsContext,
-) -> Result<ExecutionReport, ExecuteError> {
-    let start = Instant::now();
-    let mut command_log = Vec::new();
-
-    // 1. Authoritative safety check: parent disk and target partition
-    check_boot_disk_protection_ctx(device, dry_run, ctx)?;
-    verify_confirmation(confirmation_token, device_serial)?;
-
+    dry_run: bool,
+    device_serial: &str,
+) -> Result<ValidatedPartitionTarget, ExecuteError> {
     let target_name = device.strip_prefix("/dev/").unwrap_or(device);
     let class_block = ctx.sys_root.join("class/block");
     let part_dir = class_block.join(target_name);
 
-    // 2. Sysfs geometry validation: partition, start, size
+    // Sysfs geometry validation: partition, start, size
     let part_file = part_dir.join("partition");
     if !part_file.exists() {
         return Err(ExecuteError::UnsupportedOperation(format!(
@@ -2905,7 +3462,7 @@ pub async fn software_overwrite_partition_ctx(
         }
     }
 
-    // 3. Resolve parent disk and check partition table fingerprint
+    // Resolve parent disk and check partition table fingerprint
     let parent_name = resolve_parent_disk(device, ctx)?;
     let actual_fingerprint = compute_partition_table_fingerprint(&parent_name, ctx)?;
     if actual_fingerprint != params.expected_table_fingerprint {
@@ -2915,7 +3472,7 @@ pub async fn software_overwrite_partition_ctx(
         )));
     }
 
-    // 4. Refuse MBR extended container partitions
+    // Refuse MBR extended container partitions
     let parent_path = format!("/dev/{}", parent_name);
     if is_mbr_extended_partition(device, &parent_path, ctx)? {
         return Err(ExecuteError::UnsupportedOperation(format!(
@@ -2924,7 +3481,7 @@ pub async fn software_overwrite_partition_ctx(
         )));
     }
 
-    // 5. Logical block size alignment validation
+    // Logical block size alignment validation
     let lbs: u64 = fs::read_to_string(ctx.sys_root.join("class/block").join(&parent_name).join("queue/logical_block_size"))
         .or_else(|_| fs::read_to_string(part_dir.join("queue/logical_block_size")))
         .ok()
@@ -2934,10 +3491,10 @@ pub async fn software_overwrite_partition_ctx(
     let start_bytes = actual_start.checked_mul(512).ok_or_else(|| {
         ExecuteError::UnsupportedOperation("Partition start sector overflow".into())
     })?;
-    let verified_size_bytes = actual_size.checked_mul(512).ok_or_else(|| {
+    let size_bytes = actual_size.checked_mul(512).ok_or_else(|| {
         ExecuteError::UnsupportedOperation("Partition size sector overflow".into())
     })?;
-    if start_bytes % lbs != 0 || verified_size_bytes % lbs != 0 {
+    if start_bytes % lbs != 0 || size_bytes % lbs != 0 {
         return Err(ExecuteError::UnsupportedOperation(format!(
             "Partition start or size is not aligned to logical block size ({})",
             lbs
@@ -2945,6 +3502,64 @@ pub async fn software_overwrite_partition_ctx(
     }
 
     let guard_identity = get_guard_identity(device, dry_run, device_serial, ctx)?;
+
+    Ok(ValidatedPartitionTarget {
+        parent_name,
+        start_bytes,
+        size_bytes,
+        logical_block_size: lbs,
+        guard_identity,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn software_overwrite_partition(
+    device: &str,
+    passes: u8,
+    pattern: OverwritePattern,
+    confirmation_token: &str,
+    device_serial: &str,
+    params: &PartitionTargetParams,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> Result<ExecutionReport, ExecuteError> {
+    software_overwrite_partition_ctx(
+        device,
+        passes,
+        pattern,
+        confirmation_token,
+        device_serial,
+        params,
+        dry_run,
+        tx,
+        &FsContext::default(),
+    ).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn software_overwrite_partition_ctx(
+    device: &str,
+    passes: u8,
+    pattern: OverwritePattern,
+    confirmation_token: &str,
+    device_serial: &str,
+    params: &PartitionTargetParams,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+    ctx: &FsContext,
+) -> Result<ExecutionReport, ExecuteError> {
+    let start = Instant::now();
+    let mut command_log = Vec::new();
+
+    // 1. Authoritative safety check: parent disk and target partition
+    check_boot_disk_protection_ctx(device, dry_run, ctx)?;
+    verify_confirmation(confirmation_token, device_serial)?;
+
+    // 2. Shared partition validation (A6 extraction — byte-for-byte the same
+    //    checks as before, now also feeding the discard path)
+    let target = validate_partition_target(device, params, ctx, dry_run, device_serial)?;
+    let guard_identity = target.guard_identity;
+    let verified_size_bytes = target.size_bytes;
 
     let total_passes = match pattern {
         OverwritePattern::MultiPass3 => 3u8,
@@ -3058,6 +3673,10 @@ mod tests {
 
         fn set_swaps(&self, content: &str) {
             fs::write(self.path("proc/swaps"), content).unwrap();
+        }
+
+        fn set_cmdline(&self, content: &str) {
+            fs::write(self.path("proc/cmdline"), content).unwrap();
         }
 
         fn add_block_device(
@@ -3431,6 +4050,111 @@ mod tests {
         assert!(res.is_err(), "Container or overlayfs root must refuse execution");
     }
 
+    // ------------------------------------------------------------------
+    // A3b: live-mode awareness
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_boot_env_detection_all_modes() {
+        // Normal: real root filesystem
+        let f = FixtureBuilder::new();
+        f.set_mountinfo("1 0 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n");
+        f.set_cmdline("BOOT_IMAGE=/vmlinuz root=/dev/sda1 rw quiet\n");
+        assert_eq!(
+            detect_boot_environment_ctx(&f.ctx()).unwrap(),
+            BootEnvironment::Normal
+        );
+
+        // Live: overlay root + live marker on the cmdline
+        let f = FixtureBuilder::new();
+        f.set_mountinfo("1 0 0:30 / / rw,relatime - overlay overlay rw,lowerdir=/run/live/medium\n");
+        f.set_cmdline("boot=casper findiso=/isos/live.iso quiet\n");
+        assert_eq!(
+            detect_boot_environment_ctx(&f.ctx()).unwrap(),
+            BootEnvironment::Live
+        );
+
+        // Container: overlay root without any live marker
+        let f = FixtureBuilder::new();
+        f.set_mountinfo("1 0 0:30 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker\n");
+        f.set_cmdline("root=/dev/mapper/vg-root\n");
+        assert_eq!(
+            detect_boot_environment_ctx(&f.ctx()).unwrap(),
+            BootEnvironment::Container
+        );
+    }
+
+    #[test]
+    fn test_live_mode_allows_internal_disk() {
+        let f = FixtureBuilder::new();
+        // Debian-live style: overlay root, live medium mounted at /cdrom
+        f.set_mountinfo(
+            "1 0 0:30 / / rw,relatime - overlay overlay rw,lowerdir=/run/live/medium\n\
+             2 1 8:17 / /cdrom ro,relatime shared:2 - iso9660 /dev/sdb1 ro\n",
+        );
+        f.set_cmdline("boot=live findiso=/images/live.iso quiet\n");
+        f.set_swaps("Filename\tType\tSize\tUsed\tPriority\n");
+        // Internal disk (no mounts) — must be wipeable in live mode
+        f.add_block_device("sda", (8, 0), false, None);
+        f.add_block_device("sda1", (8, 1), true, Some("sda"));
+        // Live medium
+        f.add_block_device("sdb", (8, 16), false, None);
+        f.add_block_device("sdb1", (8, 17), true, Some("sdb"));
+
+        let ctx = f.ctx();
+        let internal = check_boot_disk_protection_ctx("/dev/sda", false, &ctx);
+        assert!(internal.is_ok(), "Live mode: unmounted internal disk must be allowed, got {:?}", internal);
+
+        let live_whole = check_boot_disk_protection_ctx("/dev/sdb", false, &ctx);
+        assert!(live_whole.is_err(), "Live mode: the live medium's own disk must stay refused");
+
+        let live_part = check_boot_disk_protection_ctx("/dev/sdb1", false, &ctx);
+        assert!(live_part.is_err(), "Live mode: partitions of the live medium must stay refused");
+    }
+
+    #[test]
+    fn test_live_mode_still_refuses_active_swap() {
+        let f = FixtureBuilder::new();
+        f.set_mountinfo(
+            "1 0 0:30 / / rw,relatime - overlay overlay rw,lowerdir=/run/live/medium\n\
+             2 1 8:17 / /cdrom ro,relatime shared:2 - iso9660 /dev/sdb1 ro\n",
+        );
+        f.set_cmdline("boot=live quiet\n");
+        f.set_swaps(
+            "Filename\tType\tSize\tUsed\tPriority\n\
+             /dev/sda2\tpartition\t4194300\t0\t-2\n",
+        );
+        f.add_block_device("sda", (8, 0), false, None);
+        f.add_block_device("sda2", (8, 2), true, Some("sda"));
+        f.add_block_device("sdb", (8, 16), false, None);
+        f.add_block_device("sdb1", (8, 17), true, Some("sdb"));
+
+        let ctx = f.ctx();
+        let res = check_boot_disk_protection_ctx("/dev/sda", false, &ctx);
+        assert!(res.is_err(), "Live mode: internal disk hosting active swap must stay refused");
+    }
+
+    #[test]
+    fn test_live_mode_still_refuses_mounted_internal_partition() {
+        let f = FixtureBuilder::new();
+        f.set_mountinfo(
+            "1 0 0:30 / / rw,relatime - overlay overlay rw,lowerdir=/run/live/medium\n\
+             2 1 8:17 / /cdrom ro,relatime shared:2 - iso9660 /dev/sdb1 ro\n\
+             3 1 8:3 /data /data rw,relatime shared:3 - ext4 /dev/sda2 rw\n",
+        );
+        f.set_cmdline("archiso archisobasedir=arch\n");
+        f.add_block_device("sda", (8, 0), false, None);
+        f.add_block_device("sda2", (8, 3), true, Some("sda"));
+        f.add_block_device("sda3", (8, 4), true, Some("sda"));
+        f.add_block_device("sdb", (8, 16), false, None);
+        f.add_block_device("sdb1", (8, 17), true, Some("sdb"));
+
+        let ctx = f.ctx();
+        // A mounted internal partition's disk is in use: whole-disk stays refused.
+        let res = check_boot_disk_protection_ctx("/dev/sda", false, &ctx);
+        assert!(res.is_err(), "Live mode: disk with a mounted partition must stay refused");
+    }
+
     #[test]
     fn test_fixture_missing_root_refuses() {
         let f = FixtureBuilder::new();
@@ -3532,5 +4256,236 @@ mod tests {
         assert!(json.contains("\"FirmwareCommand\""));
         assert!(json.contains("\"percent\":0.5"));
         assert!(json.contains("\"schema_version\":2"));
+    }
+
+    // -----------------------------------------------------------------------
+    // A6: discard execution path (plan, geometry, dry-run step ordering)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_discard_chunks_alignment_and_splitting() {
+        // Unaligned start of 1000 over a 16 MiB range, 512-byte granularity,
+        // 4 MiB per-command cap.
+        let chunks = build_discard_chunks(1000, 16 * 1024 * 1024, 512, 4 * 1024 * 1024)
+            .expect("valid range must plan");
+
+        // Start rounds UP to the next 512-byte boundary: 1024.
+        assert_eq!(chunks[0].start, 1024);
+        // End rounds DOWN: floor((1000 + 16 MiB) / 512) * 512 = 16777728.
+        let last = chunks.last().unwrap();
+        assert_eq!(last.start + last.len, 16_777_728);
+
+        // Contiguous, granularity-aligned, never exceeding the per-command cap.
+        let mut expected_cursor = chunks[0].start;
+        for c in &chunks {
+            assert_eq!(c.start, expected_cursor, "chunks must be contiguous");
+            assert_eq!(c.len % 512, 0, "chunk length must be 512-aligned");
+            assert!(c.len <= 4 * 1024 * 1024, "chunk exceeds per-command cap");
+            expected_cursor = c.start + c.len;
+        }
+        // 16,776,704 aligned bytes / 4 MiB cap → 4 commands.
+        assert_eq!(chunks.len(), 4);
+    }
+
+    #[test]
+    fn test_build_discard_chunks_rejects_range_smaller_than_granularity() {
+        let res = build_discard_chunks(0, 256, 512, 0);
+        match res {
+            Err(ExecuteError::UnsupportedOperation(msg)) => {
+                assert!(msg.contains("contains no full"), "got: {}", msg);
+            }
+            other => panic!("Expected UnsupportedOperation, got {:?}", other),
+        }
+
+        // Unaligned start that rounds past the aligned end is also refused.
+        let res = build_discard_chunks(100, 300, 512, 0);
+        assert!(res.is_err(), "start rounding past end must be refused");
+    }
+
+    #[test]
+    fn test_build_discard_chunks_single_command_when_max_zero() {
+        let chunks = build_discard_chunks(0, 1024 * 1024, 512, 0).unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], DiscardChunk { start: 0, len: 1024 * 1024 });
+    }
+
+    #[test]
+    fn test_build_discard_chunks_step_rises_to_granularity() {
+        // max_chunk smaller than granularity must degrade to one granularity
+        // per command (never a sub-granular ioctl).
+        let chunks = build_discard_chunks(0, 1024 * 1024, 4096, 1024).unwrap();
+        assert!(chunks.iter().all(|c| c.len == 4096));
+        assert_eq!(chunks.len(), 256);
+    }
+
+    #[test]
+    fn test_read_discard_geometry_fixture() {
+        let f = FixtureBuilder::new();
+
+        // Whole device with queue attributes.
+        f.add_block_device("sdb", (8, 16), false, None);
+        let class_dir = f.path("sys/class/block/sdb");
+        fs::create_dir_all(class_dir.join("queue")).unwrap();
+        fs::write(class_dir.join("queue/discard_granularity"), "4096\n").unwrap();
+        fs::write(class_dir.join("queue/discard_max_bytes"), "33554432\n").unwrap();
+
+        // Partition without its own queue/ dir → parent fallback.
+        f.add_block_device("sdb1", (8, 17), true, Some("sdb"));
+
+        let ctx = f.ctx();
+        assert_eq!(read_discard_geometry("/dev/sdb", &ctx), (4096, 33554432));
+        assert_eq!(read_discard_geometry("/dev/sdb1", &ctx), (4096, 33554432));
+        // Unknown device degrades to safe defaults: 512 granularity, one command.
+        assert_eq!(read_discard_geometry("/dev/nonexistent", &ctx), (512, 0));
+    }
+
+    #[test]
+    fn test_issue_discard_chunk_on_regular_file_maps_enotty() {
+        // A regular file has no block ioctl surface: the kernel answers ENOTTY,
+        // which must surface as a typed UnsupportedOperation (fail closed).
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp.path())
+            .unwrap();
+        let chunk = DiscardChunk { start: 0, len: 4096 };
+        let res = issue_discard_chunk(file.as_raw_fd(), tmp.path().to_str().unwrap(), chunk);
+        match res {
+            Err(ExecuteError::UnsupportedOperation(msg)) => {
+                assert!(msg.contains("BLKDISCARD is not supported"), "got: {}", msg);
+            }
+            other => panic!("Expected UnsupportedOperation from ENOTTY, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_whole_device_discard_reports_ordered_steps() {
+        let f = FixtureBuilder::new();
+        f.set_mountinfo("1 0 8:0 / / rw,relatime - ext4 /dev/root rw\n");
+        f.add_block_device("sdb", (8, 16), false, None);
+
+        // 16 MiB device (32768 sectors), 512-byte granularity, 4 MiB per command.
+        let class_dir = f.path("sys/class/block/sdb");
+        fs::create_dir_all(class_dir.join("queue")).unwrap();
+        fs::write(class_dir.join("size"), "32768\n").unwrap();
+        fs::write(class_dir.join("queue/discard_granularity"), "512\n").unwrap();
+        fs::write(class_dir.join("queue/discard_max_bytes"), "4194304\n").unwrap();
+
+        let ctx = f.ctx();
+        let (tx, _rx) = mpsc::channel(64);
+        let report = discard_erase_ctx("/dev/sdb", "SER1", "SER1", true, tx, &ctx)
+            .await
+            .expect("dry-run discard should succeed");
+
+        assert!(report.success);
+        assert!(report.dry_run);
+        assert_eq!(report.io_mode, "dry_run");
+        assert_eq!(report.bytes_written, 0, "dry run must discard zero bytes");
+        assert_eq!(report.method_used, "BLKDISCARD (TRIM/UNMAP)");
+
+        // Ordered steps: guard first, plan second, nothing executed.
+        let log = &report.command_log;
+        assert!(
+            log[0].contains("[DRY RUN] [guard]"),
+            "first step must be the guard check: {:?}",
+            log[0]
+        );
+        assert_eq!(log.len(), 2, "dry run logs exactly guard + plan: {:?}", log);
+        assert!(
+            log[1].contains("[DRY RUN] BLKDISCARD plan")
+                && log[1].contains("4 command(s), 16777216 bytes"),
+            "plan step must be ordered second: {:?}",
+            log[1]
+        );
+        assert!(
+            !log.iter().any(|l| l.starts_with("[flush]")),
+            "dry run must never flush: {:?}",
+            log
+        );
+        assert!(log.iter().all(|l| l.starts_with("[DRY RUN]")));
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_partition_discard_reports_ordered_steps() {
+        let f = FixtureBuilder::new();
+        f.set_mountinfo("1 0 8:0 / / rw,relatime - ext4 /dev/root rw\n");
+        f.add_block_device("sdb", (8, 16), false, None);
+        f.add_block_device("sdb1", (8, 17), true, Some("sdb"));
+        let p_dir = f.path("sys/class/block/sdb1");
+        fs::write(p_dir.join("start"), "2048\n").unwrap();
+        fs::write(p_dir.join("size"), "204800\n").unwrap();
+
+        // Discard geometry on the parent disk (partition fallback path).
+        let class_dir = f.path("sys/class/block/sdb");
+        fs::create_dir_all(class_dir.join("queue")).unwrap();
+        fs::write(class_dir.join("queue/discard_granularity"), "512\n").unwrap();
+        fs::write(class_dir.join("queue/discard_max_bytes"), "4194304\n").unwrap();
+
+        let ctx = f.ctx();
+        let fp = compute_partition_table_fingerprint("sdb", &ctx).unwrap();
+        let params = PartitionTargetParams {
+            expected_partition_num: 1,
+            expected_start_sector: 2048,
+            expected_size_sectors: 204800,
+            expected_partuuid: None,
+            expected_table_fingerprint: fp,
+        };
+
+        let (tx, _rx) = mpsc::channel(64);
+        let report = discard_erase_partition_ctx("/dev/sdb1", "SER1", "SER1", &params, true, tx, &ctx)
+            .await
+            .expect("dry-run partition discard should succeed");
+
+        assert!(report.success);
+        assert!(report.dry_run);
+        assert_eq!(report.io_mode, "dry_run");
+        assert_eq!(report.bytes_written, 0);
+        assert_eq!(report.method_used, "Partition BLKDISCARD (TRIM/UNMAP)");
+
+        // Ordered steps: guard (geometry + fingerprint) first, plan second.
+        let log = &report.command_log;
+        assert!(
+            log[0].contains("[DRY RUN] [guard] partition geometry and table fingerprint verified"),
+            "first step must be the partition guard: {:?}",
+            log[0]
+        );
+        assert_eq!(log.len(), 2, "dry run logs exactly guard + plan: {:?}", log);
+        assert!(
+            log[1].contains("[DRY RUN] BLKDISCARD plan")
+                && log[1].contains("104857600 bytes"),
+            "plan must cover the full 100 MiB partition range: {:?}",
+            log[1]
+        );
+        assert!(log.iter().all(|l| l.starts_with("[DRY RUN]")));
+    }
+
+    #[tokio::test]
+    async fn test_discard_partition_refuses_fingerprint_mismatch() {
+        let f = FixtureBuilder::new();
+        f.set_mountinfo("1 0 8:0 / / rw,relatime - ext4 /dev/root rw\n");
+        f.add_block_device("sdb", (8, 16), false, None);
+        f.add_block_device("sdb1", (8, 17), true, Some("sdb"));
+        let p_dir = f.path("sys/class/block/sdb1");
+        fs::write(p_dir.join("start"), "2048\n").unwrap();
+        fs::write(p_dir.join("size"), "204800\n").unwrap();
+
+        let ctx = f.ctx();
+        let params = PartitionTargetParams {
+            expected_partition_num: 1,
+            expected_start_sector: 2048,
+            expected_size_sectors: 204800,
+            expected_partuuid: None,
+            expected_table_fingerprint: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+        };
+
+        let (tx, _rx) = mpsc::channel(64);
+        let res = discard_erase_partition_ctx("/dev/sdb1", "SER1", "SER1", &params, true, tx, &ctx).await;
+        match res {
+            Err(ExecuteError::IdentityMismatch(msg)) => {
+                assert!(msg.contains("Partition table changed"), "got: {}", msg);
+            }
+            other => panic!("Expected IdentityMismatch on fingerprint mismatch, got {:?}", other),
+        }
     }
 }

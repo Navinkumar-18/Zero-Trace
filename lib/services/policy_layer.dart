@@ -72,12 +72,18 @@ class PolicyLayer {
 
     // Safety Rule 4: Partition mode method allowlist & target protection
     if (job.isPartitionScope) {
-      // Decision: partitions on INTERNAL disks are not wipeable. Partition-scoped
-      // wiping is for removable media only (strict rule); there is no override.
-      if (!job.device.isRemovable) {
+      // A3: internal-disk partitions are allowed, but ONLY non-system ones.
+      // Still refused below: the boot/system disk (isSystemDisk covers disks
+      // hosting /, /boot, /boot/efi, /usr, /var, /home and live media),
+      // protected mounts, active swap, and busy holders. The Rust engine is
+      // the authoritative enforcement point and applies the same family
+      // (disk + sibling partitions) rules plus live-mode awareness.
+      if (job.device.isSystemDisk) {
         return PolicyValidationResult(
           isAllowed: false,
-          policyMessage: 'POLICY VIOLATION: Partition-scoped wiping is only permitted on removable media. Partitions on internal disks are not wipeable.',
+          policyMessage:
+              'POLICY VIOLATION: Refusing partition wipe on the system/live disk (${job.device.name}). '
+              'The disk hosting the operating system or live medium is never wipeable, including its non-system partitions.',
         );
       }
 
@@ -90,19 +96,33 @@ class PolicyLayer {
       }
 
       final part = job.targetPartition;
-      if (part != null) {
-        if (part.isProtected || part.isActiveSwap) {
-          return PolicyValidationResult(
-            isAllowed: false,
-            policyMessage: 'POLICY VIOLATION: Target partition (${part.name}) is protected (system mount, active swap, or live media).',
-          );
-        }
-        if (part.isMounted && !part.isMountAllowed) {
-          return PolicyValidationResult(
-            isAllowed: false,
-            policyMessage: 'POLICY VIOLATION: Target partition (${part.name}) has protected mount (${part.mountPoint}).',
-          );
-        }
+      if (part == null) {
+        return PolicyValidationResult(
+          isAllowed: false,
+          policyMessage: 'POLICY VIOLATION: Partition-scoped wipe requires an explicitly selected target partition.',
+        );
+      }
+      // A3: partitions holding system paths are never wipeable, even when
+      // mounted under an otherwise-unmountable location.
+      const systemMounts = {'/', '/boot', '/boot/efi', '/usr', '/var', '/home'};
+      final partMp = part.mountPoint;
+      if (partMp != null && systemMounts.contains(partMp)) {
+        return PolicyValidationResult(
+          isAllowed: false,
+          policyMessage: 'POLICY VIOLATION: Target partition (${part.name}) holds a system path ($partMp) and is never wipeable.',
+        );
+      }
+      if (part.isProtected || part.isActiveSwap) {
+        return PolicyValidationResult(
+          isAllowed: false,
+          policyMessage: 'POLICY VIOLATION: Target partition (${part.name}) is protected (system mount, active swap, or live media).',
+        );
+      }
+      if (part.isMounted && !part.isMountAllowed) {
+        return PolicyValidationResult(
+          isAllowed: false,
+          policyMessage: 'POLICY VIOLATION: Target partition (${part.name}) has protected mount (${part.mountPoint}).',
+        );
       }
     }
 

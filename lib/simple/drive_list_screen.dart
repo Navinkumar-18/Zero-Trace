@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 import '../models/device_profile.dart';
 import '../models/sanitization_support_level.dart';
 import '../models/untrusted_text.dart';
+import '../services/live_boot_detector.dart';
 import '../services/orphaned_process_checker.dart';
 import '../services/sanitization_controller.dart';
 import '../widgets/theme.dart';
@@ -34,6 +35,10 @@ class _DriveListScreenState extends State<DriveListScreen> {
     final showInternal = controller.showInternalDrives;
     final isSimulated = !controller.isRealMode;
     final orphanResult = controller.orphanResult;
+
+    // A3b: show which rule set applies (live medium vs installed system).
+    final bootMode =
+        isSimulated ? BootMode.normal : LiveBootDetector.detect();
 
     // Filter: removable first, then internal if toggled on
     final List<DeviceProfile> visibleDevices = allDevices.where((d) {
@@ -78,6 +83,54 @@ class _DriveListScreenState extends State<DriveListScreen> {
                     color: AppTheme.accentGold,
                     fontWeight: FontWeight.bold,
                     fontSize: 12,
+                  ),
+                ),
+              ],
+            ),
+          ),
+
+        // A3b: live-mode / container-mode banner (real mode only)
+        if (!isSimulated && bootMode != BootMode.normal)
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            decoration: BoxDecoration(
+              color: (bootMode == BootMode.live
+                      ? AppTheme.simplePrimary
+                      : Colors.red)
+                  .withValues(alpha: 0.12),
+              border: Border(
+                bottom: BorderSide(
+                  color: (bootMode == BootMode.live
+                          ? AppTheme.simplePrimary
+                          : Colors.red)
+                      .withValues(alpha: 0.5),
+                  width: 1.5,
+                ),
+              ),
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  bootMode == BootMode.live
+                      ? Icons.usb
+                      : Icons.dangerous_outlined,
+                  color: bootMode == BootMode.live
+                      ? AppTheme.simplePrimary
+                      : Colors.red,
+                  size: 18,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    LiveBootDetector.describe(bootMode),
+                    style: TextStyle(
+                      color: bootMode == BootMode.live
+                          ? AppTheme.simplePrimary
+                          : Colors.red,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
+                    ),
                   ),
                 ),
               ],

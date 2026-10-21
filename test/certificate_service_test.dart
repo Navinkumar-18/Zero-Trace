@@ -48,7 +48,7 @@ void main() {
       capacityBytes: 32000000000,
     );
 
-    test('Generates v2 certificate with required fields and verifies signature', () {
+    test('Generates v4 certificate with required fields and verifies signature', () {
       final job = SanitizationJob(
         jobId: 'JOB-V2-001',
         device: nvmeDevice,
@@ -67,21 +67,46 @@ void main() {
         evidence: testEvidence,
         executionMode: 'simulated',
         actualMethodExecuted: 'NVMe Sanitize (start-block-erase)',
+        stepsExecuted: const [
+          '[guard] boot-disk protection verified',
+          '[discard] BLKDISCARD chunk 1/4',
+        ],
       );
 
-      expect(cert.certVersion, 2);
+      expect(cert.certVersion, 4);
       expect(cert.executionMode, 'simulated');
       expect(cert.simulationDisclaimer, contains('SIMULATED, not a valid sanitization record'));
       expect(cert.sanitizationCategory, 'Purge');
+      expect(cert.sanitizationLevel, 'Purge');
+      expect(cert.scope, 'full');
       expect(cert.busType, 'NVMe');
       expect(cert.supportLevel, contains('Full support'));
       expect(cert.signature, isNotEmpty);
       expect(cert.signature, contains(':'));
 
-      // Verify signature via CertificateService
+      // A7: v4 fields present in serialized form
       final certJson = cert.toJson();
+      expect(certJson['scope'], 'full');
+      expect(certJson['sanitizationLevel'], 'Purge');
+      expect(certJson['stepsExecuted'], [
+        '[guard] boot-disk protection verified',
+        '[discard] BLKDISCARD chunk 1/4',
+      ]);
+      expect(certJson.containsKey('partitions'), isFalse);
+      expect(certJson.containsKey('partitionsWiped'), isFalse);
+
+      // Verify signature via CertificateService
       final isValid = service.verifyCertificateSignature(certJson);
       expect(isValid, isTrue);
+
+      // A7 tamper detection: ordered steps and level are covered by the signature
+      final tamperedSteps = Map<String, dynamic>.from(certJson);
+      tamperedSteps['stepsExecuted'] = ['all data purged'];
+      expect(service.verifyCertificateSignature(tamperedSteps), isFalse);
+
+      final tamperedLevel = Map<String, dynamic>.from(certJson);
+      tamperedLevel['sanitizationLevel'] = 'Clear';
+      expect(service.verifyCertificateSignature(tamperedLevel), isFalse);
     });
 
     test('Real execution mode omits simulation disclaimer', () {
@@ -105,7 +130,7 @@ void main() {
         actualMethodExecuted: 'NVMe Format / Sanitize',
       );
 
-      expect(cert.certVersion, 2);
+      expect(cert.certVersion, 4);
       expect(cert.executionMode, 'real');
       expect(cert.simulationDisclaimer, isNull);
 
@@ -402,40 +427,121 @@ void main() {
       expect(pdfHeader, '%PDF-');
     });
 
-    group('Certificate Versioning & Tamper Detection (v1, v2, v3)', () {
-      test('v2 certificate fixture adhering to commit 39acb0c payload verifies successfully', () {
-        // Generate a v2 full-disk certificate
-        final job = SanitizationJob(
+    group('Certificate Versioning & Tamper Detection (v1, v2, v3, v4)', () {
+      test('v2 certificate payload (commit 39acb0c shape) verifies and tampering breaks it', () {
+        final payload = CertificateService.buildSigningPayload(
+          certVersion: 2,
+          certificateId: 'ZT-CERT-V2-FIXTURE',
           jobId: 'JOB-V2-39ACB0C',
-          device: nvmeDevice,
-          dataSensitivity: DataSensitivity.internal,
-          deviceCondition: DeviceCondition.functional,
-          disposalPath: DisposalPath.internalReuse,
-          riskScore: 0.25,
-          targetCategory: NistCategory.purge,
-          recommendedMethod: SanitizationMethod.nvmeSanitize,
-          standardReference: 'NIST SP 800-88 Rev. 1 Purge',
-          explanationText: 'NVMe Sanitize',
-        );
-
-        final cert = service.generateCertificate(
-          job: job,
-          evidence: testEvidence,
+          deviceSerial: nvmeDevice.serialNumber,
+          method: 'NVMe Sanitize (start-block-erase)',
+          sanitizationCategory: 'Purge',
           executionMode: 'simulated',
+          evidenceHash: testEvidence.evidenceHash,
+          result: 'SUCCESS',
+          timestamp: '2026-01-01T00:00:00.000',
         );
 
-        expect(cert.certVersion, equals(2));
-        final jsonMap = cert.toJson();
-        // Verify that v2 does not contain partition fields
-        expect(jsonMap.containsKey('partitionsWiped'), isFalse);
-        expect(jsonMap.containsKey('scope'), isFalse);
+        // v2 payload shape: no scope / partitions / level / steps fields.
+        expect(payload.containsKey('scope'), isFalse);
+        expect(payload.containsKey('partitions'), isFalse);
+        expect(payload.containsKey('partitionsWiped'), isFalse);
+        expect(payload.containsKey('sanitizationLevel'), isFalse);
+        expect(payload.containsKey('stepsExecuted'), isFalse);
 
-        expect(service.verifyCertificateSignature(jsonMap), isTrue);
+        final fixture = <String, dynamic>{
+          'certVersion': 2,
+          'certificateId': payload['certificateId'],
+          'jobId': payload['jobId'],
+          'deviceSerial': payload['deviceSerial'],
+          'method': payload['method'],
+          'sanitizationCategory': payload['sanitizationCategory'],
+          'executionMode': payload['executionMode'],
+          'evidenceHash': payload['evidenceHash'],
+          'result': payload['result'],
+          'timestamp': payload['timestamp'],
+          'signature': service.signPayloadForTesting(jsonEncode(payload)),
+        };
+
+        expect(service.verifyCertificateSignature(fixture), isTrue);
+
+        final tampered = Map<String, dynamic>.from(fixture);
+        tampered['method'] = 'ATA Secure Erase';
+        expect(service.verifyCertificateSignature(tampered), isFalse);
       });
 
       test('v3 partition-scope certificate verifies and tampering breaks signature', () {
-        final job = SanitizationJob(
+        final payload = CertificateService.buildSigningPayload(
+          certVersion: 3,
+          certificateId: 'ZT-CERT-V3-FIXTURE',
           jobId: 'JOB-V3-PART-001',
+          deviceSerial: nvmeDevice.serialNumber,
+          method: 'Software Overwrite (1-pass, Zeros)',
+          sanitizationCategory: 'Clear',
+          executionMode: 'simulated',
+          evidenceHash: testEvidence.evidenceHash,
+          result: 'SUCCESS',
+          timestamp: '2026-01-01T00:00:00.000',
+          scope: 'partial',
+          limitation:
+              'Partition wipe: partition table and unselected sectors are not overwritten',
+          partitionsWiped: [
+            {
+              'partition_number': 1,
+              'start_sector': 2048,
+              'size_bytes': 104857600,
+            }
+          ],
+          bytesOverwritten: 104857600,
+          totalDeviceBytes: nvmeDevice.capacityBytes,
+        );
+
+        final fixture = <String, dynamic>{
+          'certVersion': 3,
+          'certificateId': payload['certificateId'],
+          'jobId': payload['jobId'],
+          'deviceSerial': payload['deviceSerial'],
+          'method': payload['method'],
+          'sanitizationCategory': payload['sanitizationCategory'],
+          'executionMode': payload['executionMode'],
+          'scope': payload['scope'],
+          'limitation': payload['limitation'],
+          'partitionsWiped': payload['partitionsWiped'],
+          'bytesOverwritten': payload['bytesOverwritten'],
+          'totalDeviceBytes': payload['totalDeviceBytes'],
+          'evidenceHash': payload['evidenceHash'],
+          'result': payload['result'],
+          'timestamp': payload['timestamp'],
+          'signature': service.signPayloadForTesting(jsonEncode(payload)),
+        };
+
+        expect(service.verifyCertificateSignature(fixture), isTrue);
+
+        // 1. Changing scope breaks v3 signature
+        final tamperedScope = Map<String, dynamic>.from(fixture);
+        tamperedScope['scope'] = 'full';
+        expect(service.verifyCertificateSignature(tamperedScope), isFalse);
+
+        // 2. Changing partitions breaks v3 signature
+        final tamperedPartitions = Map<String, dynamic>.from(fixture);
+        tamperedPartitions['partitionsWiped'] = [
+          {
+            'partition_number': 2, // tampered partition number
+            'start_sector': 2048,
+            'size_bytes': 104857600,
+          }
+        ];
+        expect(service.verifyCertificateSignature(tamperedPartitions), isFalse);
+
+        // 3. Changing limitation breaks v3 signature
+        final tamperedLimitation = Map<String, dynamic>.from(fixture);
+        tamperedLimitation['limitation'] = 'Entire device securely purged';
+        expect(service.verifyCertificateSignature(tamperedLimitation), isFalse);
+      });
+
+      test('generated partition-scope certificate is v4 and tampering breaks it', () {
+        final job = SanitizationJob(
+          jobId: 'JOB-V4-PART-001',
           device: nvmeDevice,
           dataSensitivity: DataSensitivity.internal,
           deviceCondition: DeviceCondition.functional,
@@ -460,35 +566,98 @@ void main() {
           job: job,
           evidence: testEvidence,
           executionMode: 'simulated',
+          stepsExecuted: const ['unmount nvme0n1p1', 'BLKDISCARD chunk 1/1'],
         );
 
-        expect(cert.certVersion, equals(3));
-        expect(cert.scope, equals('partial'));
+        expect(cert.certVersion, 4);
+        expect(cert.scope, 'partial');
         expect(cert.partitionsWiped, isNotNull);
+        expect(cert.sanitizationLevel, 'Clear');
 
-        final validJson = cert.toJson();
-        expect(service.verifyCertificateSignature(validJson), isTrue);
+        final json = cert.toJson();
+        // v4 uses the 'partitions' key (with the partition name), never v3's key.
+        expect(json.containsKey('partitions'), isTrue);
+        expect(json.containsKey('partitionsWiped'), isFalse);
+        expect((json['partitions'] as List).first['name'], 'nvme0n1p1');
+        expect(json['stepsExecuted'], ['unmount nvme0n1p1', 'BLKDISCARD chunk 1/1']);
 
-        // 1. Changing scope breaks v3 signature
-        final tamperedScope = Map<String, dynamic>.from(validJson);
-        tamperedScope['scope'] = 'full';
-        expect(service.verifyCertificateSignature(tamperedScope), isFalse);
+        // fromJson reads the v4 key back into partitionsWiped
+        final parsed = SanitizationCertificate.fromJson(json);
+        expect(parsed.partitionsWiped, isNotNull);
+        expect(parsed.sanitizationLevel, 'Clear');
 
-        // 2. Changing partitions breaks v3 signature
-        final tamperedPartitions = Map<String, dynamic>.from(validJson);
-        tamperedPartitions['partitionsWiped'] = [
+        expect(service.verifyCertificateSignature(json), isTrue);
+
+        // Tampering with the v4 partition list breaks the signature
+        final tampered = Map<String, dynamic>.from(json);
+        tampered['partitions'] = [
           {
-            'partition_number': 2, // tampered partition number
+            'name': 'nvme0n1p9',
+            'partition_number': 9,
             'start_sector': 2048,
             'size_bytes': 104857600,
           }
         ];
-        expect(service.verifyCertificateSignature(tamperedPartitions), isFalse);
+        expect(service.verifyCertificateSignature(tampered), isFalse);
+      });
 
-        // 3. Changing limitation breaks v3 signature
-        final tamperedLimitation = Map<String, dynamic>.from(validJson);
-        tamperedLimitation['limitation'] = 'Entire device securely purged';
-        expect(service.verifyCertificateSignature(tamperedLimitation), isFalse);
+      test('v4 reader accepts the legacy partitionsWiped key as fallback', () {
+        // Reader-compat: a v4-stamped payload whose partition list still uses
+        // the v3 key must verify; tampering must still break it.
+        final partitions = [
+          {
+            'partition_number': 1,
+            'start_sector': 2048,
+            'size_bytes': 104857600,
+          }
+        ];
+        final payload = CertificateService.buildSigningPayload(
+          certVersion: 4,
+          certificateId: 'ZT-CERT-V4-LEGACY-KEY',
+          jobId: 'JOB-V4-LEGACY-KEY',
+          deviceSerial: nvmeDevice.serialNumber,
+          method: 'Software Overwrite (1-pass, Zeros)',
+          sanitizationCategory: 'Clear',
+          executionMode: 'simulated',
+          evidenceHash: testEvidence.evidenceHash,
+          result: 'SUCCESS',
+          timestamp: '2026-01-01T00:00:00.000',
+          scope: 'partial',
+          limitation:
+              'Partition wipe: partition table and unselected sectors are not overwritten',
+          partitionsWiped: partitions,
+          sanitizationLevel: 'Clear',
+          stepsExecuted: ['unmount nvme0n1p1'],
+          bytesOverwritten: 104857600,
+          totalDeviceBytes: nvmeDevice.capacityBytes,
+        );
+
+        final fixture = <String, dynamic>{
+          'certVersion': 4,
+          'certificateId': payload['certificateId'],
+          'jobId': payload['jobId'],
+          'deviceSerial': payload['deviceSerial'],
+          'method': payload['method'],
+          'sanitizationCategory': payload['sanitizationCategory'],
+          'executionMode': payload['executionMode'],
+          'sanitizationLevel': payload['sanitizationLevel'],
+          'scope': payload['scope'],
+          'limitation': payload['limitation'],
+          'partitionsWiped': payload['partitions'], // legacy key on purpose
+          'stepsExecuted': payload['stepsExecuted'],
+          'bytesOverwritten': payload['bytesOverwritten'],
+          'totalDeviceBytes': payload['totalDeviceBytes'],
+          'evidenceHash': payload['evidenceHash'],
+          'result': payload['result'],
+          'timestamp': payload['timestamp'],
+          'signature': service.signPayloadForTesting(jsonEncode(payload)),
+        };
+
+        expect(service.verifyCertificateSignature(fixture), isTrue);
+
+        final tampered = Map<String, dynamic>.from(fixture);
+        tampered['stepsExecuted'] = ['unmount nvme0n1p1', 'faked success step'];
+        expect(service.verifyCertificateSignature(tampered), isFalse);
       });
     });
   });

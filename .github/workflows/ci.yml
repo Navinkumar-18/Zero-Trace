@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  flutter:
+    name: Flutter analyze & test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+
+      - name: flutter pub get
+        run: flutter pub get
+
+      - name: flutter analyze
+        run: flutter analyze
+
+      # Default concurrency. Tests are hermetic: no real block devices, no sudo,
+      # no loop devices (hardware tests live behind the cargo `loopdev_tests`
+      # feature and are never run in CI).
+      - name: flutter test
+        run: flutter test
+
+  rust:
+    name: Cargo clippy & test
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: native/zt_engine
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/zt_engine
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # No `loopdev_tests` feature: ignored hardware tests need sudo and are
+      # explicitly out of scope for automation.
+      - name: cargo test
+        run: cargo test

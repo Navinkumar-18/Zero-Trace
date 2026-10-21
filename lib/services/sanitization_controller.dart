@@ -59,7 +59,13 @@ class SanitizationController extends ChangeNotifier {
   bool _showInternalDrives = false;
   PartitionInfo? _selectedPartition;
 
+  /// A4: multi-select partition state. [_selectedPartition] tracks the
+  /// partition used by the current job (first selected); this list holds
+  /// every user-selected partition for sequential partition-scope wipes.
+  List<PartitionInfo> _selectedPartitions = const [];
+
   PartitionInfo? get selectedPartition => _selectedPartition;
+  List<PartitionInfo> get selectedPartitions => _selectedPartitions;
 
   // Real-time telemetry and stall watchdog
   DateTime? _lastHeartbeatTime;
@@ -721,6 +727,7 @@ class SanitizationController extends ChangeNotifier {
     if (isJobRunning) return;
     _selectedDevice = device;
     _selectedPartition = null;
+    _selectedPartitions = const [];
     _updateJobRecommendation();
     notifyListeners();
   }
@@ -728,6 +735,33 @@ class SanitizationController extends ChangeNotifier {
   void selectPartition(PartitionInfo? partition) {
     if (isJobRunning) return;
     _selectedPartition = partition;
+    _selectedPartitions = partition == null ? const [] : [partition];
+    _updateJobRecommendation();
+    notifyListeners();
+  }
+
+  /// A4: toggle a partition in the multi-select set.
+  void togglePartitionSelection(PartitionInfo partition) {
+    if (isJobRunning) return;
+    final next = List<PartitionInfo>.from(_selectedPartitions);
+    final idx = next.indexWhere((p) => p.name == partition.name);
+    if (idx >= 0) {
+      next.removeAt(idx);
+    } else {
+      next.add(partition);
+      next.sort((a, b) => a.partitionNumber.compareTo(b.partitionNumber));
+    }
+    _selectedPartitions = next;
+    _selectedPartition = next.isEmpty ? null : next.first;
+    _updateJobRecommendation();
+    notifyListeners();
+  }
+
+  /// A4: clear all partition selections (back to whole-device scope).
+  void clearPartitionSelection() {
+    if (isJobRunning) return;
+    _selectedPartitions = const [];
+    _selectedPartition = null;
     _updateJobRecommendation();
     notifyListeners();
   }
@@ -1093,6 +1127,8 @@ class SanitizationController extends ChangeNotifier {
             evidence: evidence,
             executionMode: 'real',
             actualMethodExecuted: report.methodUsed,
+            // A7: sign the ordered engine steps actually executed.
+            stepsExecuted: report.commandLog,
             verificationSampleCount: verifyReport?.sampleCount,
             verificationEntropyScore: verifyReport?.entropyScore,
           );

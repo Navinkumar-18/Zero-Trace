@@ -110,6 +110,7 @@ class DeviceProfile {
   final bool supportsNvmeSanitize;
   final bool supportsEmmcSanitize;
   final bool supportsTrim;
+  final bool supportsNvmeFormat;
   final bool hpaDcoPresent;
   final String? mountPoint;
   final bool isSystemDisk;
@@ -132,6 +133,9 @@ class DeviceProfile {
   /// Canonical SHA-256 fingerprint of the partition table, if partitions exist.
   final String? partitionTableFingerprint;
 
+  /// Partition table type as reported by lsblk PTTYPE ("gpt"/"dos"/"none"...).
+  final String? partitionTableType;
+
   const DeviceProfile({
     required this.id,
     required this.name,
@@ -146,6 +150,7 @@ class DeviceProfile {
     this.supportsNvmeSanitize = false,
     this.supportsEmmcSanitize = false,
     this.supportsTrim = false,
+    this.supportsNvmeFormat = false,
     this.hpaDcoPresent = false,
     this.mountPoint,
     this.isSystemDisk = false,
@@ -157,6 +162,7 @@ class DeviceProfile {
     this.disabledReason,
     this.partitions = const [],
     this.partitionTableFingerprint,
+    this.partitionTableType,
   });
 
   /// Whether this device has any discovered partitions.
@@ -176,6 +182,7 @@ class DeviceProfile {
     bool? supportsNvmeSanitize,
     bool? supportsEmmcSanitize,
     bool? supportsTrim,
+    bool? supportsNvmeFormat,
     bool? hpaDcoPresent,
     String? mountPoint,
     bool? isSystemDisk,
@@ -187,6 +194,7 @@ class DeviceProfile {
     String? disabledReason,
     List<PartitionInfo>? partitions,
     String? partitionTableFingerprint,
+    String? partitionTableType,
   }) {
     return DeviceProfile(
       id: id ?? this.id,
@@ -202,6 +210,7 @@ class DeviceProfile {
       supportsNvmeSanitize: supportsNvmeSanitize ?? this.supportsNvmeSanitize,
       supportsEmmcSanitize: supportsEmmcSanitize ?? this.supportsEmmcSanitize,
       supportsTrim: supportsTrim ?? this.supportsTrim,
+      supportsNvmeFormat: supportsNvmeFormat ?? this.supportsNvmeFormat,
       hpaDcoPresent: hpaDcoPresent ?? this.hpaDcoPresent,
       mountPoint: mountPoint ?? this.mountPoint,
       isSystemDisk: isSystemDisk ?? this.isSystemDisk,
@@ -213,6 +222,7 @@ class DeviceProfile {
       disabledReason: disabledReason ?? this.disabledReason,
       partitions: partitions ?? this.partitions,
       partitionTableFingerprint: partitionTableFingerprint ?? this.partitionTableFingerprint,
+      partitionTableType: partitionTableType ?? this.partitionTableType,
     );
   }
 
@@ -342,6 +352,7 @@ class DeviceProfile {
         'supportsNvmeSanitize': supportsNvmeSanitize,
         'supportsEmmcSanitize': supportsEmmcSanitize,
         'supportsTrim': supportsTrim,
+        'supportsNvmeFormat': supportsNvmeFormat,
         'hpaDcoPresent': hpaDcoPresent,
         'mountPoint': mountPoint,
         'isSystemDisk': isSystemDisk,
@@ -354,6 +365,7 @@ class DeviceProfile {
         'partitions': partitions.map((p) => p.toJson()).toList(),
         if (partitionTableFingerprint != null)
           'partitionTableFingerprint': partitionTableFingerprint,
+        if (partitionTableType != null) 'partitionTableType': partitionTableType,
       };
 
   factory DeviceProfile.fromJson(Map<String, dynamic> json) {
@@ -374,6 +386,7 @@ class DeviceProfile {
       supportsNvmeSanitize: (json['supportsNvmeSanitize'] as bool?) ?? false,
       supportsEmmcSanitize: (json['supportsEmmcSanitize'] as bool?) ?? false,
       supportsTrim: (json['supportsTrim'] as bool?) ?? false,
+      supportsNvmeFormat: (json['supportsNvmeFormat'] as bool?) ?? false,
       hpaDcoPresent: (json['hpaDcoPresent'] as bool?) ?? false,
       mountPoint: json['mountPoint'] as String?,
       isSystemDisk: (json['isSystemDisk'] as bool?) ?? false,
@@ -388,6 +401,7 @@ class DeviceProfile {
               .toList() ??
           const [],
       partitionTableFingerprint: json['partitionTableFingerprint'] as String?,
+      partitionTableType: json['partitionTableType'] as String?,
     );
   }
 }

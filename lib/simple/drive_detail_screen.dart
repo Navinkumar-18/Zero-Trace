@@ -3,6 +3,7 @@ import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
 
 import '../models/device_profile.dart';
+import '../models/partition_info.dart';
 import '../models/sanitization_job.dart';
 import '../models/sanitization_support_level.dart';
 import '../models/storage_capability.dart';
@@ -394,6 +395,13 @@ class DriveDetailScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 20),
+
+                  // A4: partition chooser (only when the drive has partitions
+                  // and no job is running for it)
+                  if (device.hasPartitions && !(isRunning && isJobForThisDevice)) ...[
+                    _PartitionChooserSection(device: device, isSimulated: isSimulated),
+                    const SizedBox(height: 20),
+                  ],
 
                   // Progress area (inline, not separate screen)
                   if (isRunning && isJobForThisDevice) ...[
@@ -1001,5 +1009,255 @@ class DriveDetailScreen extends StatelessWidget {
       case DriveType.unknown:
         return Icons.help_outline;
     }
+  }
+}
+
+/// A4: partition chooser.
+///
+/// Shows every partition of the drive as a selectable row (label, size,
+/// filesystem, mountpoint) in a C:/D: style list. Multi-select is allowed;
+/// "select all" switches to the whole-device path. System/unsafe partitions
+/// are shown disabled with the reason. Selecting every partition of a
+/// removable device offers "Wipe entire device" instead.
+class _PartitionChooserSection extends StatelessWidget {
+  final DeviceProfile device;
+  final bool isSimulated;
+
+  const _PartitionChooserSection({
+    required this.device,
+    required this.isSimulated,
+  });
+
+  /// Reason a partition cannot be selected, or null when selectable.
+  String? _unsafeReason(PartitionInfo p) {
+    if (p.isActiveSwap) return 'Active swap partition';
+    if (p.isSystemPartition) return 'Holds system path (${p.mountPoint})';
+    if (p.isProtected) {
+      return p.isMounted
+          ? 'Protected mount (${p.mountPoint})'
+          : 'Protected partition (live media or system)';
+    }
+    if (p.isMounted && !p.isMountAllowed) {
+      return 'Mounted at ${p.mountPoint} — unmount first';
+    }
+    return null;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final controller = context.watch<SanitizationController>();
+    final selected = controller.selectedPartitions;
+    final selectedNames = selected.map((p) => p.name).toSet();
+
+    final selectable = device.partitions.where((p) => _unsafeReason(p) == null).toList();
+    final allSelected =
+        selectable.isNotEmpty && selectable.every((p) => selectedNames.contains(p.name));
+    final allPartitionsSelected =
+        selectable.length == device.partitions.length && allSelected;
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppTheme.simplePrimary.withValues(alpha: 0.05),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppTheme.simplePrimary.withValues(alpha: 0.2)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.view_list, color: AppTheme.simplePrimary, size: 18),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  'Wipe specific partitions',
+                  style: TextStyle(
+                    color: AppTheme.simplePrimary,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 14,
+                  ),
+                ),
+              ),
+              Text(
+                isSimulated ? 'Simulated' : 'Real mode',
+                style: const TextStyle(color: AppTheme.textMuted, fontSize: 10),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Leave everything unselected to wipe the entire drive.',
+            style: TextStyle(color: AppTheme.textMuted, fontSize: 11),
+          ),
+          const SizedBox(height: 10),
+
+          // "Select all" row → whole-device path
+          InkWell(
+            onTap: selectable.isEmpty
+                ? null
+                : () {
+                    if (allSelected) {
+                      controller.clearPartitionSelection();
+                    } else {
+                      for (final p in selectable) {
+                        if (!selectedNames.contains(p.name)) {
+                          controller.togglePartitionSelection(p);
+                        }
+                      }
+                    }
+                  },
+            borderRadius: BorderRadius.circular(8),
+            child: Container(
+              padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
+              child: Row(
+                children: [
+                  Icon(
+                    allSelected ? Icons.check_box : Icons.check_box_outline_blank,
+                    color: allSelected
+                        ? AppTheme.simplePrimary
+                        : AppTheme.textMuted,
+                    size: 20,
+                  ),
+                  const SizedBox(width: 10),
+                  const Expanded(
+                    child: Text(
+                      'Select all partitions',
+                      style: TextStyle(
+                          fontWeight: FontWeight.w600, fontSize: 13),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+
+          const Divider(height: 12),
+
+          // Partition rows
+          for (final p in device.partitions) ...[
+            _buildPartitionRow(context, controller, p, selectedNames),
+            const SizedBox(height: 2),
+          ],
+
+          // A4: "Wipe entire device" offer when every partition is selected
+          if (allPartitionsSelected && device.isRemovable) ...[
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: AppTheme.accentGold.withValues(alpha: 0.08),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.warning_amber_rounded,
+                      color: AppTheme.accentGold, size: 16),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      'All partitions selected: confirmation will offer '
+                      '"Wipe entire device" (partition table destroyed).',
+                      style:
+                          TextStyle(color: AppTheme.accentGold, fontSize: 11),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+
+          // Selection summary
+          if (selected.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Text(
+              '${selected.length} partition(s) selected for wipe: '
+              '${selected.map((p) => p.name).join(', ')}',
+              style: const TextStyle(
+                  color: AppTheme.textSecondary, fontSize: 11),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPartitionRow(
+    BuildContext context,
+    SanitizationController controller,
+    PartitionInfo p,
+    Set<String> selectedNames,
+  ) {
+    final reason = _unsafeReason(p);
+    final disabled = reason != null;
+    final isSelected = !disabled && selectedNames.contains(p.name);
+
+    final displayName = (p.label.sanitized.isNotEmpty)
+        ? p.label.sanitized
+        : 'Partition ${p.partitionNumber}';
+
+    return InkWell(
+      onTap: disabled ? null : () => controller.togglePartitionSelection(p),
+      borderRadius: BorderRadius.circular(8),
+      child: Opacity(
+        opacity: disabled ? 0.55 : 1.0,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+          decoration: BoxDecoration(
+            color: isSelected
+                ? AppTheme.simplePrimary.withValues(alpha: 0.08)
+                : null,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                disabled
+                    ? Icons.lock_outline
+                    : (isSelected
+                        ? Icons.check_box
+                        : Icons.check_box_outline_blank),
+                size: 18,
+                color: disabled
+                    ? AppTheme.textMuted
+                    : (isSelected
+                        ? AppTheme.simplePrimary
+                        : AppTheme.textMuted),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      displayName,
+                      style: TextStyle(
+                        fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
+                        fontSize: 13,
+                        decoration: disabled ? TextDecoration.lineThrough : null,
+                      ),
+                    ),
+                    Text(
+                      disabled
+                          ? reason
+                          : '${p.formattedSize} • ${p.fsType ?? 'no filesystem'}'
+                              '${p.mountPoint != null ? ' • ${p.mountPoint}' : ''}',
+                      style: const TextStyle(
+                          color: AppTheme.textMuted, fontSize: 11),
+                    ),
+                  ],
+                ),
+              ),
+              Text(
+                p.name,
+                style:
+                    const TextStyle(color: AppTheme.textMuted, fontSize: 11),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
   }
 }

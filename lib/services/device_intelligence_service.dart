@@ -43,12 +43,12 @@ class DeviceIntelligenceService {
     }
 
     try {
-      debugPrint('[DISCOVERY] Running: lsblk -J -b -o NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG,FSTYPE,LABEL,PARTUUID,START,PARTN');
+      debugPrint('[DISCOVERY] Running: lsblk -J -b -o NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG,FSTYPE,LABEL,PARTUUID,START,PARTN,DISC-MAX,PTTYPE');
       final result = await Process.run('lsblk', [
         '-J',
         '-b',
         '-o',
-        'NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG,FSTYPE,LABEL,PARTUUID,START,PARTN'
+        'NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG,FSTYPE,LABEL,PARTUUID,START,PARTN,DISC-MAX,PTTYPE'
       ]);
 
       if (result.exitCode != 0) {
@@ -104,6 +104,11 @@ class DeviceIntelligenceService {
       
       final isRm = dev['rm'] == true || dev['rm'] == 1 || dev['rm'] == '1';
       final isHotplug = dev['hotplug'] == true || dev['hotplug'] == 1 || dev['hotplug'] == '1';
+
+      // A1: kernel discard/TRIM support (lsblk DISC-MAX in bytes; 0 = none).
+      final discMax = (dev['disc-max'] as num?)?.toInt();
+      // A2: partition table type (lsblk PTTYPE: "gpt", "dos", "none", ...).
+      final ptType = (dev['pttype'] as String?)?.trim();
       
       // Filesystem and Partition detection
       final mainFsType = (dev['fstype'] as String?)?.trim();
@@ -229,7 +234,9 @@ class DeviceIntelligenceService {
           supportsAtaSanitize: mediaType == MediaType.sataSsd,
           supportsNvmeSanitize: mediaType == MediaType.nvmeSsd,
           supportsEmmcSanitize: mediaType == MediaType.emmc,
-          supportsTrim: mediaType != MediaType.hdd,
+          // A1: prefer the kernel's real discard capability (DISC-MAX);
+          // fall back to the media heuristic when lsblk lacks the column.
+          supportsTrim: discMax != null ? discMax > 0 : mediaType != MediaType.hdd,
           hpaDcoPresent: false,
           mountPoint: systemMountPoint ?? mainMountPoint,
           isSystemDisk: isSys,
@@ -240,6 +247,7 @@ class DeviceIntelligenceService {
           disabledReason: unsupportedReason,
           partitions: childPartitions,
           partitionTableFingerprint: tableFingerprint,
+          partitionTableType: (ptType != null && ptType.isNotEmpty && ptType != 'none') ? ptType : null,
           notes: isWipedNoFilesystem
               ? 'SANITIZED / NO FILESYSTEM (Raw Block Device)'
               : (isLiveMedia

@@ -2,8 +2,10 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../models/device_profile.dart';
+import '../models/partition_info.dart';
 import '../models/sanitization_job.dart';
 import '../models/sanitization_support_level.dart';
+import '../services/classification_service.dart';
 import '../services/sanitization_controller.dart';
 import '../widgets/theme.dart';
 
@@ -85,45 +87,65 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
   final TextEditingController _serialController = TextEditingController();
   bool _isMatch = false;
 
-  String get _expectedToken {
+  /// Normalization applied to both the typed input and the expected token:
+  /// case-insensitive, whitespace-insensitive.
+  String _normalize(String value) =>
+      value.trim().toLowerCase().replaceAll(RegExp(r'\s+'), '');
+
+  /// Last 4 characters of the serial, or '' when the device has no usable
+  /// serial (empty or the generic 'S/N-…' placeholder from enumeration).
+  String get _serialToken {
     final serial = widget.device.serialNumber.trim();
     if (serial.isNotEmpty && !serial.startsWith('S/N-')) {
       return serial.length >= 4 ? serial.substring(serial.length - 4) : serial;
     }
-    // Fallback: device path + size
     return '';
   }
 
-  bool get _useFallbackMatch => _expectedToken.isEmpty;
+  bool get _useFallbackMatch => _serialToken.isEmpty;
+
+  /// A5: partitions selected for a partition-scope wipe (empty = whole device).
+  List<PartitionInfo> get _scopePartitions =>
+      context.read<SanitizationController>().selectedPartitions;
+
+  /// A5: internal disks require the serial last-4 PLUS the partition name(s)
+  /// so the operator cannot authorize a partition wipe by rote muscle memory.
+  bool get _requiresPartitionToken =>
+      !widget.device.isRemovable && _scopePartitions.isNotEmpty;
+
+  /// A5: serial-less fallback token = device model + size (documented in the
+  /// prompt so the operator knows exactly what to type).
+  String get _fallbackToken =>
+      _normalize('${widget.device.name} ${widget.device.capacityBytes}');
+
+  /// The exact token the operator must type to enable the wipe button.
+  String get _expectedTypedConfirmation {
+    if (_useFallbackMatch) return _fallbackToken;
+    if (_requiresPartitionToken) {
+      final names = _scopePartitions.map((p) => p.name).join(' ');
+      return _normalize('$_serialToken $names');
+    }
+    return _normalize(_serialToken);
+  }
 
   bool _checkAmbiguousFallback(SanitizationController controller) {
     if (!_useFallbackMatch) return false;
-    final targetKey = '${widget.device.id}${widget.device.capacityBytes}'.toLowerCase().replaceAll(RegExp(r'\s+'), '');
+    final targetKey = _fallbackToken;
     final matchingDrives = controller.devices.where((d) {
-      final key = '${d.id}${d.capacityBytes}'.toLowerCase().replaceAll(RegExp(r'\s+'), '');
+      final key = _normalize('${d.name} ${d.capacityBytes}');
       return key == targetKey;
     }).toList();
     return matchingDrives.length > 1;
   }
 
   void _onTextChanged() {
-    final input = _serialController.text.trim().toLowerCase().replaceAll(RegExp(r'\s+'), '');
     final controller = context.read<SanitizationController>();
     if (_checkAmbiguousFallback(controller)) {
       setState(() => _isMatch = false);
       return;
     }
-
-    if (_useFallbackMatch) {
-      // Match device path + formatted size
-      final expected = '${widget.device.id}${widget.device.capacityBytes}'
-          .toLowerCase()
-          .replaceAll(RegExp(r'\s+'), '');
-      setState(() => _isMatch = input == expected);
-    } else {
-      final expected = _expectedToken.toLowerCase().replaceAll(RegExp(r'\s+'), '');
-      setState(() => _isMatch = input == expected);
-    }
+    setState(() =>
+        _isMatch = _normalize(_serialController.text) == _expectedTypedConfirmation);
   }
 
   @override
@@ -144,6 +166,8 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
     final controller = context.watch<SanitizationController>();
     final isSimulated = !controller.isRealMode;
     final hasAmbiguousFallback = _checkAmbiguousFallback(controller);
+    // A5: what exactly gets wiped — selected partitions, or the whole device.
+    final selectedParts = controller.selectedPartitions;
     final rec = controller.getAutoMethod(widget.device, _intent);
     final method = rec.method;
     final supportLevel = computeSupportLevel(widget.device);
@@ -262,6 +286,18 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
               _infoRow('Serial:', widget.device.serialNumber),
               const SizedBox(height: 4),
               _infoRow('Method:', _methodDisplayText(method, isDestroyRecommended)),
+              const SizedBox(height: 4),
+              // A5: exact scope (partitions + sizes) and the level it yields.
+              _infoRow(
+                'Scope:',
+                selectedParts.isEmpty
+                    ? 'Entire device (${widget.device.formattedCapacity})'
+                    : selectedParts
+                        .map((p) => '${p.name} (${p.formattedSize})')
+                        .join(', '),
+              ),
+              const SizedBox(height: 4),
+              _infoRow('Level:', _levelText(supportLevel, selectedParts.isEmpty)),
               const SizedBox(height: 4),
               _infoRow('Est. Duration:', _estimateDisplayText(widget.device, method)),
               if (widget.device.driveType == DriveType.usb ||
@@ -437,8 +473,12 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
               // Serial confirmation
               Text(
                 _useFallbackMatch
-                    ? 'Type device path and size to confirm (${widget.device.id} ${widget.device.capacityBytes}):'
-                    : 'Type the last 4 characters of the serial to confirm:',
+                    ? 'Type device model and size to confirm '
+                        '(${widget.device.name} ${widget.device.capacityBytes}):'
+                    : _requiresPartitionToken
+                        ? 'Type the last 4 characters of the serial followed by '
+                            'the partition name(s) to confirm:'
+                        : 'Type the last 4 characters of the serial to confirm:',
                 style: const TextStyle(fontSize: 12, color: AppTheme.textSecondary),
               ),
               const SizedBox(height: 8),
@@ -451,7 +491,11 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                   fontWeight: FontWeight.bold,
                 ),
                 decoration: InputDecoration(
-                  hintText: _useFallbackMatch ? '${widget.device.id}${widget.device.capacityBytes}' : '****',
+                  hintText: _useFallbackMatch
+                      ? '${widget.device.name}${widget.device.capacityBytes}'
+                      : _requiresPartitionToken
+                          ? '$_serialToken ${_scopePartitions.map((p) => p.name).join(' ')}'
+                          : '****',
                   hintStyle: TextStyle(
                     color: AppTheme.textMuted.withValues(alpha: 0.5),
                     fontWeight: FontWeight.normal,
@@ -553,6 +597,25 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
   String _methodDisplayText(SanitizationMethod method, bool isDestroy) {
     if (isDestroy) return 'Physical destruction recommended';
     return '${method.displayName} (auto)';
+  }
+
+  /// A5: NIST SP 800-88 level this wipe will actually achieve.
+  /// Partition scope, unsupported media and clear-only media cap at Clear;
+  /// whole-device wipes on hardware-command-capable devices reach Purge.
+  String _levelText(SanitizationSupportLevel supportLevel, bool wholeDevice) {
+    if (supportLevel == SanitizationSupportLevel.unsupported) {
+      return 'Clear at best — purge not supported by this device';
+    }
+    if (supportLevel == SanitizationSupportLevel.clearOnly) {
+      return 'Clear — purge not achievable on this media';
+    }
+    final level = ClassificationService()
+        .capabilityMatrix(widget.device)
+        .sanitizationLevel(wholeDevice: wholeDevice);
+    if (level == 'Purge') return 'Purge (NIST SP 800-88 Rev. 1)';
+    return wholeDevice
+        ? 'Clear (NIST SP 800-88 Rev. 1) — no hardware purge command available'
+        : 'Clear (NIST SP 800-88 Rev. 1) — partition scope never reaches Purge';
   }
 
   String _estimateDisplayText(DeviceProfile device, SanitizationMethod method) {

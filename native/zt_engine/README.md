@@ -11,7 +11,10 @@ This Rust crate is the execution core of Zero Trace 2.0. It provides:
 | `detect.rs` | CLI-based device capability probing (smartctl, hdparm, nvme, sedutil-cli, mmc) |
 | `execute.rs` | Firmware/software sanitize command execution with dry-run & safety guardrails |
 | `verify.rs` | Post-sanitization O_DIRECT LBA sector sampling with SHA-256 fingerprinting |
-| `certificate.rs` | HMAC-SHA256 and Ed25519 certificate signing with key persistence |
+
+Certificate signing is **not** part of this engine: the Flutter application signs
+audit certificates with its own local **ECDSA P-256 / SHA-256** keypair (see the
+root `README.md`).
 
 ## Required Linux Packages
 
@@ -66,20 +69,3 @@ The execution engine has multiple layers of protection:
 | TCG OPAL Cryptographic Erase | `sedutil-cli --revertTPer` | Self-Encrypting Drives |
 | eMMC Sanitize | `mmc sanitize` | eMMC embedded flash |
 | Software Overwrite (1-pass/3-pass/DoD) | Native direct-I/O writer | All block devices |
-
-## Certificate Signing (`certificate.rs`)
-
-`certificate.rs` implements HMAC-SHA256 and Ed25519 signing with key
-persistence, and is unit-tested. Note that the Flutter application signs its
-audit certificates with its own local **ECDSA P-256 / SHA-256** keypair (see the
-root `README.md`); this Rust module is not currently wired into the app's
-certificate flow.
-
-## Ed25519 Key Storage
-
-On first certificate signing with Ed25519, a keypair is generated and stored at:
-```
-~/.zero_trace/keys/ed25519.key    (permissions: 0600)
-```
-
-The public key is embedded in every signed certificate for independent third-party verification.

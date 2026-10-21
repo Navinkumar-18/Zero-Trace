@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
 import 'package:zero_trace/models/device_profile.dart';
+import 'package:zero_trace/models/partition_info.dart';
+import 'package:zero_trace/models/untrusted_text.dart';
 import 'package:zero_trace/services/sanitization_controller.dart';
 import 'package:zero_trace/simple/confirm_wipe_dialog.dart';
 
@@ -124,21 +126,21 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    // Prompts for device path and size
-    expect(find.textContaining('Type device path and size to confirm'), findsOneWidget);
+    // Prompts for device model and size
+    expect(find.textContaining('Type device model and size to confirm'), findsOneWidget);
 
     final wipeButtonFinder = find.widgetWithText(ElevatedButton, 'SECURE WIPE');
     expect(tester.widget<ElevatedButton>(wipeButtonFinder).onPressed, isNull);
 
-    // Enter matching fallback token: 'sdb 8000000000'
+    // Enter matching fallback token: model + size ('Generic Flash Disk 8000000000')
     final textFieldFinder = find.byType(TextField);
-    await tester.enterText(textFieldFinder, 'sdb 8000000000');
+    await tester.enterText(textFieldFinder, 'Generic Flash Disk 8000000000');
     await tester.pumpAndSettle();
 
     expect(tester.widget<ElevatedButton>(wipeButtonFinder).onPressed, isNotNull);
   });
 
-  testWidgets('Fallback confirmation match blocks wipe when two drives share device path and size', (tester) async {
+  testWidgets('Fallback confirmation match blocks wipe when two drives share model and size', (tester) async {
     tester.view.physicalSize = const Size(1920, 1080);
     tester.view.devicePixelRatio = 1.0;
     addTearDown(() {
@@ -148,7 +150,7 @@ void main() {
 
     const driveA = DeviceProfile(
       id: 'sdb',
-      name: 'Drive A',
+      name: 'Generic Flash Disk',
       serialNumber: 'S/N-sdb',
       mediaType: MediaType.usbFlash,
       busType: 'USB',
@@ -157,8 +159,8 @@ void main() {
     );
 
     const driveB = DeviceProfile(
-      id: 'sdb',
-      name: 'Drive B',
+      id: 'sdc',
+      name: 'Generic Flash Disk',
       serialNumber: 'S/N-sdb-dup',
       mediaType: MediaType.usbFlash,
       busType: 'USB',
@@ -188,7 +190,7 @@ void main() {
 
     // Even if user types exact fallback match, button MUST remain disabled
     final textFieldFinder = find.byType(TextField);
-    await tester.enterText(textFieldFinder, 'sdb 8000000000');
+    await tester.enterText(textFieldFinder, 'Generic Flash Disk 8000000000');
     await tester.pumpAndSettle();
 
     final wipeButtonFinder = find.widgetWithText(ElevatedButton, 'SECURE WIPE');
@@ -368,6 +370,107 @@ void main() {
 
     // Verify SIMULATION banner in confirm dialog
     expect(find.text('SIMULATION MODE — Virtual Wipe'), findsOneWidget);
+  });
+
+  group('A5 confirmation hardening', () {
+    const partition = PartitionInfo(
+      partitionNumber: 1,
+      name: 'sda1',
+      devicePath: '/dev/sda1',
+      startSector: 2048,
+      sizeSectors: 1000000,
+      sizeBytes: 512000000,
+      label: UntrustedText('DATA'),
+      fsType: 'ext4',
+    );
+
+    const internalDisk = DeviceProfile(
+      id: 'sda',
+      name: 'Internal SATA SSD',
+      serialNumber: 'ABCDEF123456', // last-4: 3456
+      mediaType: MediaType.sataSsd,
+      busType: 'SATA',
+      capacityBytes: 512000000000,
+      isRemovable: false,
+      supportsAtaSanitize: true, // support level = full
+      partitions: [partition],
+    );
+
+    Future<SanitizationController> pumpDialog(WidgetTester tester) async {
+      tester.view.physicalSize = const Size(1920, 1080);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      final controller = SanitizationController(
+        enableAutoPolling: false,
+        deferInitialDiscovery: true,
+      );
+      addTearDown(() => controller.dispose());
+      controller.setMockDevices([internalDisk]);
+      controller.togglePartitionSelection(partition);
+
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SanitizationController>.value(
+          value: controller,
+          child: const MaterialApp(
+            home: Scaffold(
+              body: SimpleConfirmDialog(device: internalDisk),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      return controller;
+    }
+
+    testWidgets(
+        'internal disk partition wipe requires serial last-4 PLUS partition name',
+        (tester) async {
+      await pumpDialog(tester);
+
+      // Scope row shows the exact partition + size; partition scope caps at Clear.
+      expect(find.textContaining('sda1 ('), findsOneWidget);
+      expect(
+          find.textContaining('partition scope never reaches Purge'), findsOneWidget);
+
+      // Prompt demands serial last-4 followed by partition name(s).
+      expect(
+          find.textContaining('followed by the partition name(s)'), findsOneWidget);
+
+      final wipeButtonFinder = find.widgetWithText(ElevatedButton, 'SECURE WIPE');
+      expect(tester.widget<ElevatedButton>(wipeButtonFinder).onPressed, isNull);
+
+      // Serial last-4 alone is NOT enough when a partition is selected.
+      await tester.enterText(find.byType(TextField), '3456');
+      await tester.pumpAndSettle();
+      expect(tester.widget<ElevatedButton>(wipeButtonFinder).onPressed, isNull);
+
+      // Serial last-4 + partition name enables the wipe.
+      await tester.enterText(find.byType(TextField), '3456sda1');
+      await tester.pumpAndSettle();
+      expect(tester.widget<ElevatedButton>(wipeButtonFinder).onPressed, isNotNull);
+    });
+
+    testWidgets('internal disk whole-device wipe only needs serial last-4',
+        (tester) async {
+      final controller = await pumpDialog(tester);
+
+      // Back to whole-device scope: deselect the partition.
+      controller.clearPartitionSelection();
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('Entire device ('), findsOneWidget);
+      expect(find.textContaining('Type the last 4 characters of the serial'),
+          findsOneWidget);
+
+      final wipeButtonFinder = find.widgetWithText(ElevatedButton, 'SECURE WIPE');
+      await tester.enterText(find.byType(TextField), '3456');
+      await tester.pumpAndSettle();
+      expect(tester.widget<ElevatedButton>(wipeButtonFinder).onPressed, isNotNull);
+    });
   });
 }
 

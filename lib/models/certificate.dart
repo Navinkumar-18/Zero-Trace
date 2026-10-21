@@ -81,6 +81,14 @@ class SanitizationCertificate {
   final int? bytesOverwritten;
   final int? totalDeviceBytes;
 
+  /// A7 (v4): NIST SP 800-88 level this wipe actually achieved
+  /// ("Clear", "Purge", "Failed").
+  final String? sanitizationLevel;
+
+  /// A7 (v4): ordered steps actually executed during the wipe (engine command
+  /// log in real mode, timestamped job log in simulated mode).
+  final List<String>? stepsExecuted;
+
   SanitizationCertificate({
     this.certVersion = 2,
     required this.certificateId,
@@ -113,6 +121,8 @@ class SanitizationCertificate {
     this.partitionsWiped,
     this.bytesOverwritten,
     this.totalDeviceBytes,
+    this.sanitizationLevel,
+    this.stepsExecuted,
   }) : simulationDisclaimer = simulationDisclaimer ??
             (executionMode == 'simulated'
                 ? 'SIMULATED, not a valid sanitization record'
@@ -133,7 +143,9 @@ class SanitizationCertificate {
             verifiedPassed: json['result'] == 'SUCCESS',
           );
 
-    final rawWiped = json['partitionsWiped'] as List<dynamic>?;
+    // v4 stores partitions under 'partitions'; v3 under 'partitionsWiped'.
+    final rawWiped = (json['partitions'] as List<dynamic>?) ??
+        (json['partitionsWiped'] as List<dynamic>?);
     final partitionsWiped = rawWiped?.map((e) => Map<String, dynamic>.from(e as Map)).toList();
 
     return SanitizationCertificate(
@@ -177,6 +189,10 @@ class SanitizationCertificate {
       partitionsWiped: partitionsWiped,
       bytesOverwritten: (json['bytesOverwritten'] as num?)?.toInt(),
       totalDeviceBytes: (json['totalDeviceBytes'] as num?)?.toInt(),
+      sanitizationLevel: json['sanitizationLevel'] as String?,
+      stepsExecuted: (json['stepsExecuted'] as List<dynamic>?)
+          ?.map((e) => e.toString())
+          .toList(),
     );
   }
 
@@ -202,11 +218,16 @@ class SanitizationCertificate {
           'verificationSampleCount': verificationSampleCount,
         if (verificationEntropyScore != null)
           'verificationEntropyScore': verificationEntropyScore,
-        if (certVersion == 3 && scope != null) 'scope': scope,
-        if (certVersion == 3 && limitation != null) 'limitation': limitation,
+        if (certVersion >= 3 && scope != null) 'scope': scope,
+        if (certVersion >= 3 && limitation != null) 'limitation': limitation,
+        // v3 serialized partitions under 'partitionsWiped'; v4 uses 'partitions'.
         if (certVersion == 3 && partitionsWiped != null) 'partitionsWiped': partitionsWiped,
-        if (certVersion == 3 && bytesOverwritten != null) 'bytesOverwritten': bytesOverwritten,
-        if (certVersion == 3 && totalDeviceBytes != null) 'totalDeviceBytes': totalDeviceBytes,
+        if (certVersion >= 4 && partitionsWiped != null) 'partitions': partitionsWiped,
+        if (certVersion >= 3 && bytesOverwritten != null) 'bytesOverwritten': bytesOverwritten,
+        if (certVersion >= 3 && totalDeviceBytes != null) 'totalDeviceBytes': totalDeviceBytes,
+        if (certVersion >= 4 && sanitizationLevel != null)
+          'sanitizationLevel': sanitizationLevel,
+        if (certVersion >= 4 && stepsExecuted != null) 'stepsExecuted': stepsExecuted,
         'startTime': startTime.toIso8601String(),
         'endTime': endTime.toIso8601String(),
         'timestamp': endTime.toIso8601String(),

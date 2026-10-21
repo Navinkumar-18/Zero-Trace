@@ -3,9 +3,10 @@ use std::path::Path;
 use std::process;
 use tokio::sync::mpsc;
 use zt_engine::execute::{
-    ata_sanitize, ata_secure_erase, emmc_sanitize, nvme_sanitize, opal_revert, software_overwrite,
-    software_overwrite_partition, AtaSanitizeAction, EngineMethod, OverwritePattern, PartitionTargetParams,
-    ProgressEvent, SanitizeAction,
+    ata_sanitize, ata_secure_erase, discard_erase, discard_erase_partition, emmc_sanitize,
+    nvme_sanitize, opal_revert, software_overwrite, software_overwrite_partition,
+    AtaSanitizeAction, EngineMethod, OverwritePattern, PartitionTargetParams, ProgressEvent,
+    SanitizeAction,
 };
 use zt_engine::verify::{verify_device, verify_device_scoped};
 use zt_engine::detect::probe_device;
@@ -36,7 +37,7 @@ async fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: zt_engine <subcommand> [args]");
-        eprintln!("Subcommands: sanitize, verify, detect");
+        eprintln!("Subcommands: sanitize, verify, detect, partitions");
         process::exit(1);
     }
 
@@ -98,7 +99,7 @@ async fn main() {
                 // Fail-closed: partition mode requires allowlisted method
                 if !engine_method.is_allowed_in_partition_mode() {
                     eprintln!(
-                        "Refusing operation: method '{}' is not allowed in partition mode. Partition mode only allows overwrite methods (overwrite-zero, overwrite-random, overwrite-3pass)",
+                        "Refusing operation: method '{}' is not allowed in partition mode. Partition mode only allows overwrite methods (overwrite-zero, overwrite-random, overwrite-3pass) and discard",
                         engine_method.as_str()
                     );
                     process::exit(1);
@@ -136,14 +137,22 @@ async fn main() {
                     expected_table_fingerprint: table_fingerprint.unwrap(),
                 };
 
-                let (pattern, passes) = match engine_method {
-                    EngineMethod::OverwriteZero => (OverwritePattern::Zeros, 1u8),
-                    EngineMethod::OverwriteRandom => (OverwritePattern::Random, 1u8),
-                    EngineMethod::Overwrite3Pass => (OverwritePattern::MultiPass3, 3u8),
-                    _ => unreachable!(),
-                };
+                match engine_method {
+                    // A6: discard targets the partition range natively — no overwrite pattern.
+                    EngineMethod::Discard => {
+                        discard_erase_partition(device, token, serial, &params, dry_run, tx).await
+                    }
+                    _ => {
+                        let (pattern, passes) = match engine_method {
+                            EngineMethod::OverwriteZero => (OverwritePattern::Zeros, 1u8),
+                            EngineMethod::OverwriteRandom => (OverwritePattern::Random, 1u8),
+                            EngineMethod::Overwrite3Pass => (OverwritePattern::MultiPass3, 3u8),
+                            _ => unreachable!(),
+                        };
 
-                software_overwrite_partition(device, passes, pattern, token, serial, &params, dry_run, tx).await
+                        software_overwrite_partition(device, passes, pattern, token, serial, &params, dry_run, tx).await
+                    }
+                }
             } else {
                 match engine_method {
                     EngineMethod::AtaSecureErase => {
@@ -169,6 +178,10 @@ async fn main() {
                     }
                     EngineMethod::EmmcSanitize => {
                         emmc_sanitize(device, token, serial, dry_run, tx).await
+                    }
+                    // A6: removable-media discard (whole device)
+                    EngineMethod::Discard => {
+                        discard_erase(device, token, serial, dry_run, tx).await
                     }
                     EngineMethod::OverwriteZero => {
                         software_overwrite(device, 1, OverwritePattern::Zeros, token, serial, dry_run, tx).await
@@ -260,6 +273,25 @@ async fn main() {
             let capabilities = probe_device(device);
             if let Ok(json) = serde_json::to_string(&capabilities) {
                 println!("DETECT_REPORT:{}", json);
+            }
+        }
+        "partitions" => {
+            // Usage: zt_engine partitions <disk>  (A2 enumeration)
+            if args.len() < 3 {
+                eprintln!("Usage: zt_engine partitions <disk>");
+                process::exit(1);
+            }
+            let disk = &args[2];
+            match zt_engine::partitions::enumerate_partitions_ctx(disk, &zt_engine::execute::FsContext::default()) {
+                Ok(report) => {
+                    if let Ok(json) = serde_json::to_string(&report) {
+                        println!("PARTITIONS_REPORT:{}", json);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error enumerating partitions: {}", e);
+                    process::exit(1);
+                }
             }
         }
         _ => {

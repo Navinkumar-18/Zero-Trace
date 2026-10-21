@@ -83,6 +83,15 @@ class PartitionInfo {
     );
   }
 
+  /// A3: mount points that make a partition a system partition.
+  static const Set<String> systemMountPoints = {
+    '/', '/boot', '/boot/efi', '/usr', '/var', '/home',
+  };
+
+  /// Whether this partition holds a system path (/, /boot, /usr, ...).
+  bool get isSystemPartition =>
+      mountPoint != null && systemMountPoints.contains(mountPoint);
+
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||

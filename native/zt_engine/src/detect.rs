@@ -52,6 +52,47 @@ pub enum DurationClass {
     Unknown,
 }
 
+/// Coarse device-class classification used for the capability matrix (A1).
+///
+/// `Sd` covers removable SD/MMC cards (`mmcblk*` with `removable=1`);
+/// `Emmc` covers soldered-down eMMC; `UsbFlash` covers USB flash drives and
+/// USB-attached HDD/SSD enclosures (bus-level classification only — the
+/// bridge chip hides the real media).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum DeviceClass {
+    Hdd,
+    SataSsd,
+    NvMe,
+    Sd,
+    Emmc,
+    UsbFlash,
+    #[default]
+    Unknown,
+}
+
+impl DeviceClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DeviceClass::Hdd => "hdd",
+            DeviceClass::SataSsd => "sata_ssd",
+            DeviceClass::NvMe => "nvme",
+            DeviceClass::Sd => "sd",
+            DeviceClass::Emmc => "emmc",
+            DeviceClass::UsbFlash => "usb_flash",
+            DeviceClass::Unknown => "unknown",
+        }
+    }
+
+    /// Sanitization scope level (NIST SP 800-88 terms) for this class:
+    /// flash-based classes cannot be assumed to honour overwrite commands.
+    pub fn is_flash(&self) -> bool {
+        matches!(
+            self,
+            DeviceClass::NvMe | DeviceClass::Sd | DeviceClass::Emmc | DeviceClass::UsbFlash
+        )
+    }
+}
+
 /// Strongly typed device capabilities gathered from real hardware probing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceCapabilities {
@@ -98,6 +139,19 @@ pub struct DeviceCapabilities {
     #[serde(default)]
     pub is_usb_2: bool,
 
+    // A1: capability matrix
+    #[serde(default)]
+    pub device_class: DeviceClass,
+    /// Kernel advertises discard/TRIM (`queue/discard_max_bytes > 0`).
+    #[serde(default)]
+    pub supports_discard: bool,
+    /// NVMe Format NVM command (id-ctrl ONCS bit 1).
+    #[serde(default)]
+    pub supports_nvme_format: bool,
+    /// Removability as reported by sysfs (`/sys/class/block/<dev>/removable`).
+    #[serde(default)]
+    pub is_removable: bool,
+
     // Meta
     pub estimated_duration_class: DurationClass,
     pub probe_errors: Vec<String>,
@@ -133,8 +187,41 @@ impl DeviceCapabilities {
             emmc_sanitize_supported: false,
             usb_speed_mbps: None,
             is_usb_2: false,
+            device_class: DeviceClass::Unknown,
+            supports_discard: false,
+            supports_nvme_format: false,
+            is_removable: false,
             estimated_duration_class: DurationClass::Unknown,
             probe_errors: Vec::new(),
+        }
+    }
+
+    /// A1: hardware secure-erase family (ATA Security erase, NVMe crypto
+    /// erase, TCG OPAL revert). Only meaningful at whole-device scope.
+    pub fn supports_secure_erase(&self) -> bool {
+        (self.ata_security_supported && !self.ata_security_locked)
+            || self.nvme_sanitize_crypto_erase
+            || self.opal_supported
+    }
+
+    /// A1: firmware sanitize family (ATA Sanitize, NVMe Sanitize, eMMC Sanitize).
+    pub fn supports_sanitize(&self) -> bool {
+        self.ata_sanitize_supported || self.nvme_sanitize_supported || self.emmc_sanitize_supported
+    }
+
+    /// A1: sanitization level for (device class, scope).
+    ///
+    /// "Purge" only when the operation covers the WHOLE device AND the device
+    /// supports a hardware command that reaches beyond the user-addressable
+    /// area (per NIST SP 800-88 Rev. 1). Everything else is "Clear".
+    pub fn sanitization_level(&self, whole_device: bool) -> &'static str {
+        let hw_supported = self.supports_secure_erase()
+            || self.supports_sanitize()
+            || self.supports_nvme_format;
+        if whole_device && hw_supported {
+            "Purge"
+        } else {
+            "Clear"
         }
     }
 }
@@ -174,6 +261,8 @@ pub struct NvmeIdData {
     pub sanitize_supported: bool,
     pub crypto_erase_supported: bool,
     pub block_erase_supported: bool,
+    /// ONCS bit 1: Format NVM supported.
+    pub format_supported: bool,
 }
 
 #[derive(Debug, Default)]
@@ -369,6 +458,12 @@ pub fn parse_hdparm_output(stdout: &str) -> HdparmData {
 pub fn parse_nvme_id_ctrl(stdout: &str) -> NvmeIdData {
     let mut data = NvmeIdData::default();
 
+    // Parse an ONCS bitmask: bit 0 = Security Commands, bit 1 = Format NVM,
+    // bit 2 = Firmware Activate, ...
+    let mut apply_oncs = |val: u32| {
+        data.format_supported = (val & 0x2) != 0;
+    };
+
     // Look for "sanicap" field (Sanitize Capabilities)
     // sanicap  : 0x3
     //   Bit 0 = Crypto Erase supported
@@ -395,6 +490,18 @@ pub fn parse_nvme_id_ctrl(stdout: &str) -> NvmeIdData {
                 }
             }
         }
+
+        // oncs  : 0x44
+        if trimmed.starts_with("oncs") {
+            if let Some(val_str) = trimmed.split(':').nth(1) {
+                let val_str = val_str.trim().trim_start_matches("0x");
+                if let Ok(val) = u32::from_str_radix(val_str, 16) {
+                    apply_oncs(val);
+                } else if let Ok(val) = val_str.parse::<u32>() {
+                    apply_oncs(val);
+                }
+            }
+        }
     }
 
     // Alternative: JSON format from nvme id-ctrl --output-format=json
@@ -403,6 +510,9 @@ pub fn parse_nvme_id_ctrl(stdout: &str) -> NvmeIdData {
             data.sanitize_supported = sanicap > 0;
             data.crypto_erase_supported = (sanicap & 0x1) != 0;
             data.block_erase_supported = (sanicap & 0x2) != 0;
+        }
+        if let Some(oncs) = parsed.get("oncs").and_then(|v| v.as_u64()) {
+            apply_oncs(oncs as u32);
         }
     }
 
@@ -575,6 +685,7 @@ pub fn probe_device(device_path: &str) -> DeviceCapabilities {
                 caps.nvme_sanitize_supported = nvme.sanitize_supported;
                 caps.nvme_sanitize_crypto_erase = nvme.crypto_erase_supported;
                 caps.nvme_sanitize_block_erase = nvme.block_erase_supported;
+                caps.supports_nvme_format = nvme.format_supported;
 
                 // NVMe sanitize is typically fast
                 caps.estimated_duration_class = DurationClass::Minutes;
@@ -618,6 +729,12 @@ pub fn probe_device(device_path: &str) -> DeviceCapabilities {
         }
     }
 
+    // 7. A1: capability matrix via sysfs (discard support, rotation, removable)
+    caps.supports_discard = detect_discard_support(device_path, "/sys");
+    let (rotational, removable) = detect_rotation_and_removable(device_path, "/sys");
+    caps.is_removable = removable.unwrap_or(false);
+    caps.device_class = classify_device_class(device_path, &caps.bus_type, rotational, removable);
+
     caps
 }
 
@@ -641,6 +758,79 @@ pub fn detect_usb_speed(device_path: &str, sys_root: &str) -> (Option<u32>, bool
         }
     }
     (None, false)
+}
+
+/// A1: read a single sysfs attribute for a block device (partition nodes
+/// inherit the parent disk's queue settings, so this works for both).
+fn read_sysfs_attr(device_path: &str, sys_root: &str, attr: &str) -> Option<String> {
+    let dev_name = device_path.rsplit('/').next().unwrap_or(device_path);
+    let path = Path::new(sys_root)
+        .join("class/block")
+        .join(dev_name)
+        .join(attr);
+    fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+}
+
+/// A1: does the kernel advertise discard/TRIM for this device?
+/// True when `queue/discard_max_bytes > 0`.
+pub fn detect_discard_support(device_path: &str, sys_root: &str) -> bool {
+    read_sysfs_attr(device_path, sys_root, "queue/discard_max_bytes")
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v > 0)
+        .unwrap_or(false)
+}
+
+/// A1: sysfs rotatation + removability flags (None when sysfs is unavailable).
+pub fn detect_rotation_and_removable(device_path: &str, sys_root: &str) -> (Option<bool>, Option<bool>) {
+    let rotational = read_sysfs_attr(device_path, sys_root, "queue/rotational")
+        .and_then(|v| v.parse::<u8>().ok())
+        .map(|v| v == 1);
+    let removable = read_sysfs_attr(device_path, sys_root, "removable")
+        .and_then(|v| v.parse::<u8>().ok())
+        .map(|v| v == 1);
+    (rotational, removable)
+}
+
+/// A1: classify a device into the capability-matrix device class.
+///
+/// `bus_type`/`device_path` are the probe's view; `rotational` and `removable`
+/// come from sysfs (None when unknown, e.g. fixture/test contexts).
+pub fn classify_device_class(
+    device_path: &str,
+    bus_type: &BusType,
+    rotational: Option<bool>,
+    removable: Option<bool>,
+) -> DeviceClass {
+    let name = device_path.rsplit('/').next().unwrap_or(device_path);
+
+    if *bus_type == BusType::NVMe || name.starts_with("nvme") {
+        return DeviceClass::NvMe;
+    }
+    if name.starts_with("mmcblk") {
+        return match removable {
+            Some(true) => DeviceClass::Sd,
+            Some(false) => DeviceClass::Emmc,
+            // No sysfs: bare `mmcblk` without bus info stays unknown-classified.
+            None => DeviceClass::Unknown,
+        };
+    }
+    if *bus_type == BusType::USB {
+        return DeviceClass::UsbFlash;
+    }
+    if *bus_type == BusType::SATA || name.starts_with("sd") || name.starts_with("hd") {
+        if rotational == Some(true) {
+            return DeviceClass::Hdd;
+        }
+        if rotational == Some(false) {
+            return DeviceClass::SataSsd;
+        }
+        // SATA bus without rotation info: treat as SSD-class (most common case),
+        // but only when the bus is positively identified.
+        if *bus_type == BusType::SATA {
+            return DeviceClass::SataSsd;
+        }
+    }
+    DeviceClass::Unknown
 }
 
 #[cfg(test)]
@@ -696,5 +886,94 @@ mod tests {
     fn test_parse_mmc_empty() {
         let data = parse_mmc_extcsd("");
         assert!(!data.sanitize_supported);
+    }
+
+    // ------------------------------------------------------------------
+    // A1: capability matrix
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_nvme_oncs_format_support() {
+        // Text output: ONCS bit 1 set (Format NVM); 0x46 = bits 1, 2, 6
+        let data = parse_nvme_id_ctrl("sanicap : 0x3\noncs   : 0x46\n");
+        assert!(data.sanitize_supported);
+        assert!(data.format_supported, "ONCS bit 1 must enable format support");
+
+        // Text output: ONCS bit 1 clear; 0x44 = bits 2, 6 only
+        let data = parse_nvme_id_ctrl("sanicap : 0x3\noncs   : 0x44\n");
+        assert!(!data.format_supported, "ONCS bit 1 clear must not report format support");
+
+        // JSON output
+        let data = parse_nvme_id_ctrl(r#"{"sanicap": 3, "oncs": 4}"#);
+        assert!(data.sanitize_supported);
+        assert!(!data.format_supported);
+    }
+
+    #[test]
+    fn test_classify_device_class_matrix() {
+        use BusType::*;
+        assert_eq!(classify_device_class("/dev/nvme0n1", &NVMe, None, None), DeviceClass::NvMe);
+        assert_eq!(classify_device_class("/dev/mmcblk0", &EMMC, None, Some(true)), DeviceClass::Sd);
+        assert_eq!(classify_device_class("/dev/mmcblk0", &EMMC, None, Some(false)), DeviceClass::Emmc);
+        assert_eq!(classify_device_class("/dev/sdb", &USB, None, None), DeviceClass::UsbFlash);
+        assert_eq!(classify_device_class("/dev/sda", &SATA, Some(true), Some(false)), DeviceClass::Hdd);
+        assert_eq!(classify_device_class("/dev/sda", &SATA, Some(false), Some(false)), DeviceClass::SataSsd);
+        assert_eq!(classify_device_class("/dev/sda", &SATA, None, Some(false)), DeviceClass::SataSsd);
+        assert_eq!(classify_device_class("/dev/sda", &Unknown, None, None), DeviceClass::Unknown);
+        assert_eq!(classify_device_class("/dev/mapper/foo", &Unknown, None, None), DeviceClass::Unknown);
+    }
+
+    #[test]
+    fn test_sanitization_level_per_class_and_scope() {
+        // Whole-device + hardware command -> Purge
+        let mut caps = DeviceCapabilities::new_unknown("/dev/sda");
+        caps.ata_security_supported = true;
+        assert_eq!(caps.sanitization_level(true), "Purge");
+        // Partition scope (or no hardware support) -> Clear
+        assert_eq!(caps.sanitization_level(false), "Clear");
+
+        let mut nvme = DeviceCapabilities::new_unknown("/dev/nvme0n1");
+        nvme.nvme_sanitize_supported = true;
+        assert_eq!(nvme.sanitization_level(true), "Purge");
+        assert_eq!(nvme.sanitization_level(false), "Clear");
+
+        // Overwrite-only device (no hardware command): always Clear
+        let plain = DeviceCapabilities::new_unknown("/dev/sdb");
+        assert_eq!(plain.sanitization_level(true), "Clear");
+        assert_eq!(plain.sanitization_level(false), "Clear");
+
+        // NVMe Format NVM counts as a hardware command
+        let mut fmt = DeviceCapabilities::new_unknown("/dev/nvme1n1");
+        fmt.supports_nvme_format = true;
+        assert_eq!(fmt.sanitization_level(true), "Purge");
+    }
+
+    #[test]
+    fn test_detect_discard_support_fixture_sysfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let block = tmp.path().join("class/block/sdb/queue");
+        std::fs::create_dir_all(&block).unwrap();
+
+        // No discard_max_bytes yet -> false
+        assert!(!detect_discard_support("/dev/sdb", tmp.path().to_str().unwrap()));
+
+        std::fs::write(block.join("discard_max_bytes"), "33554432\n").unwrap();
+        assert!(detect_discard_support("/dev/sdb", tmp.path().to_str().unwrap()));
+
+        std::fs::write(block.join("discard_max_bytes"), "0\n").unwrap();
+        assert!(!detect_discard_support("/dev/sdb", tmp.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn test_detect_rotation_and_removable_fixture_sysfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let block = tmp.path().join("class/block/mmcblk0");
+        std::fs::create_dir_all(block.join("queue")).unwrap();
+        std::fs::write(block.join("queue/rotational"), "0\n").unwrap();
+        std::fs::write(block.join("removable"), "1\n").unwrap();
+
+        let (rot, rem) = detect_rotation_and_removable("/dev/mmcblk0", tmp.path().to_str().unwrap());
+        assert_eq!(rot, Some(false));
+        assert_eq!(rem, Some(true));
     }
 }

@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
+import 'package:meta/meta.dart';
 import 'package:pdf/pdf.dart';
 import 'package:pdf/widgets.dart' as pw;
 import 'package:pointycastle/export.dart' as pc;
@@ -71,6 +72,10 @@ class CertificateService {
   }
 
   /// Builds the exact map of fields included in the cryptographic signature payload.
+  ///
+  /// A7: v4 adds `sanitizationLevel`, `scope`, the ordered `stepsExecuted`
+  /// list and a `partitions[]` list. v1–v3 payloads are kept byte-for-byte so
+  /// certificates issued by older builds still verify.
   static Map<String, dynamic> buildSigningPayload({
     required int certVersion,
     required String certificateId,
@@ -86,6 +91,8 @@ class CertificateService {
     String? scope,
     String? limitation,
     List<Map<String, dynamic>>? partitionsWiped,
+    String? sanitizationLevel,
+    List<String>? stepsExecuted,
     int? bytesOverwritten,
     int? totalDeviceBytes,
   }) {
@@ -98,6 +105,28 @@ class CertificateService {
         'evidenceHash': evidenceHash,
         'result': result,
         'timestamp': timestamp,
+      };
+    }
+    if (certVersion == 4) {
+      return {
+        'certVersion': 4,
+        'certificateId': certificateId,
+        'jobId': jobId,
+        'deviceSerial': deviceSerial,
+        'method': method,
+        'sanitizationCategory': sanitizationCategory ?? 'Clear',
+        'executionMode': executionMode ?? 'simulated',
+        'sanitizationLevel': sanitizationLevel ?? 'Clear',
+        'scope': scope ?? 'full',
+        'limitation': ?limitation,
+        'partitions': ?partitionsWiped,
+        'stepsExecuted': ?stepsExecuted,
+        'bytesOverwritten': ?bytesOverwritten,
+        'totalDeviceBytes': ?totalDeviceBytes,
+        'evidenceHash': evidenceHash,
+        'result': result,
+        'timestamp': timestamp,
+        'warningLine': ?warningLine,
       };
     }
     if (certVersion == 3) {
@@ -203,7 +232,7 @@ class CertificateService {
     return 'Clear';
   }
 
-  /// Generates a signed SanitizationCertificate (Version 2 by default).
+  /// Generates a signed SanitizationCertificate (A7: payload v4).
   SanitizationCertificate generateCertificate({
     required SanitizationJob job,
     required VerificationEvidence evidence,
@@ -212,6 +241,7 @@ class CertificateService {
     String? sanitizationCategory,
     String? warningLine,
     String? operatorNote,
+    List<String>? stepsExecuted,
     int? verificationSampleCount,
     double? verificationEntropyScore,
   }) {
@@ -250,20 +280,38 @@ class CertificateService {
     final timestampStr = (job.endTime ?? now).toIso8601String();
 
     final bool isPartition = job.isPartitionScope;
-    final int version = isPartition ? 3 : 2;
+    // A7: every newly issued certificate uses payload v4 (scope, partitions[],
+    // ordered steps executed, sanitization level, limitations). Older v1–v3
+    // certificates remain verifiable through buildSigningPayload.
+    const int version = 4;
     final String scope = isPartition ? 'partial' : 'full';
     final String? limitation = isPartition
         ? 'Partition wipe: partition table and unselected sectors are not overwritten'
-        : null;
+        : (category == 'Clear' && _isFlashWithoutPurge(job.device)
+            ? 'Clear only: overwrite cannot reach remapped or over-provisioned flash blocks'
+            : null);
     final List<Map<String, dynamic>>? partitionsWiped = isPartition && job.targetPartition != null
         ? [
             {
+              'name': job.targetPartition!.name,
               'partition_number': job.targetPartition!.partitionNumber,
               'start_sector': job.targetPartition!.startSector,
               'size_bytes': job.targetPartition!.sizeBytes,
             }
           ]
         : null;
+    // NIST SP 800-88 level this wipe actually achieved, derived from the
+    // executed-method category (never from the device's capability alone).
+    final String sanitizationLevel = category == 'Purge'
+        ? 'Purge'
+        : category == 'Failed'
+            ? 'Failed'
+            : 'Clear';
+    // Ordered steps actually executed: the engine command log wins when the
+    // caller passes it; the timestamped job log is the fallback (simulated
+    // mode / engine log unavailable).
+    final List<String>? steps =
+        stepsExecuted ?? (job.logs.isNotEmpty ? List<String>.from(job.logs) : null);
     final int? bytesOverwritten = isPartition ? job.targetPartition?.sizeBytes : null;
     final int totalDeviceBytes = job.device.capacityBytes;
 
@@ -282,6 +330,8 @@ class CertificateService {
       scope: scope,
       limitation: limitation,
       partitionsWiped: partitionsWiped,
+      sanitizationLevel: sanitizationLevel,
+      stepsExecuted: steps,
       bytesOverwritten: bytesOverwritten,
       totalDeviceBytes: totalDeviceBytes,
     );
@@ -318,10 +368,27 @@ class CertificateService {
       scope: scope,
       limitation: limitation,
       partitionsWiped: partitionsWiped,
+      sanitizationLevel: sanitizationLevel,
+      stepsExecuted: steps,
       bytesOverwritten: bytesOverwritten,
       totalDeviceBytes: totalDeviceBytes,
     );
   }
+
+  /// Flash media without any firmware purge capability: software overwrite is
+  /// Clear-only (cannot reach remapped / over-provisioned blocks).
+  static bool _isFlashWithoutPurge(DeviceProfile device) =>
+      device.mediaTechnology == MediaTechnology.flash &&
+      !device.supportsAtaSanitize &&
+      !device.supportsNvmeSanitize &&
+      !device.supportsEmmcSanitize &&
+      !device.supportsAtaSecureErase &&
+      !device.isHardwareEncrypted;
+
+  /// Test-only signing entry point so fixture suites can mint genuine v1–v3
+  /// payload signatures against the active keypair.
+  @visibleForTesting
+  String signPayloadForTesting(String payloadJson) => _signData(payloadJson);
 
   /// Verifies a certificate signature using backward-compatible payload reconstruction.
   bool verifyCertificateSignature(Map<String, dynamic> certJson) {
@@ -337,8 +404,14 @@ class CertificateService {
     final executionMode = certJson['executionMode'] as String? ?? 'simulated';
     final scope = certJson['scope'] as String?;
     final limitation = certJson['limitation'] as String?;
-    final rawWiped = certJson['partitionsWiped'] as List<dynamic>?;
+    // v4 stores partitions under 'partitions'; accept the v3 key as fallback.
+    final rawWiped = ((certVer >= 4
+            ? (certJson['partitions'] ?? certJson['partitionsWiped'])
+            : certJson['partitionsWiped']) as List<dynamic>?);
     final partitionsWiped = rawWiped?.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    final sanitizationLevel = certJson['sanitizationLevel'] as String?;
+    final stepsExecuted =
+        (certJson['stepsExecuted'] as List<dynamic>?)?.map((e) => e.toString()).toList();
     final bytesOverwritten = (certJson['bytesOverwritten'] as num?)?.toInt();
     final totalDeviceBytes = (certJson['totalDeviceBytes'] as num?)?.toInt();
 
@@ -366,6 +439,8 @@ class CertificateService {
       scope: scope,
       limitation: limitation,
       partitionsWiped: partitionsWiped,
+      sanitizationLevel: sanitizationLevel,
+      stepsExecuted: stepsExecuted,
       bytesOverwritten: bytesOverwritten,
       totalDeviceBytes: totalDeviceBytes,
     );
@@ -597,6 +672,17 @@ class CertificateService {
                   ['Sanitization Assurance', cert.supportLevel],
                   ['Applied Method', cert.method],
                   ['NIST SP 800-88 Category', cert.sanitizationCategory],
+                  if (cert.sanitizationLevel != null)
+                    ['Sanitization Level (NIST)', cert.sanitizationLevel!],
+                  if (cert.scope != null)
+                    ['Scope', cert.scope == 'partial' ? 'Partition (partial)' : 'Full device'],
+                  if (cert.partitionsWiped != null && cert.partitionsWiped!.isNotEmpty)
+                    [
+                      'Partitions Wiped',
+                      cert.partitionsWiped!
+                          .map((p) => p['name'] ?? 'partition #${p['partition_number']}')
+                          .join(', ')
+                    ],
                   ['Standard Reference', cert.standardReference],
                   ['Execution Time', '${cert.startTime.toString().substring(0, 19)} to ${cert.endTime.toString().substring(11, 19)}'],
                   if (cert.operatorNote != null) ['Operator Note', cert.operatorNote!],
@@ -624,6 +710,24 @@ class CertificateService {
                       pw.Text('Shannon Entropy Score: ${cert.verificationEntropyScore!.toStringAsFixed(4)}', style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey800)),
                     ],
                     pw.SizedBox(height: 3),
+                    if (cert.stepsExecuted != null && cert.stepsExecuted!.isNotEmpty) ...[
+                      pw.Text(
+                        'Executed Steps (ordered, ${cert.stepsExecuted!.length}):',
+                        style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold),
+                      ),
+                      ...cert.stepsExecuted!.take(20).map(
+                            (s) => pw.Text(
+                              '• $s',
+                              style: const pw.TextStyle(fontSize: 7.5, color: PdfColors.grey800),
+                            ),
+                          ),
+                      if (cert.stepsExecuted!.length > 20)
+                        pw.Text(
+                          '… ${cert.stepsExecuted!.length - 20} more steps recorded in the audit log',
+                          style: const pw.TextStyle(fontSize: 7.5, color: PdfColors.grey600),
+                        ),
+                      pw.SizedBox(height: 3),
+                    ],
                     pw.Text('Limitations Disclaimer: ${cert.evidence.limitations}', style: const pw.TextStyle(fontSize: 7.5, color: PdfColors.grey700)),
                   ],
                 ),
