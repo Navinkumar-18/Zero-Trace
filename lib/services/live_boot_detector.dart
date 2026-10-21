@@ -27,8 +27,8 @@ class LiveBootDetector {
     'livemedia',
   ];
 
-  /// Overlay-style root filesystem types.
-  static const Set<String> overlayRootTypes = {'overlay', 'aufs', 'tmpfs'};
+  /// Overlay-style root filesystem types (A3b spec: overlay/squashfs/tmpfs).
+  static const Set<String> overlayRootTypes = {'overlay', 'aufs', 'tmpfs', 'squashfs'};
 
   /// Detect the current boot mode by reading /proc/cmdline + /proc/mounts.
   /// Returns [BootMode.normal] when /proc is unreadable (non-Linux, web, or

@@ -343,7 +343,16 @@ pub fn detect_boot_environment_ctx(ctx: &FsContext) -> Result<BootEnvironment, E
             if let Some(pos) = dash_pos {
                 let fs_type = parts.get(pos + 1).copied().unwrap_or("");
                 let source = parts.get(pos + 2).copied().unwrap_or("");
-                if fs_type == "overlay" || fs_type == "aufs" || source == "overlay" {
+                // A3b spec: overlay, aufs, tmpfs or squashfs root all mean the
+                // running system's writes do not land on a real disk (archiso
+                // uses tmpfs + squashfs; Docker uses overlay).
+                if fs_type == "overlay"
+                    || fs_type == "aufs"
+                    || fs_type == "tmpfs"
+                    || fs_type == "squashfs"
+                    || source == "overlay"
+                    || source == "aufs"
+                {
                     root_is_overlay = true;
                 }
             }
@@ -4081,6 +4090,42 @@ mod tests {
         assert_eq!(
             detect_boot_environment_ctx(&f.ctx()).unwrap(),
             BootEnvironment::Container
+        );
+
+        // A3b spec: tmpfs + squashfs root (archiso style) is live-mode material
+        let f = FixtureBuilder::new();
+        f.set_mountinfo("1 0 0:30 / / rw,relatime - tmpfs tmpfs rw\n");
+        f.set_cmdline("archiso archisobasedir=arch quiet\n");
+        assert_eq!(
+            detect_boot_environment_ctx(&f.ctx()).unwrap(),
+            BootEnvironment::Live
+        );
+
+        let f = FixtureBuilder::new();
+        f.set_mountinfo("1 0 0:30 / / ro,relatime - squashfs /dev/sdb1 ro\n");
+        f.set_cmdline("boot=live quiet\n");
+        assert_eq!(
+            detect_boot_environment_ctx(&f.ctx()).unwrap(),
+            BootEnvironment::Live
+        );
+
+        // tmpfs root without a marker fails closed to Container
+        let f = FixtureBuilder::new();
+        f.set_mountinfo("1 0 0:30 / / rw,relatime - tmpfs tmpfs rw\n");
+        f.set_cmdline("root=/dev/mapper/vg-root\n");
+        assert_eq!(
+            detect_boot_environment_ctx(&f.ctx()).unwrap(),
+            BootEnvironment::Container
+        );
+
+        // A cmdline live marker on a real disk root does NOT downgrade
+        // protection: Normal rules (root disk protected) still apply.
+        let f = FixtureBuilder::new();
+        f.set_mountinfo("1 0 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n");
+        f.set_cmdline("boot=live root=/dev/sda1 rw\n");
+        assert_eq!(
+            detect_boot_environment_ctx(&f.ctx()).unwrap(),
+            BootEnvironment::Normal
         );
     }
 
