@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 
@@ -11,6 +12,7 @@ import 'certificate_service.dart';
 import 'classification_service.dart';
 import 'device_intelligence_service.dart';
 import 'device_simulator.dart';
+import 'engine_binary_resolver.dart';
 import 'policy_layer.dart';
 import 'recommendation_service.dart';
 import 'risk_scoring_service.dart';
@@ -18,6 +20,7 @@ import 'verification_service.dart';
 import 'real_sanitization_service.dart';
 import 'audit_log_service.dart';
 import 'job_state_file.dart';
+import 'live_boot_detector.dart';
 import 'orphaned_process_checker.dart';
 import '../simple/confirm_wipe_dialog.dart';
 
@@ -63,6 +66,17 @@ class SanitizationController extends ChangeNotifier {
   /// partition used by the current job (first selected); this list holds
   /// every user-selected partition for sequential partition-scope wipes.
   List<PartitionInfo> _selectedPartitions = const [];
+
+  /// B1: read-only Windows-install probe results keyed by partition device
+  /// path (true = "likely C: (Windows installed)"), plus per-partition error
+  /// messages when the probe could not run (no root, no engine, ...).
+  final Map<String, bool> _windowsProbeResults = {};
+  final Map<String, String> _windowsProbeErrors = {};
+
+  Map<String, bool> get windowsProbeResults =>
+      Map.unmodifiable(_windowsProbeResults);
+  Map<String, String> get windowsProbeErrors =>
+      Map.unmodifiable(_windowsProbeErrors);
 
   PartitionInfo? get selectedPartition => _selectedPartition;
   List<PartitionInfo> get selectedPartitions => _selectedPartitions;
@@ -186,6 +200,9 @@ class SanitizationController extends ChangeNotifier {
       standardReference: standardRef,
       explanationText: explanation,
       targetPartition: _selectedPartition,
+      // B4: every selected partition wipes sequentially (subset scope;
+      // partition table stays intact).
+      targetPartitions: List<PartitionInfo>.from(_selectedPartitions),
       shouldSimulateFailure: _simulateFailureMode,
       overriddenMethod: overrideMethod,
     );
@@ -231,16 +248,29 @@ class SanitizationController extends ChangeNotifier {
     }
   }
 
-  List<PartitionAuditOutcome>? _buildPartitionOutcomes(SanitizationJob job, bool success) {
+  /// B4: audit outcomes for the partitions this job targeted. [override]
+  /// carries the per-target statuses recorded while the sequential wipe loop
+  /// ran; without it every selected partition gets the job-level verdict
+  /// (simulated mode / failure paths before the loop ran).
+  List<PartitionAuditOutcome>? _buildPartitionOutcomes(
+    SanitizationJob job,
+    bool success, {
+    List<PartitionAuditOutcome>? override,
+  }) {
+    if (override != null && override.isNotEmpty) return override;
     if (!job.isPartitionScope || job.targetPartition == null) return null;
+    final List<PartitionInfo> parts = job.targetPartitions.isEmpty
+        ? <PartitionInfo>[job.targetPartition!]
+        : job.targetPartitions;
     return [
-      PartitionAuditOutcome(
-        partitionNumber: job.targetPartition!.partitionNumber,
-        startSector: job.targetPartition!.startSector,
-        sizeSectors: job.targetPartition!.sizeSectors,
-        status: success ? 'COMPLETED' : 'FAILED',
-        bytesWiped: success ? job.targetPartition!.sizeBytes : 0,
-      )
+      for (final p in parts)
+        PartitionAuditOutcome(
+          partitionNumber: p.partitionNumber,
+          startSector: p.startSector,
+          sizeSectors: p.sizeSectors,
+          status: success ? 'COMPLETED' : 'FAILED',
+          bytesWiped: success ? p.sizeBytes : 0,
+        )
     ];
   }
 
@@ -766,6 +796,48 @@ class SanitizationController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// B1: probe a partition read-only for a Windows installation via
+  /// `zt_engine probe-windows <device>` (mounts `ro,noexec,nosuid,nodev`,
+  /// checks for a `\Windows` directory, reads usage, always unmounts —
+  /// the volume is never opened for writing).
+  ///
+  /// Returns null on success (result recorded in [windowsProbeResults]) or
+  /// an error message for the UI.
+  Future<String?> probeWindowsInstall(PartitionInfo partition) async {
+    String fail(String message) {
+      _windowsProbeErrors[partition.devicePath] = message;
+      _windowsProbeResults.remove(partition.devicePath);
+      notifyListeners();
+      return message;
+    }
+
+    try {
+      final bin = await resolveEngineBinaryPath();
+      final res =
+          await Process.run(bin, ['probe-windows', partition.devicePath])
+              .timeout(const Duration(seconds: 30));
+      final out = res.stdout as String? ?? '';
+      const marker = 'WINDOWS_PROBE:';
+      final idx = out.indexOf(marker);
+      if (idx < 0) {
+        final err = (res.stderr as String? ?? '').trim();
+        return fail(err.isEmpty ? 'Probe failed' : 'Probe failed: $err');
+      }
+      final probe =
+          jsonDecode(out.substring(idx + marker.length)) as Map<String, dynamic>;
+      if (probe['mounted_read_only'] != true) {
+        return fail(probe['error'] as String? ?? 'read-only mount failed');
+      }
+      _windowsProbeResults[partition.devicePath] =
+          probe['likely_windows_install'] == true;
+      _windowsProbeErrors.remove(partition.devicePath);
+      notifyListeners();
+      return null;
+    } catch (e) {
+      return fail('Probe failed: $e');
+    }
+  }
+
   void setRiskInputs({
     DataSensitivity? sensitivity,
     DeviceCondition? condition,
@@ -843,6 +915,8 @@ class SanitizationController extends ChangeNotifier {
       standardReference: standardRef,
       explanationText: explanation,
       targetPartition: _selectedPartition,
+      // B4: preview job mirrors the real one — every selected partition.
+      targetPartitions: List<PartitionInfo>.from(_selectedPartitions),
       shouldSimulateFailure: _simulateFailureMode,
     );
 
@@ -889,6 +963,24 @@ class SanitizationController extends ChangeNotifier {
     _addLog('SUCCESS: Whitelist verified. Target: ${job.device.name} [${job.device.serialNumber}]');
     notifyListeners();
 
+    // B4: fail-closed pre-flight — EVERY selected partition must pass the
+    // per-target policy BEFORE the first wipe starts, so a subset wipe never
+    // stops half-way because of a later protected partition.
+    if (job.isPartitionScope && job.targetPartitions.length > 1) {
+      for (final t in job.targetPartitions) {
+        final perPart = _policyLayer.validatePartitionTarget(job, t);
+        if (!perPart.isAllowed) {
+          job.status = JobStatus.failed;
+          job.currentStageDescription = perPart.policyMessage;
+          _addLog('ERROR: Pre-flight refused partition ${t.name}: ${perPart.policyMessage}');
+          notifyListeners();
+          return;
+        }
+      }
+      _addLog('SUCCESS: Pre-flight passed for all ${job.targetPartitions.length} selected partitions.');
+      notifyListeners();
+    }
+
     if (_isRealMode) {
       if (kIsWeb) {
         job.status = JobStatus.failed;
@@ -905,6 +997,16 @@ class SanitizationController extends ChangeNotifier {
         return;
       }
 
+      // B4: per-run accumulators shared by the wipe loop and the failure
+      // path (declared before try so the catch block can report them).
+      final List<PartitionAuditOutcome> outcomes = [];
+      final List<String> aggregatedCommandLog = [];
+      final List<RealVerificationReport> verifyReports = [];
+      RealExecutionReport? lastReport;
+      bool anyVerifyRan = false;
+      bool allVerifiesPassed = true;
+      int wipedTargets = 0;
+
       try {
         // Stage 1: Detecting & unmounting filesystems
         job.status = JobStatus.unmounting;
@@ -913,31 +1015,18 @@ class SanitizationController extends ChangeNotifier {
         _addLog('SYSTEM: Initializing device preparation (zt_engine managing unmount)...');
         notifyListeners();
 
-        // Stage 2: Sanitization execution
+        // B4: execution targets — whole device = single pass; partition
+        // scope = every selected partition wiped sequentially (ranges only;
+        // the partition table stays intact).
+        final List<PartitionInfo?> targets = job.wipeExecutionTargets;
+
+        // Stage 2: Sanitization execution (sequential per target)
         job.status = JobStatus.sanitizing;
         job.progress = null; // Honest indeterminate state until write progress arrives
-        job.currentStageDescription = 'Executing real-hardware sanitization...';
+        job.currentStageDescription = targets.length > 1
+            ? 'Executing partition wipe 1/${targets.length}...'
+            : 'Executing real-hardware sanitization...';
         notifyListeners();
-
-        await _jobStateFile.saveActiveJob(ActiveJobState(
-          jobId: job.jobId,
-          deviceSerial: job.device.serialNumber,
-          devicePath: job.isPartitionScope
-              ? job.targetPartition!.devicePath
-              : (job.device.id.startsWith('real_') ? '/dev/${job.device.id.substring(5)}' : '/dev/sdb'),
-          deviceName: job.device.name,
-          method: job.effectiveMethod.displayName,
-          methodKind: _methodKind(job.effectiveMethod),
-          deviceSize: job.device.capacityBytes,
-          startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
-          partitionNumber: job.targetPartition?.partitionNumber,
-          partitionStartSector: job.targetPartition?.startSector,
-          partitionSizeSectors: job.targetPartition?.sizeSectors,
-          scope: job.isPartitionScope ? 'partial' : 'full',
-          limitation: job.isPartitionScope
-              ? 'Partition wipe: partition table and unselected sectors are not overwritten'
-              : null,
-        ));
 
         _lastHeartbeatTime = DateTime.now();
         _isStalled = false;
@@ -957,12 +1046,47 @@ class SanitizationController extends ChangeNotifier {
           }
         });
 
+        for (var ti = 0; ti < targets.length; ti++) {
+          final PartitionInfo? target = targets[ti];
+          final String targetPath = target != null
+              ? target.devicePath
+              : (job.device.id.startsWith('real_')
+                  ? '/dev/${job.device.id.substring(5)}'
+                  : '/dev/sdb');
+          if (targets.length > 1) {
+            job.currentStageDescription =
+                'Wiping partition ${ti + 1}/${targets.length}: ${target!.name}...';
+            _addLog('SCOPE: Partition ${ti + 1}/${targets.length}: ${target.devicePath} '
+                '(range only — partition table untouched)');
+            notifyListeners();
+          }
+
+          await _jobStateFile.saveActiveJob(ActiveJobState(
+            jobId: job.jobId,
+            deviceSerial: job.device.serialNumber,
+            devicePath: targetPath,
+            deviceName: job.device.name,
+            method: job.effectiveMethod.displayName,
+            methodKind: _methodKind(job.effectiveMethod),
+            deviceSize: job.device.capacityBytes,
+            startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
+            partitionNumber: target?.partitionNumber,
+            partitionStartSector: target?.startSector,
+            partitionSizeSectors: target?.sizeSectors,
+            scope: job.isPartitionScope ? 'partial' : 'full',
+            limitation: job.isPartitionScope
+                ? 'Partition wipe: partition table and unselected sectors are not overwritten'
+                : null,
+          ));
+
+          _lastHeartbeatTime = DateTime.now();
+
         final report = await _realSanitizeService.executeSanitization(
           device: job.device,
           method: job.effectiveMethod,
           confirmationToken: job.device.serialNumber, // verified by dialog retype
           deviceSerial: job.device.serialNumber,
-          targetPartition: job.targetPartition,
+          targetPartition: target,
           dryRun: false,
           onProgress: (event) {
             _lastHeartbeatTime = DateTime.now();
@@ -979,7 +1103,10 @@ class SanitizationController extends ChangeNotifier {
 
             // Firmware sanitize methods have percent == null -> indeterminate
             // Software overwrite has real percent computed by native engine
-            job.progress = event.percent;
+            // B4: fold per-partition progress into overall job progress.
+            job.progress = (targets.length > 1 && event.percent != null)
+                ? (ti + event.percent!) / targets.length
+                : event.percent;
 
             if (event.bytesTotal > 0 && event.bytesDone > 0) {
               final doneGb = (event.bytesDone / 1e9).toStringAsFixed(1);
@@ -1002,6 +1129,70 @@ class SanitizationController extends ChangeNotifier {
             notifyListeners();
           },
         );
+        aggregatedCommandLog.addAll(report.commandLog);
+        lastReport = report;
+
+          if (!report.success) {
+            job.status = JobStatus.failed;
+            job.endTime = DateTime.now();
+            if (report.exitCode == 130) {
+              job.currentStageDescription = 'Sanitization Cancelled: Partially Wiped';
+              _addLog('CANCEL: Sanitization cancelled by user. Partially wiped.');
+            } else {
+              job.currentStageDescription = 'Sanitization Failed: ${report.stderr}';
+              _addLog('ERROR: Sanitization command failed with code ${report.exitCode}');
+              _addLog('ERROR Details: ${report.stderr}');
+            }
+            if (target != null) {
+              outcomes.add(PartitionAuditOutcome.forPartition(target, success: false));
+            }
+            _addLog('ERROR: Wipe stopped; $wipedTargets/${targets.length} target(s) completed.');
+            await _jobStateFile.clearActiveJob();
+            notifyListeners();
+            return;
+          }
+          if (target != null) {
+            outcomes.add(PartitionAuditOutcome.forPartition(target, success: true));
+          }
+          wipedTargets++;
+
+          // Stage 3: Verification LBA sampling — immediately after each
+          // target's wipe so every wiped range is sampled.
+          job.status = JobStatus.verifying;
+          job.progress = targets.length > 1 ? wipedTargets / targets.length : null;
+          job.currentStageDescription = targets.length > 1
+              ? 'Verifying partition ${ti + 1}/${targets.length}: ${target!.name}...'
+              : 'Verifying sector erasure via LBA sampling...';
+          _addLog('VERIFICATION: Running post-sanitize verify LBA sampling'
+              '${targets.length > 1 ? ' for ${target!.devicePath}' : ''}...');
+          notifyListeners();
+
+          final cliMethod = _realSanitizeService.mapMethodToCliArg(job.effectiveMethod, job.device);
+          final isCryptoMethod = job.effectiveMethod == SanitizationMethod.cryptographicErase ||
+              report.methodUsed.toLowerCase().contains('crypto') ||
+              report.methodUsed.toLowerCase().contains('reverttper');
+          final expectZeros = !isCryptoMethod;
+
+          RealVerificationReport? verifyReport;
+          try {
+            verifyReport = await _realSanitizeService.executeVerification(
+              device: job.device,
+              method: cliMethod,
+              deviceSerial: job.device.serialNumber,
+              targetPartition: target,
+              sampleCount: 50,
+              expectZeros: expectZeros,
+            );
+          } catch (verifyErr) {
+            _addLog('WARNING: Verification sampling failed: $verifyErr');
+            _addLog('NOTE: Disk write operation itself completed successfully.');
+          }
+          if (verifyReport != null) {
+            anyVerifyRan = true;
+            allVerifiesPassed = allVerifiesPassed && verifyReport.pass;
+            verifyReports.add(verifyReport);
+          }
+        } // end per-target wipe loop (B4)
 
         _stallWatchdogTimer?.cancel();
         _stallWatchdogTimer = null;
@@ -1010,63 +1201,25 @@ class SanitizationController extends ChangeNotifier {
         _isCancelling = false;
         _showForceStop = false;
 
-        if (!report.success) {
-          job.status = JobStatus.failed;
-          job.endTime = DateTime.now();
-          if (report.exitCode == 130) {
-            job.currentStageDescription = 'Sanitization Cancelled: Partially Wiped';
-            _addLog('CANCEL: Sanitization cancelled by user. Partially wiped.');
-          } else {
-            job.currentStageDescription = 'Sanitization Failed: ${report.stderr}';
-            _addLog('ERROR: Sanitization command failed with code ${report.exitCode}');
-            _addLog('ERROR Details: ${report.stderr}');
-          }
-          await _jobStateFile.clearActiveJob();
-          notifyListeners();
-          return;
-        }
-
         // ── Disk operation succeeded. Record this fact BEFORE post-processing ──
         // From this point forward, any exception is a post-processing failure
         // (certificate signing, audit log), NOT a disk operation failure.
         final bool diskWipeSucceeded = true;
         job.wipeCompleted = true;
 
-        // Stage 3: Verification LBA sampling
-        job.status = JobStatus.verifying;
-        job.progress = null; // Indeterminate during LBA sampling
-        job.currentStageDescription = 'Verifying sector erasure via LBA sampling...';
-        _addLog('VERIFICATION: Running post-sanitize verify LBA sampling...');
-        notifyListeners();
+        // B4: aggregate verification over every target. Single-target runs
+        // keep the exact A8 semantics: no verify report = pass=false in the
+        // evidence, but the wipe itself still counts as successful.
+        final bool verificationPassed = anyVerifyRan ? allVerifiesPassed : false;
+        final RealVerificationReport? verifyReport =
+            verifyReports.isEmpty ? null : verifyReports.last;
 
-        final cliMethod = _realSanitizeService.mapMethodToCliArg(job.effectiveMethod, job.device);
-        final isCryptoMethod = job.effectiveMethod == SanitizationMethod.cryptographicErase ||
-            report.methodUsed.toLowerCase().contains('crypto') ||
-            report.methodUsed.toLowerCase().contains('reverttper');
-        final expectZeros = !isCryptoMethod;
-
-        RealVerificationReport? verifyReport;
-        try {
-          verifyReport = await _realSanitizeService.executeVerification(
-            device: job.device,
-            method: cliMethod,
-            deviceSerial: job.device.serialNumber,
-            targetPartition: job.targetPartition,
-            sampleCount: 50,
-            expectZeros: expectZeros,
-          );
-        } catch (verifyErr) {
-          _addLog('WARNING: Verification sampling failed: $verifyErr');
-          _addLog('NOTE: Disk write operation itself completed successfully.');
-        }
-
-        final bool verificationPassed = verifyReport?.pass ?? false;
-
-        // Construct VerificationEvidence from real report
+        // Construct VerificationEvidence from real report(s). Sample offsets
+        // are absolute device LBAs, so multi-target samples never collide.
         final List<int> sampleOffsets = [];
         final Map<int, String> sampleHashes = {};
-        if (verifyReport != null) {
-          for (final sample in verifyReport.samples) {
+        for (final vr in verifyReports) {
+          for (final sample in vr.samples) {
             try {
               final offset = sample['offset'] as int;
               final hash = sample['sector_hash'] as String;
@@ -1085,8 +1238,13 @@ class SanitizationController extends ChangeNotifier {
         }
 
         final statusCode = verificationPassed ? 0 : 1;
-        final controllerConfirmation = verifyReport != null
-            ? 'VERIFICATION: Pass: ${verifyReport.pass} | Samples: ${verifyReport.sampleCount} | Entropy: ${verifyReport.entropyScore}'
+        final controllerConfirmation = verifyReports.isNotEmpty
+            ? (verifyReports.length == 1
+                ? 'VERIFICATION: Pass: ${verifyReports.single.pass} | Samples: ${verifyReports.single.sampleCount} | Entropy: ${verifyReports.single.entropyScore}'
+                : 'VERIFICATION: Pass: $allVerifiesPassed '
+                    '(${verifyReports.where((v) => v.pass).length}/${targets.length} partitions) | '
+                    'Samples: ${verifyReports.fold<int>(0, (a, v) => a + v.sampleCount)} | '
+                    'Entropy: ${verifyReports.last.entropyScore}')
             : 'VERIFICATION: Sampling unavailable (disk wipe command succeeded)';
 
         final limitations = _verificationService.getTailoredLimitations(job.recommendedMethod);
@@ -1102,8 +1260,8 @@ class SanitizationController extends ChangeNotifier {
         );
 
         bool isJobSuccessful = false;
-        if (verifyReport != null) {
-          isJobSuccessful = verifyReport.pass;
+        if (anyVerifyRan) {
+          isJobSuccessful = allVerifiesPassed;
         } else {
           isJobSuccessful = diskWipeSucceeded;
         }
@@ -1126,11 +1284,15 @@ class SanitizationController extends ChangeNotifier {
             job: job,
             evidence: evidence,
             executionMode: 'real',
-            actualMethodExecuted: report.methodUsed,
-            // A7: sign the ordered engine steps actually executed.
-            stepsExecuted: report.commandLog,
+            actualMethodExecuted: lastReport?.methodUsed ?? job.effectiveMethod.displayName,
+            // A7: sign the ordered engine steps actually executed (B4: the
+            // aggregated command log of every sequential target).
+            stepsExecuted: aggregatedCommandLog,
             verificationSampleCount: verifyReport?.sampleCount,
             verificationEntropyScore: verifyReport?.entropyScore,
+            // B5: signed claim of the boot environment ("live" when running
+            // from the live medium).
+            bootEnvironment: LiveBootDetector.detect().name,
           );
           _addLog('CERTIFICATE: Issued ${completedCertificate!.certificateId} signed with ECDSA P-256 key.');
         } catch (certErr) {
@@ -1175,9 +1337,13 @@ class SanitizationController extends ChangeNotifier {
             fingerprintHash: verifyReport?.fingerprintHash ?? 'UNAVAILABLE',
             entropyScore: verifyReport?.entropyScore ?? 0.0,
             sampleCount: verifyReport?.sampleCount ?? 0,
-            commandLog: report.commandLog,
+            commandLog: aggregatedCommandLog,
             isSimulated: false,
-            partitions: _buildPartitionOutcomes(job, diskWipeSucceeded && verificationPassed),
+            partitions: _buildPartitionOutcomes(
+              job,
+              diskWipeSucceeded && verificationPassed,
+              override: outcomes,
+            ),
           );
           await _auditLogService.appendEntry(auditEntry);
         } catch (auditErr) {
@@ -1198,6 +1364,7 @@ class SanitizationController extends ChangeNotifier {
             job: job,
             evidence: evidence,
             executionMode: 'real',
+            bootEnvironment: LiveBootDetector.detect().name,
           );
           _completedCertificate = report;
           final (_, reportSha) = await _auditLogService.saveFailureReport(report);
@@ -1224,7 +1391,11 @@ class SanitizationController extends ChangeNotifier {
             sampleCount: 0,
             commandLog: List<String>.from(job.logs),
             isSimulated: false,
-            partitions: _buildPartitionOutcomes(job, false),
+            partitions: _buildPartitionOutcomes(
+              job,
+              false,
+              override: outcomes.isNotEmpty ? outcomes : null,
+            ),
           ));
         } catch (_) {}
 
@@ -1284,6 +1455,7 @@ class SanitizationController extends ChangeNotifier {
         job: job,
         evidence: evidence,
         executionMode: 'simulated',
+        bootEnvironment: LiveBootDetector.detect().name,
       );
       try {
         final (_, reportSha) = await _auditLogService.saveFailureReport(_completedCertificate!);
@@ -1339,6 +1511,7 @@ class SanitizationController extends ChangeNotifier {
       job: job,
       evidence: evidence,
       executionMode: 'simulated',
+      bootEnvironment: LiveBootDetector.detect().name,
     );
     _addLog('CERTIFICATE: Issued ${completedCertificate!.certificateId} signed with ECDSA P-256 key.');
 

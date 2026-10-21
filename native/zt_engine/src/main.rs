@@ -37,7 +37,7 @@ async fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: zt_engine <subcommand> [args]");
-        eprintln!("Subcommands: sanitize, verify, detect, partitions");
+        eprintln!("Subcommands: sanitize, verify, detect, partitions, probe-windows");
         process::exit(1);
     }
 
@@ -292,6 +292,18 @@ async fn main() {
                     eprintln!("Error enumerating partitions: {}", e);
                     process::exit(1);
                 }
+            }
+        }
+        "probe-windows" => {
+            // Usage: zt_engine probe-windows <device>  (B1 read-only probe)
+            if args.len() < 3 {
+                eprintln!("Usage: zt_engine probe-windows <device>");
+                process::exit(1);
+            }
+            let device = &args[2];
+            let probe = zt_engine::partitions::probe_windows_volume(device);
+            if let Ok(json) = serde_json::to_string(&probe) {
+                println!("WINDOWS_PROBE:{}", json);
             }
         }
         _ => {

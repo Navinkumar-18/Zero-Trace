@@ -6,6 +6,7 @@ import 'package:crypto/crypto.dart';
 
 import '../core/app_paths.dart';
 import '../models/certificate.dart';
+import '../models/partition_info.dart';
 
 class PartitionAuditOutcome {
   final int partitionNumber;
@@ -21,6 +22,19 @@ class PartitionAuditOutcome {
     required this.status,
     required this.bytesWiped,
   });
+
+  /// B4: outcome for one target of a (sequential) partition-scope wipe.
+  factory PartitionAuditOutcome.forPartition(
+    PartitionInfo partition, {
+    required bool success,
+  }) =>
+      PartitionAuditOutcome(
+        partitionNumber: partition.partitionNumber,
+        startSector: partition.startSector,
+        sizeSectors: partition.sizeSectors,
+        status: success ? 'COMPLETED' : 'FAILED',
+        bytesWiped: success ? partition.sizeBytes : 0,
+      );
 
   Map<String, dynamic> toJson() => {
         'bytesWiped': bytesWiped,

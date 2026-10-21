@@ -1,0 +1,5 @@
+# B3: auto-launch Zero Trace on the live session's root tty1 login.
+# Guarded so an interactive root shell (tty2+, recovery) stays unaffected.
+if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ] && [ -x /usr/local/bin/zero-trace-live ]; then
+  exec /usr/local/bin/zero-trace-live
+fi

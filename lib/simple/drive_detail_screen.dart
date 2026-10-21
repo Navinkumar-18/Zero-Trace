@@ -1141,8 +1141,13 @@ class _PartitionChooserSection extends StatelessWidget {
             const SizedBox(height: 2),
           ],
 
-          // A4: "Wipe entire device" offer when every partition is selected
-          if (allPartitionsSelected && device.isRemovable) ...[
+          // B4: subset vs entire-disk scope. Selecting every partition wipes
+          // only those ranges (partition table stays intact); switching to
+          // "entire disk" destroys every partition AND the table. Offered for
+          // removable AND internal non-system disks (a Windows laptop drive
+          // included) — the A5 typed confirmation still gates execution.
+          if (allPartitionsSelected &&
+              (device.isRemovable || !device.isSystemDisk)) ...[
             const SizedBox(height: 8),
             Container(
               padding: const EdgeInsets.all(10),
@@ -1157,10 +1162,23 @@ class _PartitionChooserSection extends StatelessWidget {
                   const SizedBox(width: 8),
                   const Expanded(
                     child: Text(
-                      'All partitions selected: confirmation will offer '
-                      '"Wipe entire device" (partition table destroyed).',
+                      'All partitions selected: this wipes only the selected '
+                      'ranges — the partition table stays intact. Choose '
+                      '"Wipe entire disk" to destroy every partition and the '
+                      'table as well.',
                       style:
                           TextStyle(color: AppTheme.accentGold, fontSize: 11),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () => controller.clearPartitionSelection(),
+                    style: TextButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      minimumSize: const Size(0, 32),
+                    ),
+                    child: const Text(
+                      'Wipe entire disk',
+                      style: TextStyle(fontSize: 11),
                     ),
                   ),
                 ],
@@ -1193,9 +1211,28 @@ class _PartitionChooserSection extends StatelessWidget {
     final disabled = reason != null;
     final isSelected = !disabled && selectedNames.contains(p.name);
 
-    final displayName = (p.label.sanitized.isNotEmpty)
-        ? p.label.sanitized
-        : 'Partition ${p.partitionNumber}';
+    // B1: Windows-friendly name ("Windows volume (NTFS, 237 GB)", "Recovery",
+    // "EFI System", …) — never invents drive letters; label/size/fs stay
+    // visible in the detail line.
+    final displayName = p.friendlyDisplayName;
+    final likelyWindows = controller.windowsProbeResults[p.devicePath];
+    final probeError = controller.windowsProbeErrors[p.devicePath];
+    final title = likelyWindows == true
+        ? '$displayName — likely C: (Windows installed)'
+        : displayName;
+    // B1 optional: offer the read-only Windows-install probe for Windows-ish,
+    // not-disabled partitions in real mode only.
+    final bool offerProbe = !isSimulated &&
+        !disabled &&
+        (p.role == 'windows_data' ||
+            const {
+              'ntfs',
+              'exfat',
+              'fat32',
+              'fat16',
+              'fat12',
+              'bitlocker',
+            }.contains(p.fsType?.toLowerCase()));
 
     return InkWell(
       onTap: disabled ? null : () => controller.togglePartitionSelection(p),
@@ -1231,7 +1268,7 @@ class _PartitionChooserSection extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      displayName,
+                      title,
                       style: TextStyle(
                         fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
                         fontSize: 13,
@@ -1241,8 +1278,9 @@ class _PartitionChooserSection extends StatelessWidget {
                     Text(
                       disabled
                           ? reason
-                          : '${p.formattedSize} • ${p.fsType ?? 'no filesystem'}'
-                              '${p.mountPoint != null ? ' • ${p.mountPoint}' : ''}',
+                          : (probeError != null
+                              ? '${p.detailLine} • $probeError'
+                              : p.detailLine),
                       style: const TextStyle(
                           color: AppTheme.textMuted, fontSize: 11),
                     ),
@@ -1254,6 +1292,32 @@ class _PartitionChooserSection extends StatelessWidget {
                 style:
                     const TextStyle(color: AppTheme.textMuted, fontSize: 11),
               ),
+              if (offerProbe)
+                IconButton(
+                  tooltip: 'Probe for Windows (read-only)',
+                  visualDensity: VisualDensity.compact,
+                  iconSize: 18,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(
+                      minWidth: 32, minHeight: 32),
+                  icon: const Icon(Icons.travel_explore,
+                      size: 18, color: AppTheme.textMuted),
+                  onPressed: () async {
+                    final err = await controller.probeWindowsInstall(p);
+                    if (!context.mounted) return;
+                    final messenger = ScaffoldMessenger.maybeOf(context);
+                    messenger?.showSnackBar(
+                      SnackBar(
+                        content: Text(err ??
+                            (controller.windowsProbeResults[p.devicePath] ==
+                                    true
+                                ? '${p.devicePath}: likely C: (Windows installed)'
+                                : '${p.devicePath}: no Windows installation found')),
+                        duration: const Duration(seconds: 4),
+                      ),
+                    );
+                  },
+                ),
             ],
           ),
         ),

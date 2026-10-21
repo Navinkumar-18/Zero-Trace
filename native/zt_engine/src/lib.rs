@@ -37,4 +37,10 @@ pub use execute::{
 pub use verify::{VerificationReport, SampleResult};
 pub use partitions::{
     detect_table_type, enumerate_partitions_ctx, DiskEnumerationReport, PartitionEntry,
+    // B1: Windows-friendly partition-type classification + volume probing
+    classify_gpt_guid, classify_mbr_type, classify_mbr_partition, format_guid_mixed_endian,
+    parse_gpt_header, parse_gpt_entry, parse_mbr_entries, probe_volume_header,
+    GptHeader, GptPartitionEntry, MbrPartitionEntry, VolumeProbe,
+    // B1 optional: read-only Windows-install probe
+    classify_windows_root, probe_windows_volume, WindowsProbe,
 };

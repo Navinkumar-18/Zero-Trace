@@ -5,6 +5,7 @@ import '../core/app_paths.dart';
 import '../models/device_profile.dart';
 import '../models/partition_info.dart';
 import '../models/sanitization_job.dart';
+import 'engine_binary_resolver.dart';
 import 'partition_table_service.dart';
 
 class RealExecutionReport {
@@ -149,34 +150,9 @@ class RealSanitizationService {
 
   Process? get activeProcess => _activeProcess;
 
-  /// Resolves the compiled zt_engine binary path using:
-  /// 1. ZT_ENGINE_PATH environment variable.
-  /// 2. Workspace target directory target/release/zt_engine (development).
-  /// 3. Current folder ./zt_engine.
-  /// 4. Fallback to global "zt_engine" command.
-  Future<String> getBinaryPath() async {
-    final envPath = Platform.environment['ZT_ENGINE_PATH'];
-    if (envPath != null && envPath.isNotEmpty) {
-      if (await File(envPath).exists()) {
-        return envPath;
-      }
-    }
-
-    final devPaths = [
-      '${Directory.current.path}/native/zt_engine/target/release/zt_engine',
-      '${Directory.current.path}/native/zt_engine/target/debug/zt_engine',
-      '${Directory.current.path}/zt_engine',
-      './zt_engine',
-    ];
-
-    for (final path in devPaths) {
-      if (await File(path).exists()) {
-        return path;
-      }
-    }
-
-    return 'zt_engine';
-  }
+  /// Resolves the compiled zt_engine binary path (delegates to the shared
+  /// resolver so discovery enrichment and execution use the same binary).
+  Future<String> getBinaryPath() => resolveEngineBinaryPath();
 
   /// Maps the recommended sanitization method to the corresponding CLI action parameter.
   String mapMethodToCliArg(SanitizationMethod method, DeviceProfile device) {

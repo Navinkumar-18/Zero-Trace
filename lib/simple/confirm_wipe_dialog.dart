@@ -288,14 +288,26 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
               _infoRow('Method:', _methodDisplayText(method, isDestroyRecommended)),
               const SizedBox(height: 4),
               // A5: exact scope (partitions + sizes) and the level it yields.
+              // B4: entire-disk wording states the partition table dies too.
               _infoRow(
                 'Scope:',
                 selectedParts.isEmpty
-                    ? 'Entire device (${widget.device.formattedCapacity})'
+                    ? 'Entire device (all partitions + partition table, '
+                        '${widget.device.formattedCapacity})'
                     : selectedParts
                         .map((p) => '${p.name} (${p.formattedSize})')
                         .join(', '),
               ),
+              // B2: encrypted volumes (BitLocker / LUKS) remain wipeable —
+              // the operator must know before confirming.
+              if (_encryptionKindsInScope(selectedParts).isNotEmpty) ...[
+                const SizedBox(height: 4),
+                _infoRow(
+                  'Encryption:',
+                  '${_encryptionKindsInScope(selectedParts).join(', ')} '
+                      'detected — wiping works regardless of encryption.',
+                ),
+              ],
               const SizedBox(height: 4),
               _infoRow('Level:', _levelText(supportLevel, selectedParts.isEmpty)),
               const SizedBox(height: 4),
@@ -602,6 +614,19 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
   /// A5: NIST SP 800-88 level this wipe will actually achieve.
   /// Partition scope, unsupported media and clear-only media cap at Clear;
   /// whole-device wipes on hardware-command-capable devices reach Purge.
+  /// B2: distinct encryption kinds (BitLocker / LUKS) present in the wipe
+  /// scope. Whole-device scope scans every partition of the drive.
+  List<String> _encryptionKindsInScope(List<PartitionInfo> selectedParts) {
+    final scope =
+        selectedParts.isNotEmpty ? selectedParts : widget.device.partitions;
+    return [
+      ...{
+        for (final p in scope)
+          if (p.encryptionKind != null) p.encryptionKind!,
+      }
+    ];
+  }
+
   String _levelText(SanitizationSupportLevel supportLevel, bool wholeDevice) {
     if (supportLevel == SanitizationSupportLevel.unsupported) {
       return 'Clear at best — purge not supported by this device';

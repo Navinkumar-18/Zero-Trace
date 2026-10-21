@@ -89,6 +89,27 @@ class SanitizationCertificate {
   /// log in real mode, timestamped job log in simulated mode).
   final List<String>? stepsExecuted;
 
+  /// B5: human-readable boot-environment wording for the PDF and UI
+  /// ("Booted from live medium" — the operator-facing claim; the raw token is
+  /// what the signature covers).
+  String? get bootEnvironmentDisplay {
+    switch (bootEnvironment) {
+      case 'live':
+        return 'Booted from live medium (internal disks wipeable)';
+      case 'container':
+        return 'Booted in container environment';
+      case 'normal':
+        return 'Booted from installed system';
+      default:
+        return null;
+    }
+  }
+
+  /// B5 (v4): boot environment the wipe ran in — "live", "normal" or
+  /// "container" ([BootMode] name). Signed so a certificate cannot claim it
+  /// booted from a live medium when it did not.
+  final String? bootEnvironment;
+
   SanitizationCertificate({
     this.certVersion = 2,
     required this.certificateId,
@@ -123,6 +144,7 @@ class SanitizationCertificate {
     this.totalDeviceBytes,
     this.sanitizationLevel,
     this.stepsExecuted,
+    this.bootEnvironment,
   }) : simulationDisclaimer = simulationDisclaimer ??
             (executionMode == 'simulated'
                 ? 'SIMULATED, not a valid sanitization record'
@@ -193,6 +215,7 @@ class SanitizationCertificate {
       stepsExecuted: (json['stepsExecuted'] as List<dynamic>?)
           ?.map((e) => e.toString())
           .toList(),
+      bootEnvironment: json['bootEnvironment'] as String?,
     );
   }
 
@@ -228,6 +251,10 @@ class SanitizationCertificate {
         if (certVersion >= 4 && sanitizationLevel != null)
           'sanitizationLevel': sanitizationLevel,
         if (certVersion >= 4 && stepsExecuted != null) 'stepsExecuted': stepsExecuted,
+        // B5: signed boot-environment claim ("live"/"normal"/"container");
+        // omitted when absent so pre-B5 v4 certificates still round-trip.
+        if (certVersion >= 4 && bootEnvironment != null)
+          'bootEnvironment': bootEnvironment,
         'startTime': startTime.toIso8601String(),
         'endTime': endTime.toIso8601String(),
         'timestamp': endTime.toIso8601String(),

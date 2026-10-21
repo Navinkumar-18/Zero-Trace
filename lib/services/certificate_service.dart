@@ -8,6 +8,7 @@ import 'package:pointycastle/export.dart' as pc;
 
 import '../models/certificate.dart';
 import '../models/device_profile.dart';
+import '../models/partition_info.dart';
 import '../models/sanitization_job.dart';
 import '../models/sanitization_support_level.dart';
 
@@ -95,6 +96,11 @@ class CertificateService {
     List<String>? stepsExecuted,
     int? bytesOverwritten,
     int? totalDeviceBytes,
+    // B5: boot-environment claim ("live"/"normal"/"container"), signed only
+    // when present so pre-B5 v4 certificates keep verifying byte-identically.
+    // The disk model stays a recorded display field; the serial is the signed
+    // device identity.
+    String? bootEnvironment,
   }) {
     if (certVersion == 1) {
       return {
@@ -123,6 +129,7 @@ class CertificateService {
         'stepsExecuted': ?stepsExecuted,
         'bytesOverwritten': ?bytesOverwritten,
         'totalDeviceBytes': ?totalDeviceBytes,
+        'bootEnvironment': ?bootEnvironment,
         'evidenceHash': evidenceHash,
         'result': result,
         'timestamp': timestamp,
@@ -244,6 +251,9 @@ class CertificateService {
     List<String>? stepsExecuted,
     int? verificationSampleCount,
     double? verificationEntropyScore,
+    // B5: boot environment the wipe ran in ("live"/"normal"/"container");
+    // signed so the live-medium claim cannot be forged after the fact.
+    String? bootEnvironment,
   }) {
     final DateTime now = DateTime.now();
     final String certId = 'ZT-CERT-${now.millisecondsSinceEpoch.toString().substring(5)}';
@@ -290,16 +300,24 @@ class CertificateService {
         : (category == 'Clear' && _isFlashWithoutPurge(job.device)
             ? 'Clear only: overwrite cannot reach remapped or over-provisioned flash blocks'
             : null);
-    final List<Map<String, dynamic>>? partitionsWiped = isPartition && job.targetPartition != null
-        ? [
-            {
-              'name': job.targetPartition!.name,
-              'partition_number': job.targetPartition!.partitionNumber,
-              'start_sector': job.targetPartition!.startSector,
-              'size_bytes': job.targetPartition!.sizeBytes,
-            }
-          ]
-        : null;
+    // B4: record every partition the job actually targeted — the sequential
+    // subset wipe lists all selected partitions in one certificate.
+    final List<PartitionInfo> wipedParts = job.isPartitionScope
+        ? (job.targetPartitions.isEmpty && job.targetPartition != null
+            ? [job.targetPartition!]
+            : job.targetPartitions)
+        : const [];
+    final List<Map<String, dynamic>>? partitionsWiped = wipedParts.isEmpty
+        ? null
+        : [
+            for (final p in wipedParts)
+              {
+                'name': p.name,
+                'partition_number': p.partitionNumber,
+                'start_sector': p.startSector,
+                'size_bytes': p.sizeBytes,
+              }
+          ];
     // NIST SP 800-88 level this wipe actually achieved, derived from the
     // executed-method category (never from the device's capability alone).
     final String sanitizationLevel = category == 'Purge'
@@ -312,7 +330,11 @@ class CertificateService {
     // mode / engine log unavailable).
     final List<String>? steps =
         stepsExecuted ?? (job.logs.isNotEmpty ? List<String>.from(job.logs) : null);
-    final int? bytesOverwritten = isPartition ? job.targetPartition?.sizeBytes : null;
+    // B4: bytes overwritten = sum of every targeted partition (identical to
+    // the single-partition value when only one partition was selected).
+    final int? bytesOverwritten = isPartition
+        ? wipedParts.fold<int>(0, (sum, p) => sum + p.sizeBytes)
+        : null;
     final int totalDeviceBytes = job.device.capacityBytes;
 
     final Map<String, dynamic> payloadToSign = buildSigningPayload(
@@ -334,6 +356,7 @@ class CertificateService {
       stepsExecuted: steps,
       bytesOverwritten: bytesOverwritten,
       totalDeviceBytes: totalDeviceBytes,
+      bootEnvironment: bootEnvironment,
     );
 
     final String payloadJson = jsonEncode(payloadToSign);
@@ -372,6 +395,7 @@ class CertificateService {
       stepsExecuted: steps,
       bytesOverwritten: bytesOverwritten,
       totalDeviceBytes: totalDeviceBytes,
+      bootEnvironment: bootEnvironment,
     );
   }
 
@@ -414,6 +438,8 @@ class CertificateService {
         (certJson['stepsExecuted'] as List<dynamic>?)?.map((e) => e.toString()).toList();
     final bytesOverwritten = (certJson['bytesOverwritten'] as num?)?.toInt();
     final totalDeviceBytes = (certJson['totalDeviceBytes'] as num?)?.toInt();
+    // B5: optional signed boot-environment claim; absent on pre-B5 v4 certs.
+    final bootEnvironment = certJson['bootEnvironment'] as String?;
 
     final evidenceHash = (certJson['evidence'] is Map)
         ? certJson['evidence']['evidenceHash'] as String? ?? ''
@@ -443,6 +469,7 @@ class CertificateService {
       stepsExecuted: stepsExecuted,
       bytesOverwritten: bytesOverwritten,
       totalDeviceBytes: totalDeviceBytes,
+      bootEnvironment: bootEnvironment,
     );
 
     return _verifySignature(jsonEncode(payload), signature);
@@ -683,6 +710,10 @@ class CertificateService {
                           .map((p) => p['name'] ?? 'partition #${p['partition_number']}')
                           .join(', ')
                     ],
+                  // B5: where the wipe ran from (live medium vs installed
+                  // system) — signed, so the claim is verifiable.
+                  if (cert.bootEnvironmentDisplay != null)
+                    ['Boot Environment', cert.bootEnvironmentDisplay!],
                   ['Standard Reference', cert.standardReference],
                   ['Execution Time', '${cert.startTime.toString().substring(0, 19)} to ${cert.endTime.toString().substring(11, 19)}'],
                   if (cert.operatorNote != null) ['Operator Note', cert.operatorNote!],

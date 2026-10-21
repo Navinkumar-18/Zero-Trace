@@ -155,7 +155,12 @@ class SanitizationJob {
   final String standardReference;
   final String explanationText;
   final PartitionInfo? targetPartition;
-  
+
+  /// B4: every partition this job targets (sequential multi-partition wipe).
+  /// [targetPartition] stays the first target for back-compat; empty for
+  /// whole-device jobs.
+  final List<PartitionInfo> targetPartitions;
+
   JobStatus status;
   double? progress; // 0.0 to 1.0, null for indeterminate
   String currentStageDescription;
@@ -178,7 +183,8 @@ class SanitizationJob {
     required this.recommendedMethod,
     required this.standardReference,
     required this.explanationText,
-    this.targetPartition,
+    PartitionInfo? targetPartition,
+    List<PartitionInfo>? targetPartitions,
     this.status = JobStatus.idle,
     this.progress,
     this.currentStageDescription = 'Ready to initiate sanitization pipeline',
@@ -189,7 +195,20 @@ class SanitizationJob {
     this.overriddenMethod,
     this.destroyAcknowledged = false,
     this.wipeCompleted = false,
-  }) : logs = logs ?? [];
+  })  : targetPartition = targetPartition,
+        targetPartitions = targetPartitions ??
+            (targetPartition != null
+                ? <PartitionInfo>[targetPartition]
+                : const []),
+        logs = logs ?? [];
+
+  /// B4: execution targets for this job — every selected partition for a
+  /// sequential subset wipe, or a single whole-device (null) pass.
+  List<PartitionInfo?> get wipeExecutionTargets => targetPartition == null
+      ? const [null]
+      : List<PartitionInfo?>.from(targetPartitions.isEmpty
+          ? <PartitionInfo?>[targetPartition]
+          : targetPartitions);
 
   /// Whether this job targets a single partition rather than the whole block device.
   bool get isPartitionScope => targetPartition != null;

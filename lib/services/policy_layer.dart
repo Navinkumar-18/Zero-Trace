@@ -1,3 +1,4 @@
+import '../models/partition_info.dart';
 import '../models/sanitization_job.dart';
 
 class PolicyValidationResult {
@@ -72,29 +73,6 @@ class PolicyLayer {
 
     // Safety Rule 4: Partition mode method allowlist & target protection
     if (job.isPartitionScope) {
-      // A3: internal-disk partitions are allowed, but ONLY non-system ones.
-      // Still refused below: the boot/system disk (isSystemDisk covers disks
-      // hosting /, /boot, /boot/efi, /usr, /var, /home and live media),
-      // protected mounts, active swap, and busy holders. The Rust engine is
-      // the authoritative enforcement point and applies the same family
-      // (disk + sibling partitions) rules plus live-mode awareness.
-      if (job.device.isSystemDisk) {
-        return PolicyValidationResult(
-          isAllowed: false,
-          policyMessage:
-              'POLICY VIOLATION: Refusing partition wipe on the system/live disk (${job.device.name}). '
-              'The disk hosting the operating system or live medium is never wipeable, including its non-system partitions.',
-        );
-      }
-
-      if (method != SanitizationMethod.singlePassOverwrite &&
-          method != SanitizationMethod.multiPassOverwrite) {
-        return PolicyValidationResult(
-          isAllowed: false,
-          policyMessage: 'POLICY VIOLATION: Partition mode only allows overwrite methods (Single-Pass Zero or 3-Pass Overwrite). Controller-level firmware erase cannot target a single partition.',
-        );
-      }
-
       final part = job.targetPartition;
       if (part == null) {
         return PolicyValidationResult(
@@ -102,33 +80,75 @@ class PolicyLayer {
           policyMessage: 'POLICY VIOLATION: Partition-scoped wipe requires an explicitly selected target partition.',
         );
       }
-      // A3: partitions holding system paths are never wipeable, even when
-      // mounted under an otherwise-unmountable location.
-      const systemMounts = {'/', '/boot', '/boot/efi', '/usr', '/var', '/home'};
-      final partMp = part.mountPoint;
-      if (partMp != null && systemMounts.contains(partMp)) {
-        return PolicyValidationResult(
-          isAllowed: false,
-          policyMessage: 'POLICY VIOLATION: Target partition (${part.name}) holds a system path ($partMp) and is never wipeable.',
-        );
-      }
-      if (part.isProtected || part.isActiveSwap) {
-        return PolicyValidationResult(
-          isAllowed: false,
-          policyMessage: 'POLICY VIOLATION: Target partition (${part.name}) is protected (system mount, active swap, or live media).',
-        );
-      }
-      if (part.isMounted && !part.isMountAllowed) {
-        return PolicyValidationResult(
-          isAllowed: false,
-          policyMessage: 'POLICY VIOLATION: Target partition (${part.name}) has protected mount (${part.mountPoint}).',
-        );
-      }
+      final perTarget = validatePartitionTarget(job, part);
+      if (!perTarget.isAllowed) return perTarget;
     }
 
     return PolicyValidationResult(
       isAllowed: true,
       policyMessage: 'POLICY PASSED: Method ${method.displayName} matches static execution whitelist.',
+    );
+  }
+
+  /// B4: per-target partition-scope gate. Validates ONE partition of a
+  /// partition-scope job. [validateOperation] uses it for the first target;
+  /// the controller runs it as a fail-closed pre-flight over EVERY selected
+  /// partition before the first wipe starts.
+  ///
+  /// Messages are identical to the original inline Rule 4 checks so existing
+  /// policy tests and operator-facing wording stay stable.
+  PolicyValidationResult validatePartitionTarget(SanitizationJob job, PartitionInfo part) {
+    final method = job.effectiveMethod;
+
+    // A3: internal-disk partitions are allowed, but ONLY non-system ones.
+    // Still refused below: the boot/system disk (isSystemDisk covers disks
+    // hosting /, /boot, /boot/efi, /usr, /var, /home and live media),
+    // protected mounts, active swap, and busy holders. The Rust engine is
+    // the authoritative enforcement point and applies the same family
+    // (disk + sibling partitions) rules plus live-mode awareness.
+    if (job.device.isSystemDisk) {
+      return PolicyValidationResult(
+        isAllowed: false,
+        policyMessage:
+            'POLICY VIOLATION: Refusing partition wipe on the system/live disk (${job.device.name}). '
+            'The disk hosting the operating system or live medium is never wipeable, including its non-system partitions.',
+      );
+    }
+
+    if (method != SanitizationMethod.singlePassOverwrite &&
+        method != SanitizationMethod.multiPassOverwrite) {
+      return PolicyValidationResult(
+        isAllowed: false,
+        policyMessage: 'POLICY VIOLATION: Partition mode only allows overwrite methods (Single-Pass Zero or 3-Pass Overwrite). Controller-level firmware erase cannot target a single partition.',
+      );
+    }
+
+    // A3: partitions holding system paths are never wipeable, even when
+    // mounted under an otherwise-unmountable location.
+    const systemMounts = {'/', '/boot', '/boot/efi', '/usr', '/var', '/home'};
+    final partMp = part.mountPoint;
+    if (partMp != null && systemMounts.contains(partMp)) {
+      return PolicyValidationResult(
+        isAllowed: false,
+        policyMessage: 'POLICY VIOLATION: Target partition (${part.name}) holds a system path ($partMp) and is never wipeable.',
+      );
+    }
+    if (part.isProtected || part.isActiveSwap) {
+      return PolicyValidationResult(
+        isAllowed: false,
+        policyMessage: 'POLICY VIOLATION: Target partition (${part.name}) is protected (system mount, active swap, or live media).',
+      );
+    }
+    if (part.isMounted && !part.isMountAllowed) {
+      return PolicyValidationResult(
+        isAllowed: false,
+        policyMessage: 'POLICY VIOLATION: Target partition (${part.name}) has protected mount (${part.mountPoint}).',
+      );
+    }
+
+    return PolicyValidationResult(
+      isAllowed: true,
+      policyMessage: 'POLICY PASSED: Target partition (${part.name}) passes partition-scope policy.',
     );
   }
 }

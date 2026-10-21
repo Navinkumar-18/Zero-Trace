@@ -7,6 +7,7 @@ import '../models/device_profile.dart';
 import '../models/partition_info.dart';
 import '../models/untrusted_text.dart';
 import 'device_simulator.dart';
+import 'engine_binary_resolver.dart';
 import 'partition_table_service.dart';
 import 'policy_layer.dart';
 
@@ -43,13 +44,20 @@ class DeviceIntelligenceService {
     }
 
     try {
-      debugPrint('[DISCOVERY] Running: lsblk -J -b -o NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG,FSTYPE,LABEL,PARTUUID,START,PARTN,DISC-MAX,PTTYPE');
-      final result = await Process.run('lsblk', [
-        '-J',
-        '-b',
-        '-o',
-        'NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG,FSTYPE,LABEL,PARTUUID,START,PARTN,DISC-MAX,PTTYPE'
-      ]);
+      // B1 columns: PARTTYPE (GPT GUID / MBR type byte) + FSUSED (read-only
+      // used-space for mounted volumes). Older lsblk builds may lack them —
+      // fall back to the legacy column set so discovery never breaks.
+      const fullColumns =
+          'NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG,FSTYPE,LABEL,PARTUUID,PARTTYPE,FSUSED,START,PARTN,DISC-MAX,PTTYPE';
+      const legacyColumns =
+          'NAME,MODEL,SERIAL,SIZE,ROTA,TRAN,MOUNTPOINT,TYPE,RM,HOTPLUG,FSTYPE,LABEL,PARTUUID,START,PARTN,DISC-MAX,PTTYPE';
+      debugPrint('[DISCOVERY] Running: lsblk -J -b -o $fullColumns');
+      var result = await Process.run('lsblk', ['-J', '-b', '-o', fullColumns]);
+      if (result.exitCode != 0) {
+        debugPrint(
+            '[DISCOVERY] lsblk with B1 columns failed (${result.stderr}); retrying legacy columns');
+        result = await Process.run('lsblk', ['-J', '-b', '-o', legacyColumns]);
+      }
 
       if (result.exitCode != 0) {
         lastScanError = 'lsblk exited with code ${result.exitCode}: ${result.stderr}';
@@ -68,12 +76,77 @@ class DeviceIntelligenceService {
 
       final Map<String, dynamic> parsed = jsonDecode(result.stdout as String);
       final List<dynamic> devicesJson = parsed['blockdevices'] ?? [];
-      return parseBlockDevices(devicesJson);
+      final profiles = parseBlockDevices(devicesJson);
+      // B1/B2: authoritative engine tags (GPT type names, BitLocker/LUKS,
+      // boot-sector fs probe) merged best-effort on top of lsblk data.
+      return await _enrichWithEngineTags(profiles);
     } catch (e) {
       lastScanError = e.toString();
       debugPrint('[DISCOVERY ERROR EXCEPTION] $e');
       return [];
     }
+  }
+
+  /// B1/B2: enrich each real profile's partitions with the authoritative
+  /// `zt_engine partitions <disk>` tags (type GUID/name/role, volume-header
+  /// fs probe, BitLocker/LUKS detection). Best-effort: engine absence or a
+  /// failing probe leaves the lsblk-derived tags untouched.
+  Future<List<DeviceProfile>> _enrichWithEngineTags(
+      List<DeviceProfile> profiles) async {
+    for (var i = 0; i < profiles.length; i++) {
+      final profile = profiles[i];
+      if (!profile.id.startsWith('real_') || profile.partitions.isEmpty) {
+        continue;
+      }
+      final diskName = profile.id.substring(5);
+      try {
+        final bin = await resolveEngineBinaryPath();
+        final res = await Process.run(bin, ['partitions', '/dev/$diskName'])
+            .timeout(const Duration(seconds: 5));
+        final out = res.stdout as String? ?? '';
+        const marker = 'PARTITIONS_REPORT:';
+        final idx = out.indexOf(marker);
+        if (idx < 0) continue;
+        final report =
+            jsonDecode(out.substring(idx + marker.length)) as Map<String, dynamic>;
+        final engineParts = report['partitions'] as List<dynamic>? ?? [];
+        final byName = <String, Map<String, dynamic>>{
+          for (final p in engineParts)
+            if (p is Map) (p['name'] as String? ?? ''): Map<String, dynamic>.from(p),
+        };
+        final merged = profile.partitions.map((p) {
+          final e = byName[p.name];
+          if (e == null) return p;
+          return PartitionInfo(
+            partitionNumber: p.partitionNumber,
+            name: p.name,
+            devicePath: p.devicePath,
+            startSector: p.startSector,
+            sizeSectors: p.sizeSectors,
+            sizeBytes: p.sizeBytes,
+            label: p.label,
+            partUuid: p.partUuid,
+            // Unmounted volumes: the engine's boot-sector probe is the only
+            // filesystem evidence available.
+            fsType: p.fsType ?? (e['fs_probe'] as String?),
+            mountPoint: p.mountPoint,
+            isMounted: p.isMounted,
+            isMountAllowed: p.isMountAllowed,
+            isProtected: p.isProtected,
+            isActiveSwap: p.isActiveSwap,
+            partTypeGuid: (e['type_guid'] as String?) ?? p.partTypeGuid,
+            partTypeName: (e['type_name'] as String?) ?? p.partTypeName,
+            role: (e['role'] as String?) ?? p.role,
+            encryptionKind: p.encryptionKind ?? (e['encryption'] as String?),
+            usedBytes: p.usedBytes,
+          );
+        }).toList();
+        profiles[i] = profile.copyWith(partitions: merged);
+      } catch (e) {
+        debugPrint('[DISCOVERY] engine enrichment skipped for $diskName: $e');
+      }
+    }
+    return profiles;
   }
 
   /// Parses block devices list from lsblk JSON into DeviceProfile models.
@@ -135,6 +208,23 @@ class DeviceIntelligenceService {
           final childPartn = (child['partn'] as num?)?.toInt() ?? _extractPartNumber(childName);
           final rawLabel = (child['label'] as String?)?.trim() ?? '';
           final childPartUuid = (child['partuuid'] as String?)?.trim();
+          // B1: lsblk PARTTYPE (GPT type GUID or MBR type byte) + FSUSED
+          // (read-only used space, only present for mounted volumes).
+          final childPartType = (child['parttype'] as String?)?.trim();
+          final childFsUsed = (child['fsused'] as num?)?.toInt();
+          final (typeName, role) = PartitionInfo.classifyTypeToken(
+            (childPartType != null && childPartType.isNotEmpty)
+                ? childPartType
+                : null,
+            fsType: (childFs != null && childFs.isNotEmpty) ? childFs : null,
+          );
+          // B2: udev/blkid surfaces volume-header signatures as FSTYPE.
+          final childEncryption = switch (childFs?.toLowerCase()) {
+            'bitlocker' => 'BitLocker',
+            'crypto_luks' => 'LUKS',
+            'luks' => 'LUKS',
+            _ => null,
+          };
 
           final bool isMounted = mp != null && mp.isNotEmpty;
           final bool isMountAllowed = isMounted && PolicyLayer.isMountUnmountable(mp);
@@ -186,6 +276,13 @@ class DeviceIntelligenceService {
               isMountAllowed: isMountAllowed,
               isProtected: isProtected,
               isActiveSwap: isActiveSwap,
+              partTypeGuid: (childPartType != null && childPartType.isNotEmpty)
+                  ? childPartType
+                  : null,
+              partTypeName: typeName,
+              role: role,
+              encryptionKind: childEncryption,
+              usedBytes: childFsUsed,
             ));
           }
         }
