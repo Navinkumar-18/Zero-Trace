@@ -129,20 +129,24 @@ fn generate_sample_offsets(device_size: u64, sample_count: u32, seed: u64) -> Ve
 }
 
 /// Read a single sector at the given offset from a file/device.
-/// On Linux, uses O_DIRECT to bypass page cache.
-/// On other platforms, uses standard file I/O (for testing).
+///
+/// Uses O_DIRECT (opened through the backend) to bypass the page cache;
+/// when O_DIRECT is unavailable (e.g. on regular fixture files) it falls
+/// back to a buffered read opened through the backend as well. C2b: this
+/// module never opens a device itself — every open helper lives in
+/// `backend/linux`.
+///
+/// (The historic `#[cfg(not(target_os = "linux"))]` std-I/O branch was dead
+/// code — the whole `verify` module compiles only on Linux (see `lib.rs`)
+/// — and was removed so the C2b static scan needs no std-open exception
+/// outside `backend/`.)
 fn read_sector_at(path: &str, offset: u64) -> Result<Vec<u8>, VerifyError> {
-    #[cfg(target_os = "linux")]
     {
         use std::io::{Read, Seek, SeekFrom};
 
-        // Try O_DIRECT first for cache-bypass guarantee
-        let fd = unsafe {
-            libc::open(
-                std::ffi::CString::new(path).unwrap().as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECT,
-            )
-        };
+        // C2b: the device open lives in the backend — try O_DIRECT first
+        // for the cache-bypass guarantee.
+        let fd = crate::backend::linux::open_read_direct_fd(path);
 
         if fd >= 0 {
             let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
@@ -184,34 +188,12 @@ fn read_sector_at(path: &str, offset: u64) -> Result<Vec<u8>, VerifyError> {
         }
 
         // Fallback to standard I/O if O_DIRECT fails (e.g., on non-block devices)
-        let mut file = std::fs::File::open(path)
+        let mut file = crate::backend::linux::open_read_buffered(path)
             .map_err(|e| VerifyError::DeviceOpenFailed(format!("{}: {}", path, e)))?;
         {
             use std::os::unix::io::AsRawFd;
-            let fd = file.as_raw_fd();
-            unsafe {
-                libc::ioctl(fd, 0x1261, 0); // BLKFLSBUF
-                libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
-            }
+            crate::backend::linux::drop_cache_for_read(file.as_raw_fd());
         }
-        file.seek(SeekFrom::Start(offset)).map_err(|e| VerifyError::ReadFailed {
-            offset,
-            message: format!("Seek failed: {}", e),
-        })?;
-        let mut buf = vec![0u8; SECTOR_SIZE];
-        file.read_exact(&mut buf).map_err(|e| VerifyError::ReadFailed {
-            offset,
-            message: format!("Read failed: {}", e),
-        })?;
-        Ok(buf)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        use std::io::{Read, Seek, SeekFrom};
-
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| VerifyError::DeviceOpenFailed(format!("{}: {}", path, e)))?;
         file.seek(SeekFrom::Start(offset)).map_err(|e| VerifyError::ReadFailed {
             offset,
             message: format!("Seek failed: {}", e),

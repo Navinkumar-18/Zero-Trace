@@ -149,7 +149,7 @@ pub fn parse_swaps(content: &str) -> Vec<String> {
 /// signature without a GPT header), "none" (no signature at all),
 /// or "unknown" (device unreadable / too small).
 pub fn detect_table_type(disk_path: &Path) -> String {
-    let mut f = match fs::File::open(disk_path) {
+    let mut f = match crate::backend::linux::open_read_buffered(disk_path) {
         Ok(f) => f,
         Err(_) => return "unknown".to_string(),
     };
@@ -344,7 +344,7 @@ pub fn parse_gpt_entry(entry: &[u8]) -> Option<GptPartitionEntry> {
 /// Read the primary GPT partition-entry array from a disk image/device
 /// (read-only). Returns entries in table order.
 pub fn read_gpt_entries(disk_path: &Path) -> Option<Vec<GptPartitionEntry>> {
-    let mut f = fs::File::open(disk_path).ok()?;
+    let mut f = crate::backend::linux::open_read_buffered(disk_path).ok()?;
     let mut hdr = [0u8; 512];
     f.seek(SeekFrom::Start(512)).ok()?;
     f.read_exact(&mut hdr).ok()?;
@@ -393,7 +393,7 @@ pub fn parse_mbr_entries(sector: &[u8]) -> Vec<MbrPartitionEntry> {
 
 /// Read the MBR (LBA 0) of a disk image/device (read-only).
 pub fn read_mbr_entries(disk_path: &Path) -> Vec<MbrPartitionEntry> {
-    let mut f = match fs::File::open(disk_path) {
+    let mut f = match crate::backend::linux::open_read_buffered(disk_path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
@@ -464,7 +464,7 @@ pub fn probe_volume_header(buf: &[u8]) -> VolumeProbe {
 /// seeking on its parent disk/image to `start_sector * 512`. Works without
 /// per-partition device nodes (fixtures, minimal udev environments).
 pub fn read_volume_probe_at(disk_path: &Path, start_sector: u64) -> VolumeProbe {
-    let mut f = match fs::File::open(disk_path) {
+    let mut f = match crate::backend::linux::open_read_buffered(disk_path) {
         Ok(f) => f,
         Err(_) => return VolumeProbe::default(),
     };

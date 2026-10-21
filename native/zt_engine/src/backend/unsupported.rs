@@ -109,12 +109,16 @@ impl BlockBackend for UnsupportedBackend {
         None
     }
 
-    fn sysfs_related_names(&self, _name: &str, _relation: crate::backend::Relation) -> Vec<String> {
-        Vec::new()
+    fn sysfs_related_names(
+        &self,
+        _name: &str,
+        _relation: crate::backend::Relation,
+    ) -> Result<Vec<String>, crate::backend::BackendError> {
+        Ok(Vec::new())
     }
 
-    fn btrfs_member_devices(&self) -> Vec<String> {
-        Vec::new()
+    fn btrfs_member_devices(&self) -> Result<Vec<String>, crate::backend::BackendError> {
+        Ok(Vec::new())
     }
 
     fn sysfs_root_display(&self) -> String {

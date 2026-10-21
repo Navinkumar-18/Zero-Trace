@@ -51,6 +51,11 @@ pub struct MockBackend {
     parents: HashMap<String, String>,
     holders: HashMap<String, Vec<String>>,
     slaves: HashMap<String, Vec<String>>,
+    /// C2c fault injection: `(block, relation)` pairs whose sysfs dir exists
+    /// but cannot be read — the guard must fail closed, never skip.
+    unreadable_relations: Vec<(String, Relation)>,
+    /// C2c fault injection: mountinfo exists but cannot be read.
+    unreadable_mountinfo: bool,
     btrfs_members: Vec<String>,
     file_backing: HashMap<String, (u32, u32)>,
     raw_files: HashMap<String, Vec<u8>>,
@@ -91,6 +96,8 @@ impl MockBackend {
             parents: HashMap::new(),
             holders: HashMap::new(),
             slaves: HashMap::new(),
+            unreadable_relations: Vec::new(),
+            unreadable_mountinfo: false,
             btrfs_members: Vec::new(),
             file_backing: HashMap::new(),
             raw_files: HashMap::new(),
@@ -207,6 +214,19 @@ impl MockBackend {
     /// Mark an attribute as existing-but-unreadable (fail-closed sites).
     pub fn with_unreadable_attr(mut self, block: &str, attr: &str) -> Self {
         self.unreadable.insert(format!("{}/{}", block, attr));
+        self
+    }
+
+    /// C2c: mark a holders/slaves dir as existing-but-unreadable — the guard
+    /// must fail closed (block the wipe), never skip the relation.
+    pub fn with_unreadable_relation(mut self, block: &str, relation: Relation) -> Self {
+        self.unreadable_relations.push((block.to_string(), relation));
+        self
+    }
+
+    /// C2c: mountinfo exists but cannot be read — the guard must fail closed.
+    pub fn with_unreadable_mountinfo(mut self) -> Self {
+        self.unreadable_mountinfo = true;
         self
     }
 
@@ -448,6 +468,12 @@ impl BlockBackend for MockBackend {
     }
 
     fn read_mount_state(&self) -> Result<MountState, BackendError> {
+        // C2c fault injection: exists-but-unreadable mountinfo fail-closes.
+        if self.unreadable_mountinfo {
+            return Err(BackendError::Unavailable(
+                "mock: mountinfo exists but cannot be read".to_string(),
+            ));
+        }
         let mountinfo = self
             .mountinfo
             .clone()
@@ -514,15 +540,30 @@ impl BlockBackend for MockBackend {
         self.parents.get(name).cloned()
     }
 
-    fn sysfs_related_names(&self, name: &str, relation: Relation) -> Vec<String> {
-        match relation {
+    fn sysfs_related_names(&self, name: &str, relation: Relation) -> Result<Vec<String>, BackendError> {
+        // C2c: injected unreadable dirs fail closed instead of skipping.
+        if self
+            .unreadable_relations
+            .iter()
+            .any(|(block, rel)| block == name && *rel == relation)
+        {
+            let rel = match relation {
+                Relation::Holders => "holders",
+                Relation::Slaves => "slaves",
+            };
+            return Err(BackendError::Unavailable(format!(
+                "mock: {} dir unreadable for {}",
+                rel, name
+            )));
+        }
+        Ok(match relation {
             Relation::Holders => self.holders.get(name).cloned().unwrap_or_default(),
             Relation::Slaves => self.slaves.get(name).cloned().unwrap_or_default(),
-        }
+        })
     }
 
-    fn btrfs_member_devices(&self) -> Vec<String> {
-        self.btrfs_members.clone()
+    fn btrfs_member_devices(&self) -> Result<Vec<String>, BackendError> {
+        Ok(self.btrfs_members.clone())
     }
 
     fn sysfs_root_display(&self) -> String {
@@ -609,6 +650,7 @@ impl BlockBackend for MockBackend {
             self.logical_block_size,
             Box::new(writer),
             Box::new(reader),
+            None, // memory-backed mock: no kernel fd
         ))
     }
 

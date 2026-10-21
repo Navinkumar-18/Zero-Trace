@@ -7,7 +7,9 @@
 //! executes primitives. All policy lives in [`crate::guard`].
 
 use std::fs;
+use std::io;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -16,11 +18,11 @@ use crate::backend::{
     HandleReader, MountState, PartitionFacts, Relation, StatFact,
 };
 use crate::execute::{
-    canonicalize_device_path, detect_boot_environment_ctx, map_open_excl_error, DirectBlockWriter,
-    FsContext,
+    canonicalize_device_path, detect_boot_environment_ctx, map_open_excl_error,
+    recheck_protection_by_dev_t, FsContext,
 };
 use crate::guard::ValidatedTarget;
-use crate::types::{dev_major, dev_minor, BlockWriter, BootEnvironment, ExecuteError};
+use crate::types::{dev_major, dev_minor, BlockWriter, BootEnvironment, ExecuteError, GuardIdentity};
 
 /// BLKDISCARD ioctl number (`_IO(0x12, 119)`).
 const BLKDISCARD: libc::c_ulong = 0x1277;
@@ -139,8 +141,22 @@ impl BlockBackend for LinuxBackend {
                 ));
             }
         };
-        let swaps = fs::read_to_string(self.ctx.proc_root.join("swaps")).unwrap_or_default();
-        let mounts = fs::read_to_string(self.ctx.proc_root.join("mounts")).unwrap_or_default();
+        // C2c: an absent swaps/mounts file keeps its historic default (empty);
+        // an exists-but-unreadable file fails closed instead of being skipped.
+        let swaps = match fs::read_to_string(self.ctx.proc_root.join("swaps")) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(BackendError::Unavailable(format!("Cannot read swaps: {}", e)))
+            }
+        };
+        let mounts = match fs::read_to_string(self.ctx.proc_root.join("mounts")) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(e) => {
+                return Err(BackendError::Unavailable(format!("Cannot read mounts: {}", e)))
+            }
+        };
         Ok(MountState {
             mountinfo: content,
             mounts,
@@ -206,43 +222,68 @@ impl BlockBackend for LinuxBackend {
         Some(parent)
     }
 
-    fn sysfs_related_names(&self, name: &str, relation: Relation) -> Vec<String> {
+    fn sysfs_related_names(&self, name: &str, relation: Relation) -> Result<Vec<String>, BackendError> {
         let rel = match relation {
             Relation::Holders => "holders",
             Relation::Slaves => "slaves",
         };
         let dir = self.class_block().join(name).join(rel);
         if !dir.exists() {
-            return Vec::new();
+            // Absent relation dir: no edges (historic skip).
+            return Ok(Vec::new());
         }
-        fs::read_dir(&dir)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .collect()
-            })
-            .unwrap_or_default()
+        // C2c: exists-but-unreadable fails closed instead of skipping — an
+        // unreadable holders/slaves dir must block the wipe, never read as
+        // "no holders".
+        let entries = fs::read_dir(&dir).map_err(|e| {
+            BackendError::Unavailable(format!("Cannot read {} for {}: {}", rel, name, e))
+        })?;
+        let mut out = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                BackendError::Unavailable(format!("Cannot read {} for {}: {}", rel, name, e))
+            })?;
+            out.push(entry.file_name().to_string_lossy().to_string());
+        }
+        Ok(out)
     }
 
-    fn btrfs_member_devices(&self) -> Vec<String> {
+    fn btrfs_member_devices(&self) -> Result<Vec<String>, BackendError> {
         let btrfs_sys = self.ctx.sys_root.join("fs/btrfs");
         let mut out = Vec::new();
         if btrfs_sys.exists() {
-            if let Ok(entries) = fs::read_dir(&btrfs_sys) {
-                for entry in entries.flatten() {
-                    let devices_dir = entry.path().join("devices");
-                    if devices_dir.exists() {
-                        if let Ok(dev_entries) = fs::read_dir(&devices_dir) {
-                            for dev_entry in dev_entries.flatten() {
-                                out.push(dev_entry.file_name().to_string_lossy().to_string());
-                            }
-                        }
+            // C2c: absent `devices/` dirs are skipped (historic); unreadable
+            // dirs fail closed.
+            let entries = fs::read_dir(&btrfs_sys).map_err(|e| {
+                BackendError::Unavailable(format!("Cannot read btrfs device tree: {}", e))
+            })?;
+            for entry in entries {
+                let entry = entry.map_err(|e| {
+                    BackendError::Unavailable(format!("Cannot read btrfs device tree: {}", e))
+                })?;
+                let devices_dir = entry.path().join("devices");
+                if devices_dir.exists() {
+                    let dev_entries = fs::read_dir(&devices_dir).map_err(|e| {
+                        BackendError::Unavailable(format!(
+                            "Cannot read btrfs devices dir {}: {}",
+                            devices_dir.display(),
+                            e
+                        ))
+                    })?;
+                    for dev_entry in dev_entries {
+                        let dev_entry = dev_entry.map_err(|e| {
+                            BackendError::Unavailable(format!(
+                                "Cannot read btrfs devices dir {}: {}",
+                                devices_dir.display(),
+                                e
+                            ))
+                        })?;
+                        out.push(dev_entry.file_name().to_string_lossy().to_string());
                     }
                 }
             }
         }
-        out
+        Ok(out)
     }
 
     fn sysfs_root_display(&self) -> String {
@@ -361,18 +402,14 @@ impl BlockBackend for LinuxBackend {
 
     fn open_exclusive(&self, target: &ValidatedTarget) -> Result<ExclusiveHandle, BackendError> {
         let path = target.canonical_path().to_string();
+        // C2a: the historic typed error is carried verbatim through
+        // BackendError::OpenFailed so execution flows see exactly the same
+        // ExecuteError they saw when opening the writer directly.
         let writer =
-            DirectBlockWriter::open(&path, target.guard_identity()).map_err(|e| {
-                BackendError::Io(match &e {
-                    // Preserve the raw message body for diagnostics.
-                    ExecuteError::CommandFailed(m)
-                    | ExecuteError::DeviceNotFound(m)
-                    | ExecuteError::UnsupportedOperation(m) => m.clone(),
-                    other => other.to_string(),
-                })
-            })?;
+            DirectBlockWriter::open(&path, target.guard_identity()).map_err(BackendError::OpenFailed)?;
         let io_mode = writer.io_mode();
         let logical_block_size = writer.logical_block_size();
+        let raw_fd = writer.raw_fd();
         let reader = fs::File::open(&path).map_err(|e| BackendError::Io(e.to_string()))?;
         Ok(ExclusiveHandle::new(
             target.clone(),
@@ -381,6 +418,7 @@ impl BlockBackend for LinuxBackend {
             logical_block_size,
             Box::new(writer),
             Box::new(StdFileReader { file: reader }),
+            Some(raw_fd),
         ))
     }
 
@@ -411,5 +449,235 @@ impl BlockBackend for LinuxBackend {
             return Err(BackendError::Io(ioctl_err.to_string()));
         }
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C2a: direct writer — raw device opening is **private to this backend**.
+//
+// The historic `DirectBlockWriter` (O_EXCL open ladder, fd identity
+// re-validation, size/sector ioctls) moved here verbatim from
+// `execute.rs`; `execute` re-exports the type so the characterization
+// tests keep compiling, but only this module can open a block device.
+// ---------------------------------------------------------------------------
+
+const BLKGETSIZE64: libc::c_ulong = 0x80081272;
+const BLKSSZGET: libc::c_ulong = 0x1268;
+
+#[derive(Debug)]
+pub struct DirectBlockWriter {
+    file: fs::File,
+    io_mode: &'static str,
+    device_size: u64,
+    sector_size: u32,
+    bytes_since_sync: u64,
+}
+
+impl DirectBlockWriter {
+    pub fn open(path: &str, expected_identity: &GuardIdentity) -> Result<Self, ExecuteError> {
+        let c_path = std::ffi::CString::new(path)
+            .map_err(|e| ExecuteError::CommandFailed(format!("Invalid path: {}", e)))?;
+
+        let mut mode = "direct";
+        let mut fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDWR | libc::O_EXCL | libc::O_DIRECT,
+            )
+        };
+
+        if fd < 0 {
+            // Fallback 1: O_DSYNC
+            mode = "dsync";
+            fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_RDWR | libc::O_EXCL | libc::O_DSYNC,
+                )
+            };
+        }
+
+        if fd < 0 {
+            // Fallback 2: buffered + periodic fdatasync
+            mode = "buffered_sync_16mb";
+            fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_RDWR | libc::O_EXCL,
+                )
+            };
+        }
+
+        if fd < 0 {
+            let err = io::Error::last_os_error();
+            return Err(map_open_excl_error(err, path));
+        }
+
+        let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
+        let res = unsafe { libc::fstat(fd, &mut stat_buf) };
+        if res < 0 {
+            unsafe { libc::close(fd) };
+            return Err(ExecuteError::IoError(io::Error::last_os_error()));
+        }
+
+        let is_blk = (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFBLK;
+        let is_reg = (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFREG;
+        if !is_blk && !is_reg {
+            unsafe { libc::close(fd) };
+            return Err(ExecuteError::UnsupportedOperation(format!(
+                "Device {} is neither a block device nor a regular file",
+                path
+            )));
+        }
+
+        // Item 1: compare opened fd's st_rdev and S_ISBLK against identity recorded at boot-guard time
+        if expected_identity.is_block {
+            if !is_blk {
+                unsafe { libc::close(fd) };
+                return Err(ExecuteError::BootDiskProtection(
+                    "Target is not a block device (S_ISBLK check failed on opened fd)".to_string(),
+                ));
+            }
+            if stat_buf.st_rdev != expected_identity.st_rdev {
+                unsafe { libc::close(fd) };
+                return Err(ExecuteError::BootDiskProtection(format!(
+                    "Device identity changed between boot-guard and open (st_rdev mismatch: expected {}, got {}): aborting",
+                    expected_identity.st_rdev, stat_buf.st_rdev
+                )));
+            }
+            // Re-run protection check on the fd's major:minor
+            if let Err(e) = recheck_protection_by_dev_t(stat_buf.st_rdev, &FsContext::default()) {
+                unsafe { libc::close(fd) };
+                return Err(e);
+            }
+        } else {
+            // For non-block targets (e.g. tests), verify inode has not changed
+            if expected_identity.st_ino > 0 && stat_buf.st_ino as u64 != expected_identity.st_ino {
+                unsafe { libc::close(fd) };
+                return Err(ExecuteError::BootDiskProtection(format!(
+                    "Path resolved to a different file after boot-guard (inode mismatch: expected {}, got {}): aborting",
+                    expected_identity.st_ino, stat_buf.st_ino
+                )));
+            }
+        }
+
+        let mut size: u64 = 0;
+        if is_blk {
+            let ret = unsafe { libc::ioctl(fd, BLKGETSIZE64, &mut size) };
+            if ret != 0 || size == 0 {
+                size = stat_buf.st_size as u64;
+            }
+        } else {
+            size = stat_buf.st_size as u64;
+        }
+
+        let mut ssz: u32 = 512;
+        if is_blk {
+            unsafe { libc::ioctl(fd, BLKSSZGET, &mut ssz) }; // BLKSSZGET
+        }
+        if ssz == 0 {
+            ssz = 512;
+        }
+
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+
+        Ok(Self {
+            file,
+            io_mode: mode,
+            device_size: size,
+            sector_size: ssz,
+            bytes_since_sync: 0,
+        })
+    }
+
+    /// Raw fd of this writer — used by the exclusive-handle construction and
+    /// by the discard ioctl flow (which issues BLKDISCARD on the very fd
+    /// opened through the validated handle).
+    pub fn raw_fd(&self) -> i32 {
+        self.file.as_raw_fd()
+    }
+}
+
+impl BlockWriter for DirectBlockWriter {
+    fn write_chunk(&mut self, offset: u64, data: &[u8]) -> Result<usize, io::Error> {
+        use std::os::unix::fs::FileExt;
+        let written = self.file.write_at(data, offset)?;
+        self.bytes_since_sync += written as u64;
+        if self.io_mode == "buffered_sync_16mb" && self.bytes_since_sync >= 16 * 1024 * 1024 {
+            self.file.sync_data()?;
+            self.bytes_since_sync = 0;
+        }
+        Ok(written)
+    }
+
+    fn sync_data(&mut self) -> Result<(), io::Error> {
+        self.file.sync_data()?;
+        self.bytes_since_sync = 0;
+        Ok(())
+    }
+
+    fn flush_buffers(&mut self) -> Result<(), io::Error> {
+        self.file.sync_all()?;
+        let fd = self.file.as_raw_fd();
+        unsafe {
+            libc::ioctl(fd, 0x1261, 0); // BLKFLSBUF
+        }
+        Ok(())
+    }
+
+    fn total_size(&self) -> Result<u64, io::Error> {
+        Ok(self.device_size)
+    }
+
+    fn logical_block_size(&self) -> u32 {
+        self.sector_size
+    }
+
+    fn io_mode(&self) -> &'static str {
+        self.io_mode
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C2b: read-side primitives for verification sampling. Device opens and
+// block-device ioctls stay inside the backend; `verify.rs` keeps only the
+// buffer/seek logic around the fd it is handed.
+// ---------------------------------------------------------------------------
+
+/// Read-only O_DIRECT open for verification sampling. Returns the raw fd
+/// (caller owns/closes it) or -1 when O_DIRECT is unavailable, mirroring the
+/// historic verify.rs open ladder. A NUL-containing path is refused (-1)
+/// instead of panicking.
+pub(crate) fn open_read_direct_fd(path: &str) -> i32 {
+    let Ok(c_path) = std::ffi::CString::new(path) else {
+        return -1;
+    };
+    unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_DIRECT) }
+}
+
+/// Buffered read-only open (fallback of verification sampling when
+/// O_DIRECT is unavailable, e.g. on non-block files; also the read path for
+/// partition-table parsing in `partitions.rs`).
+pub(crate) fn open_read_buffered(path: impl AsRef<Path>) -> io::Result<fs::File> {
+    fs::File::open(path)
+}
+
+/// Drop page-cache lines backing `fd` (BLKFLSBUF + POSIX_FADV_DONTNEED) so
+/// verification reads back from media, not from cache.
+pub(crate) fn drop_cache_for_read(fd: i32) {
+    unsafe {
+        libc::ioctl(fd, 0x1261, 0); // BLKFLSBUF
+        libc::posix_fadvise(fd, 0, 0, libc::POSIX_FADV_DONTNEED);
+    }
+}
+
+/// C2b: the BLKDISCARD block-device ioctl. The raw kernel call lives in the
+/// backend; callers translate errno into typed errors on their side.
+pub(crate) fn blkdiscard_range(fd: i32, range: &mut [u64; 2]) -> io::Result<()> {
+    let ret = unsafe { libc::ioctl(fd, BLKDISCARD, range.as_mut_ptr()) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
 }

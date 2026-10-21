@@ -197,3 +197,150 @@ fn historic_guard_wrappers_delegate_to_crate_guard() {
 fn blocks_find(src: &str, name: &str) -> Option<(String, String)> {
     fn_blocks(src).into_iter().find(|(n, _)| n == name)
 }
+
+// ---------------------------------------------------------------------------
+// C2b: no direct device access outside `backend/`.
+//
+// After the C2a migration, the backend directory is the ONLY place that may
+// open a block device or issue a block-device ioctl. This scan fails if any
+// production source outside `src/backend/` regains one of those calls.
+// ---------------------------------------------------------------------------
+
+/// Functions whose `libc::open(` is a **file creation**, not a device open.
+/// Every entry must name a function that only ever creates its own temp file
+/// (O_CREAT | O_EXCL | O_NOFOLLOW on a path inside a directory it was
+/// handed) and never touches a block device.
+const ALLOWED_LIBC_OPEN_FNS: &[&str] = &[
+    // Atomic checkpoint writer: creates `<job>.tmp` inside the checkpoint
+    // directory with O_CREAT|O_EXCL|O_NOFOLLOW and renames it over the
+    // final file. Not a device.
+    "write_checkpoint_file_in_dir",
+];
+
+/// Std opens of device paths in production code outside `backend/`.
+///
+/// C2b: currently EMPTY — no std open of a device path may exist outside
+/// `backend/`. Any future entry must be documented and explicitly approved
+/// by the maintainer; the scan fails on every undevised std device open.
+const ALLOWED_STD_OPENS: &[(&str, &str)] = &[];
+
+/// Production `.rs` files under `src/`, excluding the backend directory.
+fn production_sources_outside_backend() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    collect_rs(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
+    out
+}
+
+fn collect_rs(dir: std::path::PathBuf, out: &mut Vec<(String, String)>) {
+    for entry in std::fs::read_dir(&dir).expect("read src/") {
+        let path = entry.expect("read_dir entry").path();
+        if path.is_dir() {
+            if path.file_name().and_then(|s| s.to_str()) == Some("backend") {
+                continue;
+            }
+            collect_rs(path, out);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            let rel = path
+                .strip_prefix(env!("CARGO_MANIFEST_DIR"))
+                .unwrap()
+                .display()
+                .to_string();
+            out.push((rel, std::fs::read_to_string(&path).expect("read source")));
+        }
+    }
+}
+
+#[test]
+fn no_direct_device_opens_or_ioctls_outside_backend() {
+    let files = production_sources_outside_backend();
+    // Sanity: the scan must actually see the crate sources (guard against a
+    // silent no-op if the directory layout ever changes).
+    assert!(
+        files.len() >= 6,
+        "static scan found only {} source files outside backend/ — layout changed?",
+        files.len()
+    );
+
+    let mut violations = Vec::new();
+    for (name, src) in &files {
+        let mut in_tests = false;
+        let mut current_fn = String::new();
+        for (idx, line) in src.split('\n').enumerate() {
+            let trimmed = line.trim();
+            // Skip `mod tests { ... }` bodies (fixture/temp-file I/O only).
+            if trimmed == "mod tests {" {
+                in_tests = true;
+                continue;
+            }
+            if in_tests {
+                if line == "}" {
+                    in_tests = false;
+                }
+                continue;
+            }
+            // Track the enclosing top-level function (rustfmt column 0).
+            if trimmed.starts_with("fn ")
+                || trimmed.starts_with("pub fn ")
+                || trimmed.starts_with("pub(crate) fn ")
+                || trimmed.starts_with("pub async fn ")
+                || trimmed.starts_with("async fn ")
+            {
+                current_fn = trimmed
+                    .split("fn ")
+                    .nth(1)
+                    .unwrap_or("")
+                    .split('(')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+            }
+            let loc = format!("{}:{}", name, idx + 1);
+
+            // 1. Raw open: any `libc::open(` outside backend/ must be a
+            //    documented file-creation helper.
+            if line.contains("libc::open(")
+                && !ALLOWED_LIBC_OPEN_FNS.contains(&current_fn.as_str())
+            {
+                violations.push(format!(
+                    "{}: raw `libc::open(` in fn `{}` — device opens live in backend/",
+                    loc, current_fn
+                ));
+            }
+
+            // 2. Device ioctl: all block-device ioctls (BLKDISCARD,
+            //    BLKFLSBUF, BLKGETSIZE64, ...) live in backend/.
+            if line.contains("libc::ioctl(") {
+                violations.push(format!(
+                    "{}: `libc::ioctl(` outside backend/ — device ioctls live in backend/",
+                    loc
+                ));
+            }
+
+            // 3. Std open of a device path: `File::open`/`OpenOptions` on a
+            //    `/dev` literal or the device-path variables this codebase
+            //    uses for device reads (disk_path, device_path, ...).
+            let std_open = line.contains("File::open(") || line.contains("OpenOptions::new(");
+            let deviceish = line.contains("/dev")
+                || line.contains("dev_root")
+                || line.contains("disk_path")
+                || line.contains("device_path")
+                || line.contains("canonical_path");
+            if std_open
+                && deviceish
+                && !ALLOWED_STD_OPENS
+                    .iter()
+                    .any(|(f, l)| f == name && trimmed == *l)
+            {
+                violations.push(format!(
+                    "{}: std open of a device path — device opens live in backend/",
+                    loc
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "raw device access outside backend/ (opens/ioctls must live in src/backend/):\n{}",
+        violations.join("\n")
+    );
+}

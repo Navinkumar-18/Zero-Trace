@@ -18,7 +18,7 @@ One shared guard chain + one UI; platform-specific disk access sits behind the
 | Guard chain (boot-disk protection, live/normal/container rules, confirmation token, partition validation, fingerprint, O_EXCL) | `src/guard.rs` | every target |
 | Shared types + `ValidatedTarget` (private constructor) | `src/types.rs`, `src/guard.rs` | every target |
 | `BlockBackend` trait, `current_backend()`, capabilities | `src/backend.rs` | every target |
-| `LinuxBackend` (the only real backend) | `src/backend/linux.rs` | Linux |
+| `LinuxBackend` (the only real backend; owns all raw device opens/ioctls incl. `DirectBlockWriter` and the read/write primitives) | `src/backend/linux.rs` | Linux |
 | Windows/Android/unknown stubs (`Unsupported`, caps all false) | `src/backend/{unsupported,windows,android}.rs` | every target |
 | `MockBackend` + shared conformance suite | `src/backend/{mock,conformance}.rs` | every target |
 | Engine modules (`detect`, `execute`, `partitions`, `verify`, `main`) | `src/` | Linux only (`#[cfg(target_os = "linux")]`); other targets get a stub `main` that exits 2 |
@@ -31,17 +31,36 @@ Rules for agents:
   decision. `open_exclusive`/`write_at` accept only a guard-minted
   `ValidatedTarget` — the `compile_fail` doc test on `ValidatedTarget` must
   keep passing (bypass must not compile).
-- **Known legacy-writer caveat (honest status):** the existing execution
-  paths (`software_overwrite*`, `discard_*`, firmware flows) still open their
-  writers through their historic call sites and keep their legacy writer
-  construction; the `ValidatedTarget` + `open_exclusive` path is the new
-  shared interface, exercised end-to-end by the conformance suite and
-  guarded at every device-level entry point per
-  `tests/guard_entry_scan_test.rs`. Fully rewiring every legacy writer
-  through `ExclusiveHandle` would change execution behavior, so it was
-  deliberately deferred — do not "fix" it casually; if you rewire it, the
-  full test suite plus golden fixtures must stay byte-identical and the
-  change must be explicitly approved.
+- **Legacy writers routed through the guard (Phase C2a):** every execution
+  flow (`software_overwrite`, `software_overwrite_partition`, `discard_erase`,
+  `discard_erase_partition`) mints a `ValidatedTarget` via
+  `guard::validate_whole_disk_flow_target` / `validate_partition_target`
+  (historic check order and error precedence preserved) and obtains its
+  writer through `BlockBackend::open_exclusive` (`execute::open_validated_writer`)
+  — no flow opens a device directly. Raw device opening is private to the
+  backend: `DirectBlockWriter` (O_EXCL open ladder, fd identity
+  re-validation) and the read/ioctl primitives (`open_read_direct_fd`,
+  `open_read_buffered`, `drop_cache_for_read`, `blkdiscard_range`) live in
+  `backend/linux.rs`; `execute` only re-exports the type so its
+  characterization tests keep compiling unchanged. Firmware flows drive
+  external tools and never open devices in-process.
+- **Static scan (Phase C2b):** `tests/guard_entry_scan_test.rs`
+  (`no_direct_device_opens_or_ioctls_outside_backend`) fails the build if
+  any source outside `src/backend/` uses `libc::open`/`libc::ioctl` or
+  opens device paths with std. The only `libc::open` exception is the
+  checkpoint temp-file creation (`write_checkpoint_file_in_dir`,
+  `O_CREAT|O_EXCL|O_NOFOLLOW` on a plain file, never a device); the
+  std-open exception list is empty.
+- **Fail-closed scans (Phase C2c — the single intended behavior change,
+  stricter never looser):** during the guard scan, exists-but-unreadable
+  sysfs/procfs state blocks the wipe with a typed `BootDiskProtection`
+  error instead of being skipped as absent — unreadable `holders`/`slaves`
+  dirs, unreadable btrfs device tree, unreadable
+  `swaps`/`mounts`/`mountinfo`, and unreadable mount-source `dev`
+  attributes. Absent state keeps its historic permissive semantics
+  (`Ok(None)`, missing dirs/files). Fault injection lives in
+  `MockBackend::with_unreadable_relation`, `with_unreadable_mountinfo`,
+  `with_unreadable_attr` and the Linux-fixture unreadable-swaps test.
 - **Never run the ignored hardware tests** (`cargo test --ignored`): the two
   loop-device tests need real disks + sudo and are permanently out of scope.
 - **Goldens** (`tests/fixtures/golden/*`,
@@ -55,7 +74,10 @@ Rules for agents:
   checkpoints may gain fields only when present (old fixtures must verify or
   parse byte-identically).
 
-Reference test counts after Phase C (baseline was Dart 422 / Rust 173 + 2
-ignored): `flutter test` → 434 passing; `cargo test` → 197 passing, 2
-ignored, 0 failed (includes the `compile_fail` doc test); `flutter analyze`
-and `cargo clippy --all-targets -- -D warnings` must be clean.
+Reference test counts after Phase C2 (Phase C baseline: Dart 434 / Rust
+197 + 2 ignored): `flutter test` → 434 passing; `cargo test` → 203
+passing, 2 ignored, 0 failed (includes the `compile_fail` doc test; the
++6 are the new C2 conformance/scan tests); `flutter analyze` and
+`cargo clippy --all-targets -- -D warnings` must be clean, and
+`cargo check` must pass for the `x86_64-pc-windows-gnu` and
+`aarch64-linux-android` targets.

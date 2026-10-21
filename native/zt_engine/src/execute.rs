@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -29,6 +29,8 @@ use tokio::sync::mpsc;
 // facts; these thin wrappers keep the historic signatures for every existing
 // caller and test while delegating to the single shared chain.
 use crate::backend::linux::LinuxBackend;
+use crate::backend::{BackendError, BlockBackend, ExclusiveHandle};
+use crate::guard::ValidatedTarget;
 pub use crate::types::{
     dev_major, dev_minor, is_mount_unmountable_allowlisted, parse_major_minor, BlockWriter,
     BootEnvironment, ExecuteError, GuardIdentity, PartitionTargetParams, ValidatedPartitionTarget,
@@ -902,11 +904,6 @@ pub async fn emmc_sanitize(
 // A6: Removable-media discard execution (blkdiscard-style BLKDISCARD ioctls)
 // ---------------------------------------------------------------------------
 
-/// `linux/fs.h`: `BLKDISCARD = _IO(0x12, 119)` — kernel TRIM/UNMAP of a byte
-/// range. Issued natively (no external blkdiscard binary) behind the same
-/// guard chain as every other execution path.
-const BLKDISCARD: libc::c_ulong = 0x1277;
-
 /// One aligned BLKDISCARD command range (byte offsets relative to the opened
 /// block-device node — for partitions, relative to the partition start).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1007,38 +1004,38 @@ pub fn read_discard_geometry(device: &str, ctx: &FsContext) -> (u64, u64) {
     (granularity.max(1), max_chunk)
 }
 
-/// Issue a single BLKDISCARD command; translate kernel refusals into typed errors.
+/// Issue a single BLKDISCARD command; translate kernel refusals into typed
+/// errors. The raw ioctl lives in the backend (C2b) — this wrapper keeps the
+/// historic errno mapping byte-for-byte.
 fn issue_discard_chunk(
     fd: libc::c_int,
     device: &str,
     chunk: DiscardChunk,
 ) -> Result<(), ExecuteError> {
     let mut range: [u64; 2] = [chunk.start, chunk.len];
-    let ret = unsafe { libc::ioctl(fd, BLKDISCARD, range.as_mut_ptr()) };
-    if ret == 0 {
-        return Ok(());
+    if let Err(err) = crate::backend::linux::blkdiscard_range(fd, &mut range) {
+        return match err.raw_os_error() {
+            Some(libc::EOPNOTSUPP) | Some(libc::ENOTTY) | Some(libc::ENOSYS) => {
+                Err(ExecuteError::UnsupportedOperation(format!(
+                    "BLKDISCARD is not supported on {} (device does not advertise discard)",
+                    device
+                )))
+            }
+            Some(libc::EPERM) | Some(libc::EACCES) => Err(ExecuteError::CommandFailed(format!(
+                "BLKDISCARD on {} was denied by the kernel (root privileges required): {}",
+                device, err
+            ))),
+            Some(libc::EINVAL) => Err(ExecuteError::UnsupportedOperation(format!(
+                "Kernel rejected BLKDISCARD range [{}, {}) on {} (alignment or granularity): {}",
+                chunk.start,
+                chunk.start + chunk.len,
+                device,
+                err
+            ))),
+            _ => Err(ExecuteError::IoError(err)),
+        };
     }
-    let err = io::Error::last_os_error();
-    match err.raw_os_error() {
-        Some(libc::EOPNOTSUPP) | Some(libc::ENOTTY) | Some(libc::ENOSYS) => {
-            Err(ExecuteError::UnsupportedOperation(format!(
-                "BLKDISCARD is not supported on {} (device does not advertise discard)",
-                device
-            )))
-        }
-        Some(libc::EPERM) | Some(libc::EACCES) => Err(ExecuteError::CommandFailed(format!(
-            "BLKDISCARD on {} was denied by the kernel (root privileges required): {}",
-            device, err
-        ))),
-        Some(libc::EINVAL) => Err(ExecuteError::UnsupportedOperation(format!(
-            "Kernel rejected BLKDISCARD range [{}, {}) on {} (alignment or granularity): {}",
-            chunk.start,
-            chunk.start + chunk.len,
-            device,
-            err
-        ))),
-        _ => Err(ExecuteError::IoError(err)),
-    }
+    Ok(())
 }
 
 /// Execute the ordered BLKDISCARD plan on an open fd, logging every step into
@@ -1118,10 +1115,14 @@ pub async fn discard_erase_ctx(
     let method_name = "BLKDISCARD (TRIM/UNMAP)".to_string();
     let step_prefix = if dry_run { "[DRY RUN] " } else { "" };
 
-    // 1. Guard chain — identical to every other execution path.
-    check_boot_disk_protection_ctx(device, dry_run, ctx)?;
-    verify_confirmation(confirmation_token, device_serial)?;
-    let guard_identity = get_guard_identity(device, dry_run, device_serial, ctx)?;
+    // 1. Guard chain — identical to every other execution path. C2a: the
+    //    historic check order (boot-disk protection → confirmation →
+    //    identity) now mints the validated target that gates the only
+    //    write-open below.
+    let backend = LinuxBackend::new(ctx.clone());
+    let validated_target = validate_whole_disk_flow_target_ctx(
+        device, confirmation_token, device_serial, dry_run, ctx,
+    )?;
     command_log.push(format!(
         "{}[guard] boot-disk protection and confirmation verified for {}",
         step_prefix, device
@@ -1183,8 +1184,9 @@ pub async fn discard_erase_ctx(
     verify_exclusive_access_and_recheck(device, false, ctx)?;
     command_log.push(format!("[guard] exclusive access verified on {}", device));
 
-    // 5. Open with O_EXCL + fd identity validation (same open as overwrite paths)
-    let mut writer = DirectBlockWriter::open(&guard_identity.canonical_path, &guard_identity)?;
+    // 5. Open with O_EXCL + fd identity validation — only through the
+    //    backend on the guard-minted validated target (C2a).
+    let mut writer = open_validated_writer(&backend, &validated_target)?;
     let size_bytes = writer.total_size().map_err(ExecuteError::IoError)?;
     let chunks = build_discard_chunks(0, size_bytes, granularity, max_chunk)?;
     command_log.push(format!(
@@ -1196,8 +1198,11 @@ pub async fn discard_erase_ctx(
         max_chunk
     ));
 
-    // 6. Ordered BLKDISCARD execution over the whole device
-    let fd = writer.file.as_raw_fd();
+    // 6. Ordered BLKDISCARD execution over the whole device — issued on the
+    //    handle's own fd (no second open of the device).
+    let fd = writer.raw_fd().ok_or_else(|| {
+        ExecuteError::UnsupportedOperation("backend exposes no raw fd for BLKDISCARD".to_string())
+    })?;
     let discarded = run_discard_plan(fd, device, &chunks, &tx, &mut command_log).await?;
 
     // 7. Flush the page cache so no stale data remains cached
@@ -1263,8 +1268,16 @@ pub async fn discard_erase_partition_ctx(
     verify_confirmation(confirmation_token, device_serial)?;
 
     // 2. Shared partition validation: sysfs geometry, PARTUUID, table
-    //    fingerprint, MBR extended refusal, logical-block alignment, identity
-    let target = validate_partition_target(device, params, ctx, dry_run, device_serial)?;
+    //    fingerprint, MBR extended refusal, logical-block alignment, identity.
+    //    C2a: same guard chain in the same order, now also minting the
+    //    validated target whose open_exclusive is the only write-open path.
+    let backend = LinuxBackend::new(ctx.clone());
+    let validated_target = crate::guard::validate_partition_target(
+        &backend, device, params, dry_run, device_serial,
+    )?;
+    let target = validated_target.to_legacy_partition_target().ok_or_else(|| {
+        ExecuteError::UnsupportedOperation("validated target is not partition-scoped".to_string())
+    })?;
     command_log.push(format!(
         "{}[guard] partition geometry and table fingerprint verified for {} ({} bytes)",
         step_prefix, device, target.size_bytes
@@ -1311,8 +1324,10 @@ pub async fn discard_erase_partition_ctx(
     verify_exclusive_access_and_recheck(device, false, ctx)?;
     command_log.push(format!("[guard] exclusive access verified on {}", device));
 
-    // 6. Open with O_EXCL + identity checks; cross-check BLKGETSIZE64 vs sysfs
-    let mut writer = DirectBlockWriter::open(&target.guard_identity.canonical_path, &target.guard_identity)?;
+    // 6. Open with O_EXCL + identity checks — only through the backend on
+    //    the guard-minted validated target (C2a); cross-check BLKGETSIZE64
+    //    vs sysfs unchanged.
+    let mut writer = open_validated_writer(&backend, &validated_target)?;
     let actual_size = writer.total_size().map_err(ExecuteError::IoError)?;
     if actual_size != target.size_bytes {
         return Err(ExecuteError::IdentityMismatch(format!(
@@ -1331,8 +1346,11 @@ pub async fn discard_erase_partition_ctx(
         max_chunk
     ));
 
-    // 7. Ordered BLKDISCARD execution over the partition range only
-    let fd = writer.file.as_raw_fd();
+    // 7. Ordered BLKDISCARD execution over the partition range only — issued
+    //    on the handle's own fd (no second open of the device).
+    let fd = writer.raw_fd().ok_or_else(|| {
+        ExecuteError::UnsupportedOperation("backend exposes no raw fd for BLKDISCARD".to_string())
+    })?;
     let discarded = run_discard_plan(fd, device, &chunks, &tx, &mut command_log).await?;
 
     // 8. Flush the page cache
@@ -1394,176 +1412,12 @@ impl Drop for AlignedBuffer {
     }
 }
 
-
-const BLKGETSIZE64: libc::c_ulong = 0x80081272;
-const BLKSSZGET: libc::c_ulong = 0x1268;
-
-#[derive(Debug)]
-pub struct DirectBlockWriter {
-    file: fs::File,
-    io_mode: &'static str,
-    device_size: u64,
-    sector_size: u32,
-    bytes_since_sync: u64,
-}
-
-impl DirectBlockWriter {
-    pub fn open(path: &str, expected_identity: &GuardIdentity) -> Result<Self, ExecuteError> {
-        let c_path = std::ffi::CString::new(path)
-            .map_err(|e| ExecuteError::CommandFailed(format!("Invalid path: {}", e)))?;
-
-        let mut mode = "direct";
-        let mut fd = unsafe {
-            libc::open(
-                c_path.as_ptr(),
-                libc::O_RDWR | libc::O_EXCL | libc::O_DIRECT,
-            )
-        };
-
-        if fd < 0 {
-            // Fallback 1: O_DSYNC
-            mode = "dsync";
-            fd = unsafe {
-                libc::open(
-                    c_path.as_ptr(),
-                    libc::O_RDWR | libc::O_EXCL | libc::O_DSYNC,
-                )
-            };
-        }
-
-        if fd < 0 {
-            // Fallback 2: buffered + periodic fdatasync
-            mode = "buffered_sync_16mb";
-            fd = unsafe {
-                libc::open(
-                    c_path.as_ptr(),
-                    libc::O_RDWR | libc::O_EXCL,
-                )
-            };
-        }
-
-        if fd < 0 {
-            let err = io::Error::last_os_error();
-            return Err(map_open_excl_error(err, path));
-        }
-
-        let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
-        let res = unsafe { libc::fstat(fd, &mut stat_buf) };
-        if res < 0 {
-            unsafe { libc::close(fd) };
-            return Err(ExecuteError::IoError(io::Error::last_os_error()));
-        }
-
-        let is_blk = (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFBLK;
-        let is_reg = (stat_buf.st_mode & libc::S_IFMT) == libc::S_IFREG;
-        if !is_blk && !is_reg {
-            unsafe { libc::close(fd) };
-            return Err(ExecuteError::UnsupportedOperation(format!(
-                "Device {} is neither a block device nor a regular file",
-                path
-            )));
-        }
-
-        // Item 1: compare opened fd's st_rdev and S_ISBLK against identity recorded at boot-guard time
-        if expected_identity.is_block {
-            if !is_blk {
-                unsafe { libc::close(fd) };
-                return Err(ExecuteError::BootDiskProtection(
-                    "Target is not a block device (S_ISBLK check failed on opened fd)".to_string(),
-                ));
-            }
-            if stat_buf.st_rdev != expected_identity.st_rdev {
-                unsafe { libc::close(fd) };
-                return Err(ExecuteError::BootDiskProtection(format!(
-                    "Device identity changed between boot-guard and open (st_rdev mismatch: expected {}, got {}): aborting",
-                    expected_identity.st_rdev, stat_buf.st_rdev
-                )));
-            }
-            // Re-run protection check on the fd's major:minor
-            if let Err(e) = recheck_protection_by_dev_t(stat_buf.st_rdev, &FsContext::default()) {
-                unsafe { libc::close(fd) };
-                return Err(e);
-            }
-        } else {
-            // For non-block targets (e.g. tests), verify inode has not changed
-            if expected_identity.st_ino > 0 && stat_buf.st_ino as u64 != expected_identity.st_ino {
-                unsafe { libc::close(fd) };
-                return Err(ExecuteError::BootDiskProtection(format!(
-                    "Path resolved to a different file after boot-guard (inode mismatch: expected {}, got {}): aborting",
-                    expected_identity.st_ino, stat_buf.st_ino
-                )));
-            }
-        }
-
-        let mut size: u64 = 0;
-        if is_blk {
-            let ret = unsafe { libc::ioctl(fd, BLKGETSIZE64, &mut size) };
-            if ret != 0 || size == 0 {
-                size = stat_buf.st_size as u64;
-            }
-        } else {
-            size = stat_buf.st_size as u64;
-        }
-
-        let mut ssz: u32 = 512;
-        if is_blk {
-            unsafe { libc::ioctl(fd, BLKSSZGET, &mut ssz) }; // BLKSSZGET
-        }
-        if ssz == 0 {
-            ssz = 512;
-        }
-
-        let file = unsafe { fs::File::from_raw_fd(fd) };
-
-        Ok(Self {
-            file,
-            io_mode: mode,
-            device_size: size,
-            sector_size: ssz,
-            bytes_since_sync: 0,
-        })
-    }
-}
-
-impl BlockWriter for DirectBlockWriter {
-    fn write_chunk(&mut self, offset: u64, data: &[u8]) -> Result<usize, io::Error> {
-        use std::os::unix::fs::FileExt;
-        let written = self.file.write_at(data, offset)?;
-        self.bytes_since_sync += written as u64;
-        if self.io_mode == "buffered_sync_16mb" && self.bytes_since_sync >= 16 * 1024 * 1024 {
-            self.file.sync_data()?;
-            self.bytes_since_sync = 0;
-        }
-        Ok(written)
-    }
-
-    fn sync_data(&mut self) -> Result<(), io::Error> {
-        self.file.sync_data()?;
-        self.bytes_since_sync = 0;
-        Ok(())
-    }
-
-    fn flush_buffers(&mut self) -> Result<(), io::Error> {
-        self.file.sync_all()?;
-        let fd = self.file.as_raw_fd();
-        unsafe {
-            libc::ioctl(fd, 0x1261, 0); // BLKFLSBUF
-        }
-        Ok(())
-    }
-
-    fn total_size(&self) -> Result<u64, io::Error> {
-        Ok(self.device_size)
-    }
-
-    fn logical_block_size(&self) -> u32 {
-        self.sector_size
-    }
-
-    fn io_mode(&self) -> &'static str {
-        self.io_mode
-    }
-}
+// C2a: the direct writer (O_EXCL open ladder, fd identity re-validation,
+// size/sector ioctls, BLKFLSBUF) now lives in the backend — raw device
+// opening is private to `backend/linux`. Re-exported so the historic API
+// (`zt_engine::execute::DirectBlockWriter`) and its characterization
+// tests keep working unchanged.
+pub use crate::backend::linux::DirectBlockWriter;
 
 pub struct FileBlockWriter {
     file: fs::File,
@@ -2312,10 +2166,17 @@ pub async fn software_overwrite(
     let start = Instant::now();
     let mut command_log = Vec::new();
 
-    // 1. Safety validation and identity pinning
-    check_boot_disk_protection(device, dry_run)?;
-    verify_confirmation(confirmation_token, device_serial)?;
-    let guard_identity = get_guard_identity(device, dry_run, device_serial, &FsContext::default())?;
+    // 1. Safety validation and identity pinning — boot-disk protection →
+    //    confirmation token → identity, minted as a validated target so the
+    //    only write-open below goes through the backend (C2a).
+    let backend = LinuxBackend::new(FsContext::default());
+    let validated_target = validate_whole_disk_flow_target_ctx(
+        device,
+        confirmation_token,
+        device_serial,
+        dry_run,
+        &FsContext::default(),
+    )?;
 
     let total_passes = match pattern {
         OverwritePattern::MultiPass3 => 3u8,
@@ -2360,12 +2221,13 @@ pub async fn software_overwrite(
     // 4. Verify exclusive access and re-check boot protection post-unmount
     verify_exclusive_access_and_recheck(device, false, &FsContext::default())?;
 
-    // 5. Open native block writer with O_EXCL and fd identity validation
-    let writer = DirectBlockWriter::open(&guard_identity.canonical_path, &guard_identity)?;
+    // 5. Open the device for writing only through the backend on the
+    //    guard-minted validated target (C2a: O_EXCL + fd identity checks).
+    let handle = open_validated_writer(&backend, &validated_target)?;
 
     // 6. Execute native overwrite
     execute_writer_overwrite(
-        writer,
+        handle,
         total_passes,
         pattern,
         device_serial,
@@ -2532,6 +2394,44 @@ pub fn map_open_excl_error(err: io::Error, path: &str) -> ExecuteError {
     }
 }
 
+/// C2a: mint the whole-device validated target for an execution flow —
+/// boot-disk protection → confirmation token → identity pinning, the exact
+/// historic check order (error precedence preserved). The returned target
+/// gates the only write-open path (`open_validated_writer`).
+pub fn validate_whole_disk_flow_target_ctx(
+    device: &str,
+    confirmation_token: &str,
+    device_serial: &str,
+    dry_run: bool,
+    ctx: &FsContext,
+) -> Result<ValidatedTarget, ExecuteError> {
+    crate::guard::validate_whole_disk_flow_target(
+        &LinuxBackend::new(ctx.clone()),
+        device,
+        confirmation_token,
+        device_serial,
+        dry_run,
+    )
+}
+
+/// C2a: the only way execution flows open a device for writing. Delegates to
+/// the backend's `open_exclusive` on a guard-minted [`ValidatedTarget`]
+/// (O_EXCL ladder + fd identity re-validation live in `backend/`) and maps
+/// backend errors back to the historic typed errors — `OpenFailed` carries
+/// the original `ExecuteError` verbatim, so every flow sees exactly the
+/// error it saw with the legacy `DirectBlockWriter::open` call.
+pub fn open_validated_writer(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+) -> Result<ExclusiveHandle, ExecuteError> {
+    backend.open_exclusive(target).map_err(|e| match e {
+        BackendError::OpenFailed(err) => err,
+        BackendError::Unavailable(msg) => ExecuteError::BootDiskProtection(msg),
+        BackendError::Io(msg) => ExecuteError::IoError(io::Error::other(msg)),
+        BackendError::Unsupported(msg) => ExecuteError::UnsupportedOperation(msg.to_string()),
+    })
+}
+
 /// Resolves the parent disk's serial number for a partition device node.
 pub fn resolve_parent_serial(device: &str, ctx: &FsContext) -> Result<String, ExecuteError> {
     crate::guard::resolve_parent_serial(&LinuxBackend::new(ctx.clone()), device)
@@ -2600,9 +2500,16 @@ pub async fn software_overwrite_partition_ctx(
     verify_confirmation(confirmation_token, device_serial)?;
 
     // 2. Shared partition validation (A6 extraction — byte-for-byte the same
-    //    checks as before, now also feeding the discard path)
-    let target = validate_partition_target(device, params, ctx, dry_run, device_serial)?;
-    let guard_identity = target.guard_identity;
+    //    checks as before, now also feeding the discard path). C2a: also
+    //    mints the validated target whose open_exclusive is the only
+    //    write-open path.
+    let backend = LinuxBackend::new(ctx.clone());
+    let validated_target = crate::guard::validate_partition_target(
+        &backend, device, params, dry_run, device_serial,
+    )?;
+    let target = validated_target.to_legacy_partition_target().ok_or_else(|| {
+        ExecuteError::UnsupportedOperation("validated target is not partition-scoped".to_string())
+    })?;
     let verified_size_bytes = target.size_bytes;
 
     let total_passes = match pattern {
@@ -2651,8 +2558,9 @@ pub async fn software_overwrite_partition_ctx(
     // 8. Verify exclusive access on the partition node
     verify_exclusive_access_and_recheck(device, false, ctx)?;
 
-    // 9. Open native block writer on the partition node with O_EXCL
-    let inner_writer = DirectBlockWriter::open(&guard_identity.canonical_path, &guard_identity)?;
+    // 9. Open native block writer on the partition node with O_EXCL — only
+    //    through the backend on the guard-minted validated target (C2a).
+    let inner_writer = open_validated_writer(&backend, &validated_target)?;
     let actual_blk_size = inner_writer.total_size()?;
     if actual_blk_size != verified_size_bytes {
         return Err(ExecuteError::IdentityMismatch(format!(
@@ -2683,6 +2591,7 @@ pub async fn software_overwrite_partition_ctx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::io::AsRawFd;
 
     struct FixtureBuilder {
         dir: tempfile::TempDir,

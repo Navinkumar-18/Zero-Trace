@@ -306,8 +306,11 @@ pub fn stubs_refuse_everything(backend: &dyn BlockBackend) -> Result<(), String>
         || backend.sysfs_block_exists("sda")
         || backend.sysfs_is_partition("sda1")
         || backend.sysfs_parent_link("sda1").is_some()
-        || !backend.sysfs_related_names("sda", crate::backend::Relation::Holders).is_empty()
-        || !backend.btrfs_member_devices().is_empty()
+        || !backend
+            .sysfs_related_names("sda", crate::backend::Relation::Holders)
+            .unwrap_or_default()
+            .is_empty()
+        || !backend.btrfs_member_devices().unwrap_or_default().is_empty()
     {
         return Err("stub leaked sysfs facts".to_string());
     }
@@ -382,6 +385,61 @@ mod tests {
              /dev/sda1                               partition\t1048576\t0\t-2\n",
         );
         refuses_active_swap(&b, "/dev/sda1").expect("active swap must be refused");
+    }
+
+    // -----------------------------------------------------------------------
+    // C2c: fail-closed scan helpers — exists-but-unreadable state must block
+    // the wipe, never be skipped as absent.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn conformance_unreadable_holders_fail_closed() {
+        // sdb's holders dir exists but cannot be read: the guard must block
+        // the wipe, never treat it as "no holders".
+        let b = fixture().with_unreadable_relation("sdb", crate::backend::Relation::Holders);
+        match guard::check_boot_disk_protection(&b, "/dev/sdb", false) {
+            Err(ExecuteError::BootDiskProtection(msg)) => {
+                assert!(msg.contains("holders"), "message must name the unreadable dir: {}", msg)
+            }
+            other => panic!("expected BootDiskProtection, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn conformance_unreadable_slaves_fail_closed() {
+        let b = fixture().with_unreadable_relation("sdb", crate::backend::Relation::Slaves);
+        match guard::check_boot_disk_protection(&b, "/dev/sdb", false) {
+            Err(ExecuteError::BootDiskProtection(msg)) => {
+                assert!(msg.contains("slaves"), "message must name the unreadable dir: {}", msg)
+            }
+            other => panic!("expected BootDiskProtection, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn conformance_unreadable_mountinfo_fails_closed() {
+        // Mountinfo exists but cannot be read: fail closed, never scan as
+        // "no mounts".
+        let b = fixture().with_unreadable_mountinfo();
+        match guard::check_boot_disk_protection(&b, "/dev/sdb", false) {
+            Err(ExecuteError::BootDiskProtection(msg)) => {
+                assert!(msg.contains("mountinfo"), "message must name the unreadable file: {}", msg)
+            }
+            other => panic!("expected BootDiskProtection, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[test]
+    fn conformance_unreadable_mount_source_sysfs_fails_closed() {
+        // A protected mount whose /dev source's sysfs dev file exists but is
+        // unreadable: the scan fails closed instead of skipping the source.
+        let b = fixture().with_unreadable_attr("sda", "dev");
+        match guard::check_boot_disk_protection(&b, "/dev/sdb", false) {
+            Err(ExecuteError::BootDiskProtection(msg)) => {
+                assert!(msg.contains("unreadable"), "message must name the read failure: {}", msg)
+            }
+            other => panic!("expected BootDiskProtection, got {:?}", other.map(|_| ())),
+        }
     }
 
     #[test]
@@ -535,6 +593,39 @@ mod linux_fixture {
     fn linux_conformance_refuses_boot_disk() {
         let (_tmp, backend) = linux_fixture();
         refuses_boot_disk(&backend, "/dev/sda").expect("boot disk must be refused");
+    }
+
+    #[test]
+    fn linux_conformance_unreadable_swaps_fails_closed() {
+        // C2c: an exists-but-unreadable /proc/swaps (here: a directory, so
+        // the read fails deterministically for any uid) must block the wipe
+        // instead of being skipped as "no swaps".
+        let tmp = tempfile::tempdir().unwrap();
+        let sys = tmp.path().join("sys");
+        let proc = tmp.path().join("proc");
+        let dev = tmp.path().join("dev");
+        fs::create_dir_all(&dev).unwrap();
+        write(&sys.join("class/block/sda/dev"), "8:0\n");
+        write(&sys.join("class/block/sdb/dev"), "16:0\n");
+        fs::write(dev.join("sda"), b"").unwrap();
+        fs::write(dev.join("sdb"), b"").unwrap();
+        write(
+            &proc.join("self/mountinfo"),
+            "25 30 8:0 / / rw,relatime shared:1 - ext4 /dev/sda rw\n",
+        );
+        // swaps exists but is unreadable (a directory): read_to_string fails.
+        fs::create_dir_all(proc.join("swaps")).unwrap();
+        let backend = crate::backend::linux::LinuxBackend::new(FsContext {
+            proc_root: proc,
+            sys_root: sys,
+            dev_root: dev,
+        });
+        match guard::check_boot_disk_protection(&backend, "/dev/sdb", false) {
+            Err(ExecuteError::BootDiskProtection(msg)) => {
+                assert!(msg.contains("swaps"), "message must name the unreadable file: {}", msg)
+            }
+            other => panic!("expected BootDiskProtection, got {:?}", other.map(|_| ())),
+        }
     }
 
     #[test]

@@ -45,7 +45,11 @@ use crate::types::{BlockWriter, BootEnvironment, ExecuteError};
 
 /// Typed backend errors. `Unsupported` is the stub-backend refusal; guard
 /// decisions surface as `ExecuteError` at the guard layer, not here.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// C2a note: no `Clone`/`PartialEq`/`Eq` — the `OpenFailed` carrier holds an
+/// `ExecuteError` (io errors and messages are not cloneable/comparable), and
+/// nothing compares backend errors by value.
+#[derive(Debug)]
 pub enum BackendError {
     /// The backend (or platform) does not support this operation at all.
     Unsupported(&'static str),
@@ -53,6 +57,11 @@ pub enum BackendError {
     Unavailable(String),
     /// The underlying I/O failed.
     Io(String),
+    /// `open_exclusive` delegates device opening to shared writer-opening
+    /// code whose typed errors (boot-disk protection, identity mismatch,
+    /// not-found, ...) carry safety meaning. The variant is carried verbatim
+    /// so callers see the exact historic `ExecuteError` (C2a: lossless).
+    OpenFailed(ExecuteError),
 }
 
 impl fmt::Display for BackendError {
@@ -61,6 +70,8 @@ impl fmt::Display for BackendError {
             BackendError::Unsupported(what) => write!(f, "Unsupported operation: {}", what),
             BackendError::Unavailable(msg) => write!(f, "Unavailable: {}", msg),
             BackendError::Io(msg) => write!(f, "I/O error: {}", msg),
+            // Display delegates to the historic error so messages are unchanged.
+            BackendError::OpenFailed(err) => write!(f, "{}", err),
         }
     }
 }
@@ -206,9 +217,13 @@ pub struct ExclusiveHandle {
     logical_block_size: u32,
     writer: Box<dyn BlockWriter>,
     reader: Box<dyn HandleReader>,
+    /// Raw fd of the writer where the backend exposes one (Linux);
+    /// `None` for memory-backed backends (mock) and platforms without fds.
+    raw_fd: Option<i32>,
 }
 
 impl ExclusiveHandle {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         target: ValidatedTarget,
         path: String,
@@ -216,8 +231,9 @@ impl ExclusiveHandle {
         logical_block_size: u32,
         writer: Box<dyn BlockWriter>,
         reader: Box<dyn HandleReader>,
+        raw_fd: Option<i32>,
     ) -> Self {
-        Self { target, path, io_mode, logical_block_size, writer, reader }
+        Self { target, path, io_mode, logical_block_size, writer, reader, raw_fd }
     }
 
     /// Guard-minted target backing this handle.
@@ -284,6 +300,55 @@ impl ExclusiveHandle {
     pub fn read_at(&self, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
         self.reader.read_at(offset, len)
     }
+
+    /// Raw fd of the writer, when the backend exposes one. Legacy device
+    /// ioctl flows (BLKDISCARD) use this to issue commands on the very fd
+    /// opened through this handle instead of re-opening the device (C2a).
+    pub fn raw_fd(&self) -> Option<i32> {
+        self.raw_fd
+    }
+
+    /// Flush device buffers only (BLKFLSBUF on the handle's fd) — no fsync.
+    pub fn flush_buffers_only(&mut self) -> std::io::Result<()> {
+        self.writer.flush_buffers()
+    }
+}
+
+/// C2a: the handle itself is a `BlockWriter` so legacy execution loops
+/// (`execute_writer_overwrite`, `PartitionRangeWriter`) consume it directly
+/// without any code outside `backend/` touching the device.
+///
+/// Coordinate note: legacy loops write **node-relative** offsets on the fd
+/// they opened (whole-disk node: absolute; partition node: partition-
+/// relative), which is exactly what the inner writer receives here. The
+/// validated-scope gate lives on [`ExclusiveHandle::write_at`] (the C1
+/// shared interface, parent-disk coordinates) and on the callers' own
+/// bounds guards (`PartitionRangeWriter`, kernel node capacity) — the
+/// adapter adds no translation, preserving byte-identical legacy behavior.
+impl BlockWriter for ExclusiveHandle {
+    fn write_chunk(&mut self, offset: u64, data: &[u8]) -> Result<usize, std::io::Error> {
+        self.writer.write_chunk(offset, data)
+    }
+
+    fn sync_data(&mut self) -> Result<(), std::io::Error> {
+        self.writer.sync_data()
+    }
+
+    fn flush_buffers(&mut self) -> Result<(), std::io::Error> {
+        self.writer.flush_buffers()
+    }
+
+    fn total_size(&self) -> Result<u64, std::io::Error> {
+        self.writer.total_size()
+    }
+
+    fn logical_block_size(&self) -> u32 {
+        self.logical_block_size
+    }
+
+    fn io_mode(&self) -> &'static str {
+        self.io_mode
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -331,9 +396,13 @@ pub trait BlockBackend {
     }
     /// `read_link` target of `class/block/<name>` (parent-disk heuristic).
     fn sysfs_parent_link(&self, name: &str) -> Option<String>;
-    fn sysfs_related_names(&self, name: &str, relation: Relation) -> Vec<String>;
-    /// All member device names under `sys/fs/btrfs/<uuid>/devices/*`.
-    fn btrfs_member_devices(&self) -> Vec<String>;
+    /// Holder/slave names of `class/block/<name>/<relation>/`. C2c: `Ok(vec![])`
+    /// means the relation dir is absent (historic skip); an **unreadable**
+    /// dir is `Err` — the guard fail-closes instead of skipping.
+    fn sysfs_related_names(&self, name: &str, relation: Relation) -> Result<Vec<String>, BackendError>;
+    /// All member device names under `sys/fs/btrfs/<uuid>/devices/*`. C2c:
+    /// absent sysfs tree → `Ok(vec![])`; unreadable tree → `Err` (fail closed).
+    fn btrfs_member_devices(&self) -> Result<Vec<String>, BackendError>;
     /// Display path of the sysfs class/block dir (error messages embed it).
     fn sysfs_root_display(&self) -> String;
     /// Backend's view of a device file path for raw reads (e.g. MBR probe):

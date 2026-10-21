@@ -139,17 +139,30 @@ struct MountProtectionState {
 /// backing block device and must not trip the anonymous-device fail-closed
 /// check; the live medium's own mounts (e.g. /run/live/medium, /cdrom) are
 /// still recorded as protected via the normal non-allowlisted-mount path.
+/// C2c: scan-read errors are **fail-closed** — an exists-but-unreadable sysfs
+/// or proc read blocks the wipe (typed `BootDiskProtection`) instead of
+/// being skipped as if the state were absent. Absent state (`Ok(None)`,
+/// absent dirs) keeps its historic permissive semantics.
+fn scan_read_err(e: BackendError) -> ExecuteError {
+    match e {
+        BackendError::Unavailable(msg) => ExecuteError::BootDiskProtection(msg),
+        other => ExecuteError::BootDiskProtection(other.to_string()),
+    }
+}
+
+/// Resolved mount/swap source: `(name, sysfs major:minor when known)`.
+/// `Ok(None)` = the source does not canonicalize (historic skip: absence).
+type ResolvedSource = Option<(String, Option<(u32, u32)>)>;
+
 fn scan_mount_and_swap_protection(
     backend: &dyn BlockBackend,
     dry_run: bool,
     boot_env: BootEnvironment,
 ) -> Result<MountProtectionState, ExecuteError> {
     // 2. Mountinfo content (backend resolves self/mountinfo → mountinfo →
-    //    mounts and fail-closes when none exist).
-    let state = backend.read_mount_state().map_err(|e| match e {
-        BackendError::Unavailable(msg) => ExecuteError::BootDiskProtection(msg),
-        other => ExecuteError::BootDiskProtection(other.to_string()),
-    })?;
+    //    mounts and fail-closes when none exist; C2c: read *errors* also
+    //    fail closed here).
+    let state = backend.read_mount_state().map_err(scan_read_err)?;
     let mountinfo_content = state.mountinfo;
 
     let mut protected_devs: HashMap<(u32, u32), String> = HashMap::new();
@@ -168,17 +181,18 @@ fn scan_mount_and_swap_protection(
     ].into_iter().collect();
 
     // Resolve a /dev mount/swap source: canonicalize → name (recorded even
-    // when the sysfs dev number is unreadable — historic inline order), with
-    // the parsed (major, minor) when available.
-    let resolve_source = |source: &str| -> Option<(String, Option<(u32, u32)>)> {
-        let canon = backend.canonicalize_path(source, dry_run).ok()?;
+    // when the sysfs dev number is absent — historic inline order), with the
+    // parsed (major, minor) when available. C2c: an exists-but-unreadable
+    // sysfs dev file fails closed; a source that does not canonicalize keeps
+    // its historic skip (absence, not an error).
+    let resolve_source = |source: &str| -> Result<ResolvedSource, ExecuteError> {
+        let Some(canon) = backend.canonicalize_path(source, dry_run).ok() else {
+            return Ok(None);
+        };
         let name = canon.rsplit('/').next().unwrap_or(&canon).to_string();
-        let mm = backend
-            .sysfs_class_attr(&name, "dev")
-            .ok()
-            .flatten()
-            .and_then(|c| parse_major_minor(&c));
-        Some((name, mm))
+        let dev_attr = backend.sysfs_class_attr(&name, "dev").map_err(scan_read_err)?;
+        let mm = dev_attr.and_then(|c| parse_major_minor(&c));
+        Ok(Some((name, mm)))
     };
 
     for line in mountinfo_content.lines() {
@@ -223,14 +237,12 @@ fn scan_mount_and_swap_protection(
                     protected_devs.insert((maj, min), format!("protected mount '{}'", mount_point));
                 } else if fs_type == "btrfs" {
                     let mut btrfs_resolved = false;
-                    for d_name in backend.btrfs_member_devices() {
+                    for d_name in backend.btrfs_member_devices().map_err(scan_read_err)? {
                         protected_names.insert(d_name.clone());
-                        if let Some(dev_mm) = backend
+                        let dev_attr = backend
                             .sysfs_class_attr(&d_name, "dev")
-                            .ok()
-                            .flatten()
-                            .and_then(|c| parse_major_minor(&c))
-                        {
+                            .map_err(scan_read_err)?;
+                        if let Some(dev_mm) = dev_attr.and_then(|c| parse_major_minor(&c)) {
                             protected_devs.insert(
                                 dev_mm,
                                 format!("btrfs device '{}' for protected mount '{}'", d_name, mount_point),
@@ -241,12 +253,10 @@ fn scan_mount_and_swap_protection(
                     if mount_source.starts_with("/dev/") {
                         let src_name = mount_source.rsplit('/').next().unwrap_or(mount_source);
                         protected_names.insert(src_name.to_string());
-                        if let Some(dev_mm) = backend
+                        let src_attr = backend
                             .sysfs_class_attr(src_name, "dev")
-                            .ok()
-                            .flatten()
-                            .and_then(|c| parse_major_minor(&c))
-                        {
+                            .map_err(scan_read_err)?;
+                        if let Some(dev_mm) = src_attr.and_then(|c| parse_major_minor(&c)) {
                             protected_devs.insert(
                                 dev_mm,
                                 format!("btrfs source '{}' for protected mount '{}'", src_name, mount_point),
@@ -262,7 +272,7 @@ fn scan_mount_and_swap_protection(
                         )));
                     }
                 } else if mount_source.starts_with("/dev/") {
-                    if let Some((src_name, src_mm)) = resolve_source(mount_source) {
+                    if let Some((src_name, src_mm)) = resolve_source(mount_source)? {
                         protected_names.insert(src_name);
                         if let Some(mm) = src_mm {
                             protected_devs.insert(
@@ -284,7 +294,7 @@ fn scan_mount_and_swap_protection(
             }
 
             if mount_source.starts_with("/dev/") {
-                if let Some((src_name, src_mm)) = resolve_source(mount_source) {
+                if let Some((src_name, src_mm)) = resolve_source(mount_source)? {
                     protected_names.insert(src_name);
                     if let Some(mm) = src_mm {
                         protected_devs.insert(
@@ -311,7 +321,7 @@ fn scan_mount_and_swap_protection(
         let swap_type = parts.get(1).copied().unwrap_or("partition");
 
         if swap_type == "partition" {
-            if let Some((swap_name, mm)) = resolve_source(swap_target) {
+            if let Some((swap_name, mm)) = resolve_source(swap_target)? {
                 protected_names.insert(swap_name);
                 if let Some(mm) = mm {
                     protected_devs.insert(mm, format!("active swap partition '{}'", swap_target));
@@ -474,12 +484,20 @@ pub fn check_boot_disk_protection(
             continue;
         }
 
-        for name in backend.sysfs_related_names(&curr, Relation::Holders) {
+        // C2c: an unreadable holders/slaves dir fails closed — the wipe is
+        // blocked rather than the relation being skipped as empty.
+        for name in backend
+            .sysfs_related_names(&curr, Relation::Holders)
+            .map_err(scan_read_err)?
+        {
             if !visited.contains(&name) {
                 queue.push_back(name);
             }
         }
-        for name in backend.sysfs_related_names(&curr, Relation::Slaves) {
+        for name in backend
+            .sysfs_related_names(&curr, Relation::Slaves)
+            .map_err(scan_read_err)?
+        {
             if !visited.contains(&name) {
                 queue.push_back(name);
             }
@@ -750,7 +768,10 @@ pub fn unmount_target_partition_and_holders(
     let target_canonical = backend.canonicalize_path(target_partition, dry_run)?;
 
     // 1. Resolve holders
-    let holders = backend.sysfs_related_names(target_name, Relation::Holders);
+    // C2c: unreadable holders dir fails closed instead of unmounting "nothing".
+    let holders = backend
+        .sysfs_related_names(target_name, Relation::Holders)
+        .map_err(scan_read_err)?;
 
     // Direct `<proc>/mounts` read (missing/unreadable → empty), matching the
     // historic direct read — independent of the mountinfo fallback chain.
@@ -1052,6 +1073,29 @@ pub fn validate_whole_disk_target(
 ) -> Result<ValidatedTarget, ExecuteError> {
     verify_confirmation(confirmation_token, device_serial)?;
     check_boot_disk_protection(backend, device, dry_run)?;
+    let guard_identity = get_guard_identity(backend, device, dry_run, device_serial)?;
+    Ok(ValidatedTarget::sealed(
+        guard_identity.canonical_path.clone(),
+        guard_identity,
+        TargetScope::WholeDisk,
+    ))
+}
+
+/// C2a: whole-device target mint in the **historic flow order** — boot-disk
+/// protection → confirmation token → identity pinning — the exact check
+/// sequence the execution flows (`software_overwrite`, `discard_erase`)
+/// performed inline before opening a writer. The returned target gates the
+/// only way those flows open a device (`open_exclusive`); error precedence
+/// is preserved so no existing test behavior changes.
+pub fn validate_whole_disk_flow_target(
+    backend: &dyn BlockBackend,
+    device: &str,
+    confirmation_token: &str,
+    device_serial: &str,
+    dry_run: bool,
+) -> Result<ValidatedTarget, ExecuteError> {
+    check_boot_disk_protection(backend, device, dry_run)?;
+    verify_confirmation(confirmation_token, device_serial)?;
     let guard_identity = get_guard_identity(backend, device, dry_run, device_serial)?;
     Ok(ValidatedTarget::sealed(
         guard_identity.canonical_path.clone(),
