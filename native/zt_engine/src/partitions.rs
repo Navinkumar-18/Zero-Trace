@@ -102,10 +102,7 @@ pub fn parse_mountinfo(content: &str) -> Vec<MountRecord> {
             continue;
         }
         let (maj, min) = match parts[2].split_once(':') {
-            Some((m, n)) => (
-                m.parse::<u32>().unwrap_or(0),
-                n.parse::<u32>().unwrap_or(0),
-            ),
+            Some((m, n)) => (m.parse::<u32>().unwrap_or(0), n.parse::<u32>().unwrap_or(0)),
             None => continue,
         };
         let sep = parts.iter().position(|p| *p == "-");
@@ -188,17 +185,57 @@ pub fn detect_table_type(disk_path: &Path) -> String {
 /// Registry values verified against the UEFI specification / GUID Partition
 /// Table type registry (Wikipedia).
 const GPT_TYPE_REGISTRY: &[(&str, &str, &str)] = &[
-    ("c12a7328-f81f-11d2-ba4b-00a0c93ec93b", "EFI System", "efi_system"),
-    ("e3c9e316-0b5c-4db8-817d-f92df00215ae", "Microsoft Reserved", "msr"),
-    ("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7", "Microsoft Basic Data", "windows_data"),
-    ("de94bba4-06d1-4d40-a16a-bfd50179d6ac", "Windows Recovery", "windows_recovery"),
-    ("0fc63daf-8483-4772-8e79-3d69d8477de4", "Linux Filesystem", "linux"),
-    ("0657fd6d-a4ab-43c4-84e5-0933c84b4f4f", "Linux Swap", "linux_swap"),
-    ("e6d6d379-f507-44c2-a23c-238f2a3df928", "Linux LVM", "linux_lvm"),
-    ("a19d880f-05fc-4d3b-a006-743f0f84911e", "Linux RAID", "linux_raid"),
-    ("7ffec5c9-2d00-49b7-8941-3ea10a5586b7", "Linux dm-crypt", "linux_crypt"),
+    (
+        "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+        "EFI System",
+        "efi_system",
+    ),
+    (
+        "e3c9e316-0b5c-4db8-817d-f92df00215ae",
+        "Microsoft Reserved",
+        "msr",
+    ),
+    (
+        "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7",
+        "Microsoft Basic Data",
+        "windows_data",
+    ),
+    (
+        "de94bba4-06d1-4d40-a16a-bfd50179d6ac",
+        "Windows Recovery",
+        "windows_recovery",
+    ),
+    (
+        "0fc63daf-8483-4772-8e79-3d69d8477de4",
+        "Linux Filesystem",
+        "linux",
+    ),
+    (
+        "0657fd6d-a4ab-43c4-84e5-0933c84b4f4f",
+        "Linux Swap",
+        "linux_swap",
+    ),
+    (
+        "e6d6d379-f507-44c2-a23c-238f2a3df928",
+        "Linux LVM",
+        "linux_lvm",
+    ),
+    (
+        "a19d880f-05fc-4d3b-a006-743f0f84911e",
+        "Linux RAID",
+        "linux_raid",
+    ),
+    (
+        "7ffec5c9-2d00-49b7-8941-3ea10a5586b7",
+        "Linux dm-crypt",
+        "linux_crypt",
+    ),
     ("ca7d7ccb-63ed-4c53-861c-1742536059cc", "LUKS", "luks"),
-    ("21686148-6449-6e6f-744e-656564454649", "BIOS Boot", "bios_boot"),
+    (
+        "21686148-6449-6e6f-744e-656564454649",
+        "BIOS Boot",
+        "bios_boot",
+    ),
 ];
 
 /// Look up a canonical (lowercase, dashed) GPT type GUID → (name, role).
@@ -351,7 +388,8 @@ pub fn read_gpt_entries(disk_path: &Path) -> Option<Vec<GptPartitionEntry>> {
     let h = parse_gpt_header(&hdr)?;
     // Allocation cap: 1024 entries × 4096 bytes = 4 MiB max.
     let total = (h.num_entries as usize).saturating_mul(h.entry_size as usize);
-    f.seek(SeekFrom::Start(h.entries_lba.saturating_mul(512))).ok()?;
+    f.seek(SeekFrom::Start(h.entries_lba.saturating_mul(512)))
+        .ok()?;
     let mut buf = vec![0u8; total];
     f.read_exact(&mut buf).ok()?;
     Some(
@@ -468,7 +506,9 @@ pub fn read_volume_probe_at(disk_path: &Path, start_sector: u64) -> VolumeProbe 
         Ok(f) => f,
         Err(_) => return VolumeProbe::default(),
     };
-    if f.seek(SeekFrom::Start(start_sector.saturating_mul(512))).is_err() {
+    if f.seek(SeekFrom::Start(start_sector.saturating_mul(512)))
+        .is_err()
+    {
         return VolumeProbe::default();
     }
     let mut buf = [0u8; 4096];
@@ -514,7 +554,9 @@ fn statvfs_bytes(path: &Path) -> Option<(u64, u64)> {
             st.f_bsize as u64
         };
         let total = (st.f_blocks as u64).saturating_mul(frsize);
-        let used = (st.f_blocks as u64).saturating_sub(st.f_bfree as u64).saturating_mul(frsize);
+        let used = (st.f_blocks as u64)
+            .saturating_sub(st.f_bfree as u64)
+            .saturating_mul(frsize);
         Some((total, used))
     }
 }
@@ -560,9 +602,7 @@ pub fn probe_windows_volume(device: &str) -> WindowsProbe {
     let mnt_str = mnt.to_string_lossy().to_string();
 
     // P2: read-only probe tools go through the backend (argv list, no shell).
-    let backend = crate::backend::linux::LinuxBackend::new(
-        crate::execute::FsContext::default(),
-    );
+    let backend = crate::backend::linux::LinuxBackend::new(crate::execute::FsContext::default());
     let mount_out = backend.exec(
         "mount",
         &["-o", "ro,noexec,nosuid,nodev", "--", device, &mnt_str],
@@ -630,10 +670,7 @@ pub fn enumerate_partitions_ctx(
         return Err("Empty disk name".to_string());
     }
 
-    let disk_dir = ctx
-        .sys_root
-        .join("class/block")
-        .join(disk_name.as_str());
+    let disk_dir = ctx.sys_root.join("class/block").join(disk_name.as_str());
     if !disk_dir.exists() {
         return Err(format!("Disk not found in sysfs: {}", disk_name));
     }
@@ -697,12 +734,11 @@ pub fn enumerate_partitions_ctx(
         }
         let part_dir = entry.path();
         // A real partition node carries a `partition` file with its number.
-        let part_num: u32 = match read_sys_attr(&part_dir.join("partition"))
-            .and_then(|v| v.parse::<u32>().ok())
-        {
-            Some(n) => n,
-            None => continue,
-        };
+        let part_num: u32 =
+            match read_sys_attr(&part_dir.join("partition")).and_then(|v| v.parse::<u32>().ok()) {
+                Some(n) => n,
+                None => continue,
+            };
 
         let size_sectors: u64 = read_sys_attr(&part_dir.join("size"))
             .and_then(|v| v.parse::<u64>().ok())
@@ -734,9 +770,9 @@ pub fn enumerate_partitions_ctx(
         }
 
         let is_swap = fs_type.as_deref() == Some("swap")
-            || swaps.iter().any(|s| {
-                s == &part_path || s.strip_prefix("/dev/") == Some(name.as_str())
-            });
+            || swaps
+                .iter()
+                .any(|s| s == &part_path || s.strip_prefix("/dev/") == Some(name.as_str()));
 
         // B1/B2: read-only classification — GPT type GUID / MBR type byte
         // plus a boot-sector probe (fs signature, BitLocker/LUKS magic).
@@ -889,7 +925,10 @@ mod tests {
         write(&proc.join("self/mountinfo"), mountinfo);
 
         // swaps: none active
-        write(&proc.join("swaps"), "Filename\t\t\t\tType\t\tSize\tUsed\tPriority\n");
+        write(
+            &proc.join("swaps"),
+            "Filename\t\t\t\tType\t\tSize\tUsed\tPriority\n",
+        );
 
         // Device nodes: GPT for sda, MBR for sdb
         let mut sda = vec![0u8; 4096];
@@ -970,7 +1009,10 @@ mod tests {
         );
         let report = enumerate_partitions_ctx("/dev/sda", &f.ctx).unwrap();
         let p3 = &report.partitions[2];
-        assert!(p3.is_swap, "partition listed in /proc/swaps must be flagged");
+        assert!(
+            p3.is_swap,
+            "partition listed in /proc/swaps must be flagged"
+        );
     }
 
     #[test]
@@ -981,18 +1023,15 @@ mod tests {
 
     #[test]
     fn test_parse_mountinfo_and_swaps() {
-        let mounts = parse_mountinfo(
-            "25 30 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\nbad line\n",
-        );
+        let mounts =
+            parse_mountinfo("25 30 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw\nbad line\n");
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].mountpoint, "/");
         assert_eq!(mounts[0].fs_type, "ext4");
         assert_eq!(mounts[0].source, "/dev/sda2");
         assert_eq!((mounts[0].major, mounts[0].minor), (8, 2));
 
-        let swaps = parse_swaps(
-            "Filename Type Size Used Priority\n/dev/sda3 partition 1 0 -2\n",
-        );
+        let swaps = parse_swaps("Filename Type Size Used Priority\n/dev/sda3 partition 1 0 -2\n");
         assert_eq!(swaps, vec!["/dev/sda3".to_string()]);
     }
 
@@ -1065,12 +1104,22 @@ mod tests {
         img[584..592].copy_from_slice(&2u64.to_le_bytes()); // entries LBA
         img[592..596].copy_from_slice(&128u32.to_le_bytes()); // entry count
         img[596..600].copy_from_slice(&128u32.to_le_bytes()); // entry size
-        // Partition entries at LBA 2
+                                                              // Partition entries at LBA 2
         let entries: [(&str, u64, u64, &str); 5] = [
-            ("c12a7328-f81f-11d2-ba4b-00a0c93ec93b", 2048, 6143, "EFI system partition"),
+            (
+                "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+                2048,
+                6143,
+                "EFI system partition",
+            ),
             ("e3c9e316-0b5c-4db8-817d-f92df00215ae", 6144, 8191, ""),
             ("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7", 8192, 10239, "Data"),
-            ("de94bba4-06d1-4d40-a16a-bfd50179d6ac", 10240, 12287, "Recovery"),
+            (
+                "de94bba4-06d1-4d40-a16a-bfd50179d6ac",
+                10240,
+                12287,
+                "Recovery",
+            ),
             ("ca7d7ccb-63ed-4c53-861c-1742536059cc", 12288, 14335, ""),
         ];
         for (i, (guid, first, last, name)) in entries.iter().enumerate() {
@@ -1102,11 +1151,11 @@ mod tests {
         write(&sys.join("class/block/sda/removable"), "0\n");
         write(&sys.join("class/block/sda/dev"), "8:0\n");
         let parts: [(u32, u64, u64); 5] = [
-            (1, 2048, 4096),   // EFI System
-            (2, 6144, 2048),   // MSR
-            (3, 8192, 2048),   // Basic Data (NTFS)
-            (4, 10240, 2048),  // Windows Recovery
-            (5, 12288, 2048),  // LUKS
+            (1, 2048, 4096),  // EFI System
+            (2, 6144, 2048),  // MSR
+            (3, 8192, 2048),  // Basic Data (NTFS)
+            (4, 10240, 2048), // Windows Recovery
+            (5, 12288, 2048), // LUKS
         ];
         for (n, start, size) in parts {
             let base = sys.join(format!("class/block/sda/sda{}", n));
@@ -1135,7 +1184,10 @@ mod tests {
 
         // Truncated / non-GPT / corrupt headers fail closed.
         assert!(parse_gpt_header(&img[512..600]).is_none(), "< 92 bytes");
-        assert!(parse_gpt_header(&[0u8; 512]).is_none(), "no EFI PART signature");
+        assert!(
+            parse_gpt_header(&[0u8; 512]).is_none(),
+            "no EFI PART signature"
+        );
         let mut bad = img[512..1024].to_vec();
         bad[80..84].copy_from_slice(&0u32.to_le_bytes()); // num_entries = 0
         assert!(parse_gpt_header(&bad).is_none(), "zero entry count");
@@ -1185,7 +1237,10 @@ mod tests {
             classify_gpt_guid("ca7d7ccb-63ed-4c53-861c-1742536059cc"),
             Some(("LUKS", "luks"))
         );
-        assert_eq!(classify_gpt_guid("00000000-0000-0000-0000-000000000000"), None);
+        assert_eq!(
+            classify_gpt_guid("00000000-0000-0000-0000-000000000000"),
+            None
+        );
     }
 
     #[test]
@@ -1197,7 +1252,10 @@ mod tests {
         ntfs[3..11].copy_from_slice(b"NTFS    ");
         assert_eq!(
             probe_volume_header(&ntfs),
-            VolumeProbe { fs: Some("ntfs".into()), encryption: None }
+            VolumeProbe {
+                fs: Some("ntfs".into()),
+                encryption: None
+            }
         );
 
         // exFAT
@@ -1221,7 +1279,10 @@ mod tests {
         bl[3..11].copy_from_slice(b"-FVE-FS-");
         assert_eq!(
             probe_volume_header(&bl),
-            VolumeProbe { fs: Some("bitlocker".into()), encryption: Some("BitLocker".into()) }
+            VolumeProbe {
+                fs: Some("bitlocker".into()),
+                encryption: Some("BitLocker".into())
+            }
         );
 
         // B2: LUKS1/LUKS2 magic
@@ -1229,7 +1290,10 @@ mod tests {
         luks[0..6].copy_from_slice(b"LUKS\xba\xbe");
         assert_eq!(
             probe_volume_header(&luks),
-            VolumeProbe { fs: Some("crypto_LUKS".into()), encryption: Some("LUKS".into()) }
+            VolumeProbe {
+                fs: Some("crypto_LUKS".into()),
+                encryption: Some("LUKS".into())
+            }
         );
 
         // ext superblock magic
@@ -1261,7 +1325,10 @@ mod tests {
         );
         assert_eq!(
             classify_mbr_partition(0x27, Some("ntfs")),
-            ("Windows Recovery".to_string(), "windows_recovery".to_string())
+            (
+                "Windows Recovery".to_string(),
+                "windows_recovery".to_string()
+            )
         );
         // fs signature contradicts the generic Windows byte → Linux wins.
         assert_eq!(
@@ -1301,7 +1368,10 @@ mod tests {
         assert_eq!(msr.role.as_deref(), Some("msr"));
 
         let basic = &report.partitions[2];
-        assert_eq!(basic.type_guid.as_deref(), Some("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"));
+        assert_eq!(
+            basic.type_guid.as_deref(),
+            Some("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7")
+        );
         assert_eq!(basic.type_name.as_deref(), Some("Microsoft Basic Data"));
         assert_eq!(basic.role.as_deref(), Some("windows_data"));
         assert_eq!(basic.fs_probe.as_deref(), Some("ntfs"));
@@ -1321,7 +1391,11 @@ mod tests {
         assert_eq!(luks.type_name.as_deref(), Some("LUKS"));
         assert_eq!(luks.role.as_deref(), Some("luks"));
         assert_eq!(luks.fs_probe.as_deref(), Some("crypto_LUKS"));
-        assert_eq!(luks.encryption.as_deref(), Some("LUKS"), "B2: label the volume");
+        assert_eq!(
+            luks.encryption.as_deref(),
+            Some("LUKS"),
+            "B2: label the volume"
+        );
     }
 
     #[test]
@@ -1357,7 +1431,11 @@ mod tests {
         write(&sys.join("class/block/sdb/sdb1/start"), "2048\n");
         write(&sys.join("class/block/sdb/sdb1/dev"), "8:17\n");
 
-        let ctx = FsContext { proc_root: proc, sys_root: sys, dev_root: dev };
+        let ctx = FsContext {
+            proc_root: proc,
+            sys_root: sys,
+            dev_root: dev,
+        };
         let report = enumerate_partitions_ctx("/dev/sdb", &ctx).unwrap();
         assert_eq!(report.table_type, "mbr");
         assert_eq!(report.partitions.len(), 1);

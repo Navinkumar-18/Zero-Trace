@@ -23,10 +23,10 @@
 //!   injection; must pass the shared conformance suite in
 //!   `backend::conformance`.
 
-#[cfg(target_os = "linux")]
-pub mod linux;
 pub mod android;
 pub mod conformance;
+#[cfg(target_os = "linux")]
+pub mod linux;
 pub mod mock;
 pub mod unsupported;
 pub mod windows;
@@ -233,7 +233,15 @@ impl ExclusiveHandle {
         reader: Box<dyn HandleReader>,
         raw_fd: Option<i32>,
     ) -> Self {
-        Self { target, path, io_mode, logical_block_size, writer, reader, raw_fd }
+        Self {
+            target,
+            path,
+            io_mode,
+            logical_block_size,
+            writer,
+            reader,
+            raw_fd,
+        }
     }
 
     /// Guard-minted target backing this handle.
@@ -272,11 +280,9 @@ impl ExclusiveHandle {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset overflow")
             })?;
             let lo = *start_bytes;
-            let hi = start_bytes
-                .checked_add(*size_bytes)
-                .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "scope overflow")
-                })?;
+            let hi = start_bytes.checked_add(*size_bytes).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "scope overflow")
+            })?;
             if offset < lo || end > hi {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -385,7 +391,11 @@ pub trait BlockBackend {
     ///
     /// `Ok(None)` = attribute absent; `Err` = attribute exists but could not
     /// be read (fail-closed sites distinguish this — see `guard`).
-    fn sysfs_class_attr(&self, block_name: &str, attr_rel: &str) -> Result<Option<String>, BackendError>;
+    fn sysfs_class_attr(
+        &self,
+        block_name: &str,
+        attr_rel: &str,
+    ) -> Result<Option<String>, BackendError>;
     fn sysfs_block_names(&self) -> Vec<String>;
     fn sysfs_block_exists(&self, name: &str) -> bool;
     /// Whether `class/block/<name>/partition` exists — existence semantics
@@ -399,7 +409,11 @@ pub trait BlockBackend {
     /// Holder/slave names of `class/block/<name>/<relation>/`. C2c: `Ok(vec![])`
     /// means the relation dir is absent (historic skip); an **unreadable**
     /// dir is `Err` — the guard fail-closes instead of skipping.
-    fn sysfs_related_names(&self, name: &str, relation: Relation) -> Result<Vec<String>, BackendError>;
+    fn sysfs_related_names(
+        &self,
+        name: &str,
+        relation: Relation,
+    ) -> Result<Vec<String>, BackendError>;
     /// All member device names under `sys/fs/btrfs/<uuid>/devices/*`. C2c:
     /// absent sysfs tree → `Ok(vec![])`; unreadable tree → `Err` (fail closed).
     fn btrfs_member_devices(&self) -> Result<Vec<String>, BackendError>;
@@ -482,10 +496,30 @@ pub trait BlockBackend {
     fn open_exclusive(&self, target: &ValidatedTarget) -> Result<ExclusiveHandle, BackendError>;
     /// Read back through a handle (verification sampling) — identical
     /// delegation for every backend.
-    fn read_at(&self, handle: &ExclusiveHandle, offset: u64, len: usize) -> Result<Vec<u8>, BackendError> {
-        handle.read_at(offset, len).map_err(|e| BackendError::Io(e.to_string()))
+    fn read_at(
+        &self,
+        handle: &ExclusiveHandle,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, BackendError> {
+        handle
+            .read_at(offset, len)
+            .map_err(|e| BackendError::Io(e.to_string()))
     }
-    fn discard_range(&self, handle: &ExclusiveHandle, offset: u64, len: u64) -> Result<(), BackendError>;
+    fn discard_range(
+        &self,
+        handle: &ExclusiveHandle,
+        offset: u64,
+        len: u64,
+    ) -> Result<(), BackendError>;
+
+    /// F2: ask the kernel to re-read the partition table after a wipe/format.
+    /// Partition-scoped targets re-read the parent disk (so the partition
+    /// appears again); whole-disk targets re-read the device itself. This
+    /// only re-reads — it never modifies the table.
+    fn reread_partition_table(&self, _target: &ValidatedTarget) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported("partition-table re-read"))
+    }
 }
 
 /// C5: the process-wide backend selector. Linux gets the only real backend;

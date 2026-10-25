@@ -48,11 +48,17 @@ class CertificateService {
         _secureRandom,
       ),
     );
-    final signature = signer.generateSignature(Uint8List.fromList(utf8.encode(data))) as pc.ECSignature;
+    final signature =
+        signer.generateSignature(Uint8List.fromList(utf8.encode(data)))
+            as pc.ECSignature;
     return '${signature.r.toRadixString(16)}:${signature.s.toRadixString(16)}';
   }
 
-  bool _verifySignature(String data, String signatureHex, [pc.ECPublicKey? key]) {
+  bool _verifySignature(
+    String data,
+    String signatureHex, [
+    pc.ECPublicKey? key,
+  ]) {
     try {
       final parts = signatureHex.split(':');
       if (parts.length != 2) return false;
@@ -62,8 +68,14 @@ class CertificateService {
 
       final sig = pc.ECSignature(r, s);
       final verifier = pc.ECDSASigner(pc.SHA256Digest(), null);
-      verifier.init(false, pc.PublicKeyParameter<pc.ECPublicKey>(key ?? _publicKey));
-      return verifier.verifySignature(Uint8List.fromList(utf8.encode(data)), sig);
+      verifier.init(
+        false,
+        pc.PublicKeyParameter<pc.ECPublicKey>(key ?? _publicKey),
+      );
+      return verifier.verifySignature(
+        Uint8List.fromList(utf8.encode(data)),
+        sig,
+      );
     } catch (_) {
       return false;
     }
@@ -106,6 +118,9 @@ class CertificateService {
     // so pre-C7 v4 certificates keep verifying byte-identically.
     String? platform,
     String? backend,
+    // Phase F: optional post-wipe format-step record, signed only when a
+    // format actually ran so wipe-only v4 certificates stay byte-identical.
+    FilesystemRecreationRecord? filesystemRecreation,
   }) {
     if (certVersion == 1) {
       return {
@@ -137,6 +152,8 @@ class CertificateService {
         'bootEnvironment': ?bootEnvironment,
         'platform': ?platform,
         'backend': ?backend,
+        if (filesystemRecreation != null)
+          'filesystemRecreation': filesystemRecreation.toJson(),
         'evidenceHash': evidenceHash,
         'result': result,
         'timestamp': timestamp,
@@ -153,7 +170,9 @@ class CertificateService {
         'sanitizationCategory': sanitizationCategory ?? 'Clear',
         'executionMode': executionMode ?? 'simulated',
         'scope': scope ?? 'partial',
-        'limitation': limitation ?? 'Partition wipe: partition table and unselected sectors are not overwritten',
+        'limitation':
+            limitation ??
+            'Partition wipe: partition table and unselected sectors are not overwritten',
         'partitionsWiped': ?partitionsWiped,
         'bytesOverwritten': ?bytesOverwritten,
         'totalDeviceBytes': ?totalDeviceBytes,
@@ -207,7 +226,9 @@ class CertificateService {
   }) {
     if (!isSuccess) return 'Failed';
 
-    final executedLower = (actualMethodExecuted ?? method.displayName).toLowerCase().trim();
+    final executedLower = (actualMethodExecuted ?? method.displayName)
+        .toLowerCase()
+        .trim();
 
     // The software does not physically destroy devices.
     if (method == SanitizationMethod.physicalDestructionRecommended ||
@@ -261,18 +282,24 @@ class CertificateService {
     // B5: boot environment the wipe ran in ("live"/"normal"/"container");
     // signed so the live-medium claim cannot be forged after the fact.
     String? bootEnvironment,
+    // Phase F: optional format-step record (present only when the operator
+    // recreated a filesystem after the verified wipe).
+    FilesystemRecreationRecord? filesystemRecreation,
   }) {
     final DateTime now = DateTime.now();
-    final String certId = 'ZT-CERT-${now.millisecondsSinceEpoch.toString().substring(5)}';
+    final String certId =
+        'ZT-CERT-${now.millisecondsSinceEpoch.toString().substring(5)}';
 
     final String resultStr = evidence.verifiedPassed ? 'SUCCESS' : 'FAILED';
     final String verificationSummary = evidence.verifiedPassed
         ? '${verificationSampleCount ?? 50}/${verificationSampleCount ?? 50} Sector Samples Passed Zero Readback Verification (${evidence.evidenceHash.substring(0, min(12, evidence.evidenceHash.length))}...)'
         : 'Sample Verification Failed - Non-Zero Data Detected at Target Offsets';
 
-    final methodToRecord = actualMethodExecuted ?? job.effectiveMethod.displayName;
+    final methodToRecord =
+        actualMethodExecuted ?? job.effectiveMethod.displayName;
 
-    final category = sanitizationCategory ??
+    final category =
+        sanitizationCategory ??
         deriveSanitizationCategory(
           method: job.effectiveMethod,
           device: job.device,
@@ -284,9 +311,12 @@ class CertificateService {
     String? finalWarningLine = warningLine;
     if (finalWarningLine == null &&
         (job.targetCategory == NistCategory.destroy ||
-            job.recommendedMethod == SanitizationMethod.physicalDestructionRecommended ||
-            job.recommendedMethod == SanitizationMethod.unsupportedFlagForDestroy) &&
-        job.effectiveMethod != SanitizationMethod.physicalDestructionRecommended &&
+            job.recommendedMethod ==
+                SanitizationMethod.physicalDestructionRecommended ||
+            job.recommendedMethod ==
+                SanitizationMethod.unsupportedFlagForDestroy) &&
+        job.effectiveMethod !=
+            SanitizationMethod.physicalDestructionRecommended &&
         job.effectiveMethod != SanitizationMethod.unsupportedFlagForDestroy) {
       finalWarningLine =
           'WARNING: User proceeded with overwrite despite NIST SP 800-88 Destroy recommendation. Data may be retained in unmapped flash blocks.';
@@ -310,14 +340,14 @@ class CertificateService {
     final String? limitation = isPartition
         ? 'Partition wipe: partition table and unselected sectors are not overwritten'
         : (category == 'Clear' && _isFlashWithoutPurge(job.device)
-            ? 'Clear only: overwrite cannot reach remapped or over-provisioned flash blocks'
-            : null);
+              ? 'Clear only: overwrite cannot reach remapped or over-provisioned flash blocks'
+              : null);
     // B4: record every partition the job actually targeted — the sequential
     // subset wipe lists all selected partitions in one certificate.
     final List<PartitionInfo> wipedParts = job.isPartitionScope
         ? (job.targetPartitions.isEmpty && job.targetPartition != null
-            ? [job.targetPartition!]
-            : job.targetPartitions)
+              ? [job.targetPartition!]
+              : job.targetPartitions)
         : const [];
     final List<Map<String, dynamic>>? partitionsWiped = wipedParts.isEmpty
         ? null
@@ -328,20 +358,21 @@ class CertificateService {
                 'partition_number': p.partitionNumber,
                 'start_sector': p.startSector,
                 'size_bytes': p.sizeBytes,
-              }
+              },
           ];
     // NIST SP 800-88 level this wipe actually achieved, derived from the
     // executed-method category (never from the device's capability alone).
     final String sanitizationLevel = category == 'Purge'
         ? 'Purge'
         : category == 'Failed'
-            ? 'Failed'
-            : 'Clear';
+        ? 'Failed'
+        : 'Clear';
     // Ordered steps actually executed: the engine command log wins when the
     // caller passes it; the timestamped job log is the fallback (simulated
     // mode / engine log unavailable).
     final List<String>? steps =
-        stepsExecuted ?? (job.logs.isNotEmpty ? List<String>.from(job.logs) : null);
+        stepsExecuted ??
+        (job.logs.isNotEmpty ? List<String>.from(job.logs) : null);
     // B4: bytes overwritten = sum of every targeted partition (identical to
     // the single-partition value when only one partition was selected).
     final int? bytesOverwritten = isPartition
@@ -371,6 +402,7 @@ class CertificateService {
       bootEnvironment: bootEnvironment,
       platform: issuingBackend.platformName,
       backend: issuingBackend.backendId,
+      filesystemRecreation: filesystemRecreation,
     );
 
     final String payloadJson = jsonEncode(payloadToSign);
@@ -412,6 +444,82 @@ class CertificateService {
       bootEnvironment: bootEnvironment,
       platform: issuingBackend.platformName,
       backend: issuingBackend.backendId,
+      filesystemRecreation: filesystemRecreation,
+    );
+  }
+
+  /// Phase F: re-sign an already issued (v4) certificate with an additional
+  /// format-step record. The wipe fields are copied verbatim from [cert], so
+  /// the only change in the signed payload is the new
+  /// `filesystemRecreation` entry. Certificates without a format step are
+  /// never touched.
+  SanitizationCertificate withFilesystemRecreation(
+    SanitizationCertificate cert,
+    FilesystemRecreationRecord record,
+  ) {
+    final payloadToSign = buildSigningPayload(
+      certVersion: cert.certVersion,
+      certificateId: cert.certificateId,
+      jobId: cert.jobId,
+      deviceSerial: cert.deviceSerial,
+      method: cert.method,
+      sanitizationCategory: cert.sanitizationCategory,
+      executionMode: cert.executionMode,
+      evidenceHash: cert.evidence.evidenceHash,
+      result: cert.result,
+      timestamp: cert.endTime.toIso8601String(),
+      warningLine: cert.warningLine,
+      scope: cert.scope,
+      limitation: cert.limitation,
+      partitionsWiped: cert.partitionsWiped,
+      sanitizationLevel: cert.sanitizationLevel,
+      stepsExecuted: cert.stepsExecuted,
+      bytesOverwritten: cert.bytesOverwritten,
+      totalDeviceBytes: cert.totalDeviceBytes,
+      bootEnvironment: cert.bootEnvironment,
+      platform: cert.platform,
+      backend: cert.backend,
+      filesystemRecreation: record,
+    );
+
+    return SanitizationCertificate(
+      certVersion: cert.certVersion,
+      certificateId: cert.certificateId,
+      jobId: cert.jobId,
+      deviceModel: cert.deviceModel,
+      deviceSerial: cert.deviceSerial,
+      mediaType: cert.mediaType,
+      capacity: cert.capacity,
+      method: cert.method,
+      standardReference: cert.standardReference,
+      sanitizationCategory: cert.sanitizationCategory,
+      busType: cert.busType,
+      supportLevel: cert.supportLevel,
+      executionMode: cert.executionMode,
+      operatorNote: cert.operatorNote,
+      warningLine: cert.warningLine,
+      verificationSampleCount: cert.verificationSampleCount,
+      verificationEntropyScore: cert.verificationEntropyScore,
+      simulationDisclaimer: cert.simulationDisclaimer,
+      startTime: cert.startTime,
+      endTime: cert.endTime,
+      result: cert.result,
+      verificationSummary: cert.verificationSummary,
+      evidence: cert.evidence,
+      softwareVersion: cert.softwareVersion,
+      signature: _signData(jsonEncode(payloadToSign)),
+      publicKeyPem: cert.publicKeyPem,
+      scope: cert.scope,
+      limitation: cert.limitation,
+      partitionsWiped: cert.partitionsWiped,
+      bytesOverwritten: cert.bytesOverwritten,
+      totalDeviceBytes: cert.totalDeviceBytes,
+      sanitizationLevel: cert.sanitizationLevel,
+      stepsExecuted: cert.stepsExecuted,
+      bootEnvironment: cert.bootEnvironment,
+      platform: cert.platform,
+      backend: cert.backend,
+      filesystemRecreation: record,
     );
   }
 
@@ -440,18 +548,24 @@ class CertificateService {
     final result = certJson['result'] as String? ?? '';
     final signature = certJson['signature'] as String? ?? '';
     final warningLine = certJson['warningLine'] as String?;
-    final sanitizationCategory = certJson['sanitizationCategory'] as String? ?? 'Clear';
+    final sanitizationCategory =
+        certJson['sanitizationCategory'] as String? ?? 'Clear';
     final executionMode = certJson['executionMode'] as String? ?? 'simulated';
     final scope = certJson['scope'] as String?;
     final limitation = certJson['limitation'] as String?;
     // v4 stores partitions under 'partitions'; accept the v3 key as fallback.
-    final rawWiped = ((certVer >= 4
-            ? (certJson['partitions'] ?? certJson['partitionsWiped'])
-            : certJson['partitionsWiped']) as List<dynamic>?);
-    final partitionsWiped = rawWiped?.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    final rawWiped =
+        ((certVer >= 4
+                ? (certJson['partitions'] ?? certJson['partitionsWiped'])
+                : certJson['partitionsWiped'])
+            as List<dynamic>?);
+    final partitionsWiped = rawWiped
+        ?.map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
     final sanitizationLevel = certJson['sanitizationLevel'] as String?;
-    final stepsExecuted =
-        (certJson['stepsExecuted'] as List<dynamic>?)?.map((e) => e.toString()).toList();
+    final stepsExecuted = (certJson['stepsExecuted'] as List<dynamic>?)
+        ?.map((e) => e.toString())
+        .toList();
     final bytesOverwritten = (certJson['bytesOverwritten'] as num?)?.toInt();
     final totalDeviceBytes = (certJson['totalDeviceBytes'] as num?)?.toInt();
     // B5: optional signed boot-environment claim; absent on pre-B5 v4 certs.
@@ -459,12 +573,20 @@ class CertificateService {
     // C7: optional signed platform/backend claim; absent on pre-C7 certs.
     final platform = certJson['platform'] as String?;
     final backend = certJson['backend'] as String?;
+    // Phase F: optional signed format-step record; absent on wipe-only certs.
+    final rawFormat = certJson['filesystemRecreation'];
+    final filesystemRecreation = rawFormat is Map
+        ? FilesystemRecreationRecord.fromJson(
+            Map<String, dynamic>.from(rawFormat),
+          )
+        : null;
 
     final evidenceHash = (certJson['evidence'] is Map)
         ? certJson['evidence']['evidenceHash'] as String? ?? ''
         : certJson['evidenceHash'] as String? ?? '';
 
-    final timestamp = certJson['timestamp'] as String? ??
+    final timestamp =
+        certJson['timestamp'] as String? ??
         certJson['endTime'] as String? ??
         certJson['startTime'] as String? ??
         '';
@@ -491,6 +613,7 @@ class CertificateService {
       bootEnvironment: bootEnvironment,
       platform: platform,
       backend: backend,
+      filesystemRecreation: filesystemRecreation,
     );
 
     return _verifySignature(jsonEncode(payload), signature);
@@ -502,7 +625,8 @@ class CertificateService {
     required VerificationEvidence evidence,
   }) {
     final DateTime now = DateTime.now();
-    final String certId = 'ZT-CERT-LEGACY-${now.millisecondsSinceEpoch.toString().substring(5)}';
+    final String certId =
+        'ZT-CERT-LEGACY-${now.millisecondsSinceEpoch.toString().substring(5)}';
     final String resultStr = evidence.verifiedPassed ? 'SUCCESS' : 'FAILED';
     final String timestampStr = (job.endTime ?? now).toIso8601String();
 
@@ -558,12 +682,18 @@ class CertificateService {
               if (cert.executionMode == 'simulated')
                 pw.Container(
                   width: double.infinity,
-                  padding: const pw.EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  padding: const pw.EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 8,
+                  ),
                   margin: const pw.EdgeInsets.only(bottom: 12),
                   decoration: pw.BoxDecoration(
                     color: PdfColors.amber100,
                     borderRadius: pw.BorderRadius.circular(6),
-                    border: pw.Border.all(color: PdfColors.amber800, width: 1.5),
+                    border: pw.Border.all(
+                      color: PdfColors.amber800,
+                      width: 1.5,
+                    ),
                   ),
                   child: pw.Row(
                     mainAxisAlignment: pw.MainAxisAlignment.center,
@@ -584,7 +714,10 @@ class CertificateService {
               if (cert.warningLine != null)
                 pw.Container(
                   width: double.infinity,
-                  padding: const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  padding: const pw.EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 6,
+                  ),
                   margin: const pw.EdgeInsets.only(bottom: 12),
                   decoration: pw.BoxDecoration(
                     color: PdfColors.red50,
@@ -605,7 +738,10 @@ class CertificateService {
               if (cert.limitation != null)
                 pw.Container(
                   width: double.infinity,
-                  padding: const pw.EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                  padding: const pw.EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 6,
+                  ),
                   margin: const pw.EdgeInsets.only(bottom: 12),
                   decoration: pw.BoxDecoration(
                     color: PdfColors.orange50,
@@ -660,7 +796,10 @@ class CertificateService {
                       ),
                       pw.Text(
                         'Issued: ${cert.endTime.toIso8601String().substring(0, 10)}',
-                        style: const pw.TextStyle(fontSize: 10, color: PdfColors.grey600),
+                        style: const pw.TextStyle(
+                          fontSize: 10,
+                          color: PdfColors.grey600,
+                        ),
                       ),
                     ],
                   ),
@@ -672,12 +811,19 @@ class CertificateService {
 
               // Status Badge
               pw.Container(
-                padding: const pw.EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                padding: const pw.EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 8,
+                ),
                 decoration: pw.BoxDecoration(
-                  color: cert.result == 'SUCCESS' ? PdfColors.green100 : PdfColors.red100,
+                  color: cert.result == 'SUCCESS'
+                      ? PdfColors.green100
+                      : PdfColors.red100,
                   borderRadius: pw.BorderRadius.circular(6),
                   border: pw.Border.all(
-                    color: cert.result == 'SUCCESS' ? PdfColors.green700 : PdfColors.red700,
+                    color: cert.result == 'SUCCESS'
+                        ? PdfColors.green700
+                        : PdfColors.red700,
                   ),
                 ),
                 child: pw.Row(
@@ -687,7 +833,9 @@ class CertificateService {
                       'SANITIZATION RESULT: ${cert.result}',
                       style: pw.TextStyle(
                         fontWeight: pw.FontWeight.bold,
-                        color: cert.result == 'SUCCESS' ? PdfColors.green900 : PdfColors.red900,
+                        color: cert.result == 'SUCCESS'
+                            ? PdfColors.green900
+                            : PdfColors.red900,
                       ),
                     ),
                     pw.Text(
@@ -695,7 +843,9 @@ class CertificateService {
                       style: pw.TextStyle(
                         fontSize: 9,
                         fontWeight: pw.FontWeight.bold,
-                        color: cert.executionMode == 'real' ? PdfColors.green900 : PdfColors.amber900,
+                        color: cert.executionMode == 'real'
+                            ? PdfColors.green900
+                            : PdfColors.amber900,
                       ),
                     ),
                   ],
@@ -704,10 +854,19 @@ class CertificateService {
               pw.SizedBox(height: 16),
 
               // Device & Method Table
-              pw.Text('1. SANITIZATION TARGET & METHOD', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 12)),
+              pw.Text(
+                '1. SANITIZATION TARGET & METHOD',
+                style: pw.TextStyle(
+                  fontWeight: pw.FontWeight.bold,
+                  fontSize: 12,
+                ),
+              ),
               pw.SizedBox(height: 6),
               pw.TableHelper.fromTextArray(
-                headerStyle: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 9),
+                headerStyle: pw.TextStyle(
+                  fontWeight: pw.FontWeight.bold,
+                  fontSize: 9,
+                ),
                 cellStyle: const pw.TextStyle(fontSize: 8.5),
                 headers: ['Parameter', 'Value Details'],
                 data: [
@@ -723,27 +882,75 @@ class CertificateService {
                   if (cert.sanitizationLevel != null)
                     ['Sanitization Level (NIST)', cert.sanitizationLevel!],
                   if (cert.scope != null)
-                    ['Scope', cert.scope == 'partial' ? 'Partition (partial)' : 'Full device'],
-                  if (cert.partitionsWiped != null && cert.partitionsWiped!.isNotEmpty)
+                    [
+                      'Scope',
+                      cert.scope == 'partial'
+                          ? 'Partition (partial)'
+                          : 'Full device',
+                    ],
+                  if (cert.partitionsWiped != null &&
+                      cert.partitionsWiped!.isNotEmpty)
                     [
                       'Partitions Wiped',
                       cert.partitionsWiped!
-                          .map((p) => p['name'] ?? 'partition #${p['partition_number']}')
-                          .join(', ')
+                          .map(
+                            (p) =>
+                                p['name'] ??
+                                'partition #${p['partition_number']}',
+                          )
+                          .join(', '),
                     ],
                   // B5: where the wipe ran from (live medium vs installed
                   // system) — signed, so the claim is verifiable.
                   if (cert.bootEnvironmentDisplay != null)
                     ['Boot Environment', cert.bootEnvironmentDisplay!],
+                  // Phase F: separate format step, recorded only when it ran.
+                  if (cert.filesystemRecreation != null) ...[
+                    [
+                      'Filesystem Recreated',
+                      '${cert.filesystemRecreation!.fsType} via ${cert.filesystemRecreation!.tool}',
+                    ],
+                    [
+                      'Volume Label',
+                      cert.filesystemRecreation!.label.isEmpty
+                          ? '(none)'
+                          : cert.filesystemRecreation!.label,
+                    ],
+                    ['Format Time', cert.filesystemRecreation!.time],
+                    [
+                      'Sanitization Verified Before Format',
+                      cert
+                              .filesystemRecreation!
+                              .sanitizationVerifiedBeforeFormat
+                          ? 'Yes'
+                          : 'No',
+                    ],
+                    if (cert.filesystemRecreation!.partitionTableCreated)
+                      [
+                        'Partition Table Created',
+                        (cert.filesystemRecreation!.partitionTableType ?? 'yes')
+                            .toUpperCase(),
+                      ],
+                  ],
                   ['Standard Reference', cert.standardReference],
-                  ['Execution Time', '${cert.startTime.toString().substring(0, 19)} to ${cert.endTime.toString().substring(11, 19)}'],
-                  if (cert.operatorNote != null) ['Operator Note', cert.operatorNote!],
+                  [
+                    'Execution Time',
+                    '${cert.startTime.toString().substring(0, 19)} to ${cert.endTime.toString().substring(11, 19)}',
+                  ],
+                  if (cert.operatorNote != null)
+                    ['Operator Note', cert.operatorNote!],
                 ],
               ),
               pw.SizedBox(height: 16),
 
               // Evidence & Verification
-              pw.Text('2. VERIFICATION & SAMPLE EVIDENCE', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 12)),
+              pw.Text(
+                '2. VERIFICATION & SAMPLE EVIDENCE',
+                style: pw.TextStyle(
+                  fontWeight: pw.FontWeight.bold,
+                  fontSize: 12,
+                ),
+              ),
               pw.SizedBox(height: 6),
               pw.Container(
                 padding: const pw.EdgeInsets.all(10),
@@ -754,40 +961,82 @@ class CertificateService {
                 child: pw.Column(
                   crossAxisAlignment: pw.CrossAxisAlignment.start,
                   children: [
-                    pw.Text('Verification Summary: ${cert.verificationSummary}', style: pw.TextStyle(fontSize: 8.5, fontWeight: pw.FontWeight.bold)),
+                    pw.Text(
+                      'Verification Summary: ${cert.verificationSummary}',
+                      style: pw.TextStyle(
+                        fontSize: 8.5,
+                        fontWeight: pw.FontWeight.bold,
+                      ),
+                    ),
                     pw.SizedBox(height: 3),
-                    pw.Text('Master Evidence Hash: ${cert.evidence.evidenceHash}', style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey800)),
+                    pw.Text(
+                      'Master Evidence Hash: ${cert.evidence.evidenceHash}',
+                      style: const pw.TextStyle(
+                        fontSize: 8,
+                        color: PdfColors.grey800,
+                      ),
+                    ),
                     if (cert.verificationEntropyScore != null) ...[
                       pw.SizedBox(height: 3),
-                      pw.Text('Shannon Entropy Score: ${cert.verificationEntropyScore!.toStringAsFixed(4)}', style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey800)),
+                      pw.Text(
+                        'Shannon Entropy Score: ${cert.verificationEntropyScore!.toStringAsFixed(4)}',
+                        style: const pw.TextStyle(
+                          fontSize: 8,
+                          color: PdfColors.grey800,
+                        ),
+                      ),
                     ],
                     pw.SizedBox(height: 3),
-                    if (cert.stepsExecuted != null && cert.stepsExecuted!.isNotEmpty) ...[
+                    if (cert.stepsExecuted != null &&
+                        cert.stepsExecuted!.isNotEmpty) ...[
                       pw.Text(
                         'Executed Steps (ordered, ${cert.stepsExecuted!.length}):',
-                        style: pw.TextStyle(fontSize: 8, fontWeight: pw.FontWeight.bold),
+                        style: pw.TextStyle(
+                          fontSize: 8,
+                          fontWeight: pw.FontWeight.bold,
+                        ),
                       ),
-                      ...cert.stepsExecuted!.take(20).map(
+                      ...cert.stepsExecuted!
+                          .take(20)
+                          .map(
                             (s) => pw.Text(
                               '• $s',
-                              style: const pw.TextStyle(fontSize: 7.5, color: PdfColors.grey800),
+                              style: const pw.TextStyle(
+                                fontSize: 7.5,
+                                color: PdfColors.grey800,
+                              ),
                             ),
                           ),
                       if (cert.stepsExecuted!.length > 20)
                         pw.Text(
                           '… ${cert.stepsExecuted!.length - 20} more steps recorded in the audit log',
-                          style: const pw.TextStyle(fontSize: 7.5, color: PdfColors.grey600),
+                          style: const pw.TextStyle(
+                            fontSize: 7.5,
+                            color: PdfColors.grey600,
+                          ),
                         ),
                       pw.SizedBox(height: 3),
                     ],
-                    pw.Text('Limitations Disclaimer: ${cert.evidence.limitations}', style: const pw.TextStyle(fontSize: 7.5, color: PdfColors.grey700)),
+                    pw.Text(
+                      'Limitations Disclaimer: ${cert.evidence.limitations}',
+                      style: const pw.TextStyle(
+                        fontSize: 7.5,
+                        color: PdfColors.grey700,
+                      ),
+                    ),
                   ],
                 ),
               ),
               pw.SizedBox(height: 16),
 
               // ECDSA Cryptographic Proof
-              pw.Text('3. CRYPTOGRAPHIC AUDIT SIGNATURE', style: pw.TextStyle(fontWeight: pw.FontWeight.bold, fontSize: 12)),
+              pw.Text(
+                '3. CRYPTOGRAPHIC AUDIT SIGNATURE',
+                style: pw.TextStyle(
+                  fontWeight: pw.FontWeight.bold,
+                  fontSize: 12,
+                ),
+              ),
               pw.SizedBox(height: 6),
               pw.Container(
                 padding: const pw.EdgeInsets.all(10),
@@ -798,11 +1047,29 @@ class CertificateService {
                 child: pw.Column(
                   crossAxisAlignment: pw.CrossAxisAlignment.start,
                   children: [
-                    pw.Text('Algorithm: ECDSA P-256 / SHA-256', style: pw.TextStyle(fontSize: 8.5, fontWeight: pw.FontWeight.bold)),
+                    pw.Text(
+                      'Algorithm: ECDSA P-256 / SHA-256',
+                      style: pw.TextStyle(
+                        fontSize: 8.5,
+                        fontWeight: pw.FontWeight.bold,
+                      ),
+                    ),
                     pw.SizedBox(height: 2),
-                    pw.Text('Signature: ${cert.signature}', style: const pw.TextStyle(fontSize: 7, color: PdfColors.blue900)),
+                    pw.Text(
+                      'Signature: ${cert.signature}',
+                      style: const pw.TextStyle(
+                        fontSize: 7,
+                        color: PdfColors.blue900,
+                      ),
+                    ),
                     pw.SizedBox(height: 3),
-                    pw.Text('Software: ${cert.softwareVersion}', style: const pw.TextStyle(fontSize: 7.5, color: PdfColors.grey700)),
+                    pw.Text(
+                      'Software: ${cert.softwareVersion}',
+                      style: const pw.TextStyle(
+                        fontSize: 7.5,
+                        color: PdfColors.grey700,
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -814,8 +1081,20 @@ class CertificateService {
               pw.Row(
                 mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
                 children: [
-                  pw.Text('SIH25070 — Team VCSE_DataCircuits', style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey600)),
-                  pw.Text('Page 1 of 1', style: const pw.TextStyle(fontSize: 8, color: PdfColors.grey600)),
+                  pw.Text(
+                    'SIH25070 — Team VCSE_DataCircuits',
+                    style: const pw.TextStyle(
+                      fontSize: 8,
+                      color: PdfColors.grey600,
+                    ),
+                  ),
+                  pw.Text(
+                    'Page 1 of 1',
+                    style: const pw.TextStyle(
+                      fontSize: 8,
+                      color: PdfColors.grey600,
+                    ),
+                  ),
                 ],
               ),
             ],

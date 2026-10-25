@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import '../core/app_paths.dart';
 import '../models/certificate.dart';
 import '../models/device_profile.dart';
+import '../models/filesystem_recreation.dart';
 import '../models/partition_info.dart';
 import '../models/sanitization_job.dart';
 import 'certificate_service.dart';
@@ -19,6 +20,7 @@ import 'risk_scoring_service.dart';
 import 'verification_service.dart';
 import 'real_sanitization_service.dart';
 import 'audit_log_service.dart';
+import 'filesystem_recreation_preference.dart';
 import 'job_state_file.dart';
 import 'live_boot_detector.dart';
 import 'orphaned_process_checker.dart';
@@ -26,7 +28,8 @@ import '../simple/confirm_wipe_dialog.dart';
 
 class SanitizationController extends ChangeNotifier {
   final DeviceSimulator _simulator = DeviceSimulator();
-  final DeviceIntelligenceService _intelligenceService = DeviceIntelligenceService();
+  final DeviceIntelligenceService _intelligenceService =
+      DeviceIntelligenceService();
   final ClassificationService _classificationService = ClassificationService();
   final RiskScoringService _riskScoringService = RiskScoringService();
   final RecommendationService _recommendationService = RecommendationService();
@@ -38,6 +41,36 @@ class SanitizationController extends ChangeNotifier {
   late final AuditLogService _auditLogService;
   late final JobStateFile _jobStateFile;
   late final OrphanedProcessChecker _orphanChecker;
+  late final FilesystemRecreationPreferenceStore _formatPreferenceStore;
+
+  // Phase F: optional post-wipe filesystem recreation state.
+  late FilesystemRecreationPreference _formatPreference;
+  FilesystemRecreationRecord? _filesystemRecreation;
+  FilesystemRecreationRecord? get filesystemRecreation => _filesystemRecreation;
+
+  /// Receipt paths for targets wiped *and verified* in the current job, keyed
+  /// by target node. The format step is refused unless its target is in here.
+  final Map<String, String> _verifiedFormatReceipts = {};
+  bool _isFormattingFilesystem = false;
+  bool _formatPromptDismissed = false;
+  String? _filesystemRecreationError;
+
+  bool get isFormattingFilesystem => _isFormattingFilesystem;
+  String? get filesystemRecreationError => _filesystemRecreationError;
+
+  /// True only after this job's wipe completed *and* verification passed for
+  /// at least one target, with a matching verified-wipe receipt available.
+  bool get canRecreateFilesystem {
+    final job = _currentJob;
+    if (job == null || _isFormattingFilesystem) return false;
+    if (!job.wipeCompleted || job.status != JobStatus.completed) return false;
+    if (_completedCertificate?.evidence.verifiedPassed != true) return false;
+    return _verifiedFormatReceipts.isNotEmpty && _filesystemRecreation == null;
+  }
+
+  /// UI gate: the prompt disappears once the user formats or dismisses it.
+  bool get showFilesystemRecreationPrompt =>
+      canRecreateFilesystem && !_formatPromptDismissed;
 
   /// C6: platform backend for discovery + engine-binary resolution. On
   /// Linux it wraps this controller's own [DeviceIntelligenceService] so
@@ -107,12 +140,20 @@ class SanitizationController extends ChangeNotifier {
 
   bool _isDisposed = false;
 
-  SanitizationController({AppPaths? appPaths, bool enableAutoPolling = true, bool deferInitialDiscovery = false}) {
+  SanitizationController({
+    AppPaths? appPaths,
+    bool enableAutoPolling = true,
+    bool deferInitialDiscovery = false,
+  }) {
     _appPaths = appPaths ?? AppPaths.production();
     _platformBackend = Platform.isLinux
         ? LinuxPlatformBackend(discovery: _intelligenceService)
         : resolvePlatformBackend();
     _auditLogService = AuditLogService(paths: _appPaths);
+    _formatPreferenceStore = FilesystemRecreationPreferenceStore(
+      paths: _appPaths,
+    );
+    _formatPreference = _formatPreferenceStore.load();
     _jobStateFile = JobStateFile(paths: _appPaths);
     _orphanChecker = OrphanedProcessChecker(paths: _appPaths);
     _realSanitizeService = RealSanitizationService(paths: _appPaths);
@@ -141,7 +182,10 @@ class SanitizationController extends ChangeNotifier {
   /// Auto-select the strongest supported method for a device.
   /// Used by Simple Mode to show the method in the confirm dialog.
   /// The disposal intent only affects warnings and the Destroy recommendation.
-  RecommendationResult getAutoMethod(DeviceProfile device, DisposalIntent intent) {
+  RecommendationResult getAutoMethod(
+    DeviceProfile device,
+    DisposalIntent intent,
+  ) {
     final sensitivity = intent.mappedSensitivity;
     return _recommendationService.selectMethod(
       device,
@@ -160,7 +204,9 @@ class SanitizationController extends ChangeNotifier {
     SanitizationMethod? overrideMethod,
   }) async {
     if (authorization.deviceSerial != device.serialNumber) {
-      throw ArgumentError('WipeAuthorization deviceSerial does not match target device serial');
+      throw ArgumentError(
+        'WipeAuthorization deviceSerial does not match target device serial',
+      );
     }
     if (isJobRunning) return;
 
@@ -191,11 +237,13 @@ class SanitizationController extends ChangeNotifier {
           effectiveRecMethod != SanitizationMethod.multiPassOverwrite) {
         effectiveRecMethod = SanitizationMethod.singlePassOverwrite;
         standardRef = 'NIST SP 800-88 R1 Clear (Partition Scope Overwrite)';
-        explanation = 'Partition-scoped wiping only supports overwrite methods.';
+        explanation =
+            'Partition-scoped wiping only supports overwrite methods.';
       }
     }
 
-    final jobId = 'JOB-${DateTime.now().millisecondsSinceEpoch.toString().substring(6)}';
+    final jobId =
+        'JOB-${DateTime.now().millisecondsSinceEpoch.toString().substring(6)}';
 
     _currentJob = SanitizationJob(
       jobId: jobId,
@@ -279,7 +327,7 @@ class SanitizationController extends ChangeNotifier {
           sizeSectors: p.sizeSectors,
           status: success ? 'COMPLETED' : 'FAILED',
           bytesWiped: success ? p.sizeBytes : 0,
-        )
+        ),
     ];
   }
 
@@ -320,7 +368,9 @@ class SanitizationController extends ChangeNotifier {
       );
       // Mark the device note in _devices
       _devices = _devices.map((d) {
-        if (d.serialNumber == active.deviceSerial || d.id == active.devicePath || d.name == active.deviceName) {
+        if (d.serialNumber == active.deviceSerial ||
+            d.id == active.devicePath ||
+            d.name == active.deviceName) {
           return DeviceProfile(
             id: d.id,
             name: d.name,
@@ -378,7 +428,9 @@ class SanitizationController extends ChangeNotifier {
     if (!canCancelJob || _currentJob == null) return;
     _isCancelling = true;
     _showForceStop = false;
-    _addLog('USER CANCEL: Sending cancellation signal to zt_engine (SIGTERM)...');
+    _addLog(
+      'USER CANCEL: Sending cancellation signal to zt_engine (SIGTERM)...',
+    );
     _realSanitizeService.cancelActiveProcess();
 
     // After 5 seconds: show "waiting for the drive to finish its current write" and offer Force stop button
@@ -386,8 +438,11 @@ class SanitizationController extends ChangeNotifier {
     _cancelEscalationTimer = Timer(const Duration(seconds: 5), () {
       if (_isCancelling && _currentJob != null && isJobRunning) {
         _showForceStop = true;
-        _currentJob!.currentStageDescription = 'waiting for the drive to finish its current write';
-        _addLog('CANCEL NOTICE: waiting for the drive to finish its current write');
+        _currentJob!.currentStageDescription =
+            'waiting for the drive to finish its current write';
+        _addLog(
+          'CANCEL NOTICE: waiting for the drive to finish its current write',
+        );
         notifyListeners();
       }
     });
@@ -396,7 +451,9 @@ class SanitizationController extends ChangeNotifier {
     job.status = JobStatus.failed;
     job.endTime = DateTime.now();
     job.currentStageDescription = 'Sanitization Cancelled: Partially Wiped';
-    _addLog('USER CANCEL: Job cancelled by user. Warning: Drive may be partially wiped.');
+    _addLog(
+      'USER CANCEL: Job cancelled by user. Warning: Drive may be partially wiped.',
+    );
 
     await _auditLogService.appendEntry(
       AuditLogEntry(
@@ -470,7 +527,9 @@ class SanitizationController extends ChangeNotifier {
     job.status = JobStatus.failed;
     job.endTime = DateTime.now();
     job.currentStageDescription = 'interrupted, state unknown';
-    _addLog('USER FORCE STOP: Job force stopped. Warning: Drive in interrupted, state unknown.');
+    _addLog(
+      'USER FORCE STOP: Job force stopped. Warning: Drive in interrupted, state unknown.',
+    );
 
     await _auditLogService.appendEntry(
       AuditLogEntry(
@@ -490,22 +549,28 @@ class SanitizationController extends ChangeNotifier {
         entropyScore: 0.0,
         sampleCount: 0,
         commandLog: List<String>.from(job.logs)
-          ..add('User force stopped sanitization via SIGKILL - interrupted, state unknown.'),
+          ..add(
+            'User force stopped sanitization via SIGKILL - interrupted, state unknown.',
+          ),
         partitions: _buildPartitionOutcomes(job, false),
       ),
     );
 
     // Save interrupted state so checkpoint stays and discovery/recovery detects it
-    await _jobStateFile.recordInterrupted(ActiveJobState(
-      jobId: job.jobId,
-      deviceSerial: job.device.serialNumber,
-      devicePath: job.device.id,
-      deviceName: job.device.name,
-      method: job.effectiveMethod.displayName,
-      methodKind: _methodKind(job.effectiveMethod),
-      deviceSize: job.device.capacityBytes,
-      startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
-    ));
+    await _jobStateFile.recordInterrupted(
+      ActiveJobState(
+        jobId: job.jobId,
+        deviceSerial: job.device.serialNumber,
+        devicePath: job.device.id,
+        deviceName: job.device.name,
+        method: job.effectiveMethod.displayName,
+        methodKind: _methodKind(job.effectiveMethod),
+        deviceSize: job.device.capacityBytes,
+        startedAt:
+            job.startTime?.toIso8601String() ??
+            DateTime.now().toIso8601String(),
+      ),
+    );
 
     notifyListeners();
   }
@@ -521,27 +586,36 @@ class SanitizationController extends ChangeNotifier {
     final job = _currentJob!;
 
     // Save interrupted state to JobStateFile so next launch displays interrupted card
-    await _jobStateFile.recordInterrupted(ActiveJobState(
-      jobId: job.jobId,
-      deviceSerial: job.device.serialNumber,
-      devicePath: job.device.id,
-      deviceName: job.device.name,
-      method: job.effectiveMethod.displayName,
-      methodKind: _methodKind(job.effectiveMethod),
-      deviceSize: job.device.capacityBytes,
-      startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
-    ));
+    await _jobStateFile.recordInterrupted(
+      ActiveJobState(
+        jobId: job.jobId,
+        deviceSerial: job.device.serialNumber,
+        devicePath: job.device.id,
+        deviceName: job.device.name,
+        method: job.effectiveMethod.displayName,
+        methodKind: _methodKind(job.effectiveMethod),
+        deviceSize: job.device.capacityBytes,
+        startedAt:
+            job.startTime?.toIso8601String() ??
+            DateTime.now().toIso8601String(),
+      ),
+    );
 
     final isFirmware = !canCancelJob;
     job.status = JobStatus.failed;
     job.endTime = DateTime.now();
 
     if (isFirmware) {
-      job.currentStageDescription = 'Interrupted: Firmware Sanitize in progress on hardware controller';
-      _addLog('EXIT INTERRUPT: Firmware sanitize in progress on controller. Not cancelled.');
+      job.currentStageDescription =
+          'Interrupted: Firmware Sanitize in progress on hardware controller';
+      _addLog(
+        'EXIT INTERRUPT: Firmware sanitize in progress on controller. Not cancelled.',
+      );
     } else {
       job.currentStageDescription = 'Interrupted: Partially Wiped';
-      _addLog('EXIT INTERRUPT: Overwrite interrupted by user exit. Warning: Drive may be partially wiped.');
+      _addLog(
+        'EXIT INTERRUPT: Overwrite interrupted by user exit. Warning: Drive may be partially wiped.',
+      );
     }
 
     await _auditLogService.appendEntry(
@@ -558,7 +632,9 @@ class SanitizationController extends ChangeNotifier {
         nistCategory: 'INTERRUPTED',
         success: false,
         outcome: 'interrupted',
-        fingerprintHash: isFirmware ? 'INTERRUPTED_FIRMWARE' : 'INTERRUPTED_PARTIALLY_WIPED',
+        fingerprintHash: isFirmware
+            ? 'INTERRUPTED_FIRMWARE'
+            : 'INTERRUPTED_PARTIALLY_WIPED',
         entropyScore: 0.0,
         sampleCount: 0,
         commandLog: List<String>.from(job.logs)
@@ -574,7 +650,10 @@ class SanitizationController extends ChangeNotifier {
     if (_orphanResult?.activeJobState != null) {
       final active = _orphanResult!.activeJobState!;
       DeviceProfile? targetDevice = _devices.cast<DeviceProfile?>().firstWhere(
-        (d) => d!.serialNumber == active.deviceSerial || d.id == active.devicePath || d.name == active.deviceName,
+        (d) =>
+            d!.serialNumber == active.deviceSerial ||
+            d.id == active.devicePath ||
+            d.name == active.deviceName,
         orElse: () => null,
       );
       targetDevice ??= DeviceProfile(
@@ -600,7 +679,8 @@ class SanitizationController extends ChangeNotifier {
         status: JobStatus.sanitizing,
         startTime: DateTime.tryParse(active.startedAt) ?? DateTime.now(),
         progress: 0.5,
-        currentStageDescription: 'Observing in-progress wipe (attached to PID ${_orphanResult?.pid ?? "active"})...',
+        currentStageDescription:
+            'Observing in-progress wipe (attached to PID ${_orphanResult?.pid ?? "active"})...',
       );
       _orphanResult = null;
       notifyListeners();
@@ -613,8 +693,286 @@ class SanitizationController extends ChangeNotifier {
     if (isJobRunning) return;
     _currentJob = null;
     _completedCertificate = null;
+    _resetFilesystemRecreationState();
     _updateJobRecommendation();
     notifyListeners();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Phase F: optional post-wipe filesystem recreation
+  // ---------------------------------------------------------------------------
+
+  String _deviceNode(DeviceProfile device) => device.id.startsWith('real_')
+      ? '/dev/${device.id.substring(5)}'
+      : '/dev/sdb';
+
+  /// Partition-scope targets of the current job, in wipe order.
+  List<PartitionInfo> get filesystemRecreationTargets {
+    final job = _currentJob;
+    if (job == null || !job.isPartitionScope) return const [];
+    final parts = job.targetPartitions.isEmpty
+        ? <PartitionInfo>[job.targetPartition!]
+        : job.targetPartitions;
+    return parts
+        .where((p) => _verifiedFormatReceipts.containsKey(p.devicePath))
+        .toList();
+  }
+
+  /// Prefill values for the "Recreate filesystem?" prompt. Defaults come from
+  /// the original volume when known; a remembered choice fills the gaps.
+  /// [FilesystemRecreationDefaults.defaultEnabled] is always false.
+  FilesystemRecreationDefaults? get filesystemRecreationDefaults {
+    if (!canRecreateFilesystem) return null;
+    final job = _currentJob!;
+
+    if (job.isPartitionScope) {
+      final targets = filesystemRecreationTargets;
+      if (targets.isEmpty) return null;
+      final part = targets.first;
+      final fs =
+          normalizeFilesystemType(part.fsType) ??
+          _formatPreference.fsType ??
+          'vfat';
+      final rawLabel = part.label.sanitized.isNotEmpty
+          ? part.label.sanitized
+          : (_formatPreference.label ?? 'ZT_VOLUME');
+      return FilesystemRecreationDefaults(
+        fsType: fs,
+        label: _safeVolumeLabel(rawLabel),
+        scope: 'partial',
+      );
+    }
+
+    final fs =
+        normalizeFilesystemType(job.device.fsType) ??
+        _formatPreference.fsType ??
+        'vfat';
+    final tableRaw = job.device.partitionTableType?.toLowerCase();
+    final table = (tableRaw == 'mbr' || tableRaw == 'dos') ? 'mbr' : 'gpt';
+    final rawLabel = _formatPreference.label ?? job.device.name;
+    return FilesystemRecreationDefaults(
+      fsType: fs,
+      label: _safeVolumeLabel(rawLabel),
+      scope: 'full',
+      tableType: table,
+    );
+  }
+
+  /// Filesystem labels are engine input: keep them short, uppercase and free
+  /// of characters the formatters reject (FAT labels are 11 chars max).
+  static String _safeVolumeLabel(String raw) {
+    final cleaned = raw
+        .toUpperCase()
+        .replaceAll(RegExp(r'[^A-Z0-9_-]'), '_')
+        .replaceAll(RegExp(r'_+'), '_');
+    final trimmed = cleaned.replaceAll(RegExp(r'^_+|_+$'), '');
+    if (trimmed.isEmpty) return 'ZT_VOLUME';
+    return trimmed.length <= 11 ? trimmed : trimmed.substring(0, 11);
+  }
+
+  void dismissFilesystemRecreationPrompt() {
+    if (!canRecreateFilesystem) return;
+    _formatPromptDismissed = true;
+    notifyListeners();
+  }
+
+  void _resetFilesystemRecreationState() {
+    _filesystemRecreation = null;
+    _filesystemRecreationError = null;
+    _isFormattingFilesystem = false;
+    _formatPromptDismissed = false;
+    _verifiedFormatReceipts.clear();
+  }
+
+  void _deleteReceiptBestEffort(String path) {
+    try {
+      final file = File(path);
+      if (file.existsSync()) file.deleteSync();
+    } catch (_) {}
+  }
+
+  /// Recreate a filesystem on a target that was wiped and verified in this
+  /// job. Refuses (returns null with [filesystemRecreationError] set) when:
+  /// the job did not complete a verified wipe, the target has no receipt, the
+  /// partition was not part of this job, or a whole-device typed confirmation
+  /// does not match the device serial.
+  ///
+  /// A format failure never changes the wipe result.
+  Future<FilesystemRecreationRecord?> recreateFilesystem({
+    required String fsType,
+    required String label,
+    String confirmationToken = '',
+    String? tableType,
+    PartitionInfo? targetPartition,
+    bool dryRun = false,
+  }) async {
+    if (!canRecreateFilesystem) {
+      _filesystemRecreationError =
+          'A filesystem can only be recreated after a wipe and verification '
+          'completed successfully in this job.';
+      notifyListeners();
+      return null;
+    }
+
+    final job = _currentJob!;
+    final fs = fsType.trim().toLowerCase();
+    if (!supportedFilesystemTypes.contains(fs)) {
+      _filesystemRecreationError =
+          'Unsupported filesystem type "$fsType" (expected vfat, exfat, ntfs or ext4).';
+      notifyListeners();
+      return null;
+    }
+    final cleanLabel = _safeVolumeLabel(label);
+
+    PartitionInfo? partition;
+    String? effectiveTable;
+    String? receiptPath;
+
+    if (job.isPartitionScope) {
+      final candidates = filesystemRecreationTargets;
+      partition =
+          targetPartition ?? (candidates.isEmpty ? null : candidates.first);
+      if (partition == null ||
+          !candidates.any((p) => p.devicePath == partition!.devicePath)) {
+        _filesystemRecreationError =
+            'That partition was not wiped and verified in this job.';
+        notifyListeners();
+        return null;
+      }
+      receiptPath = _verifiedFormatReceipts[partition.devicePath];
+    } else {
+      effectiveTable =
+          (tableType ?? filesystemRecreationDefaults?.tableType ?? 'gpt')
+              .trim()
+              .toLowerCase();
+      if (effectiveTable != 'gpt' && effectiveTable != 'mbr') {
+        _filesystemRecreationError =
+            'Whole-device recreation requires a gpt or mbr partition table.';
+        notifyListeners();
+        return null;
+      }
+      if (confirmationToken.trim() != job.device.serialNumber) {
+        _filesystemRecreationError =
+            'Typed confirmation does not match the device serial number.';
+        notifyListeners();
+        return null;
+      }
+      receiptPath = _verifiedFormatReceipts[_deviceNode(job.device)];
+    }
+
+    if (receiptPath == null || !File(receiptPath).existsSync()) {
+      _filesystemRecreationError =
+          'No verified-wipe receipt for this target; refusing to format.';
+      notifyListeners();
+      return null;
+    }
+
+    _isFormattingFilesystem = true;
+    _filesystemRecreationError = null;
+    notifyListeners();
+
+    try {
+      final report = await _realSanitizeService.executeFormat(
+        device: job.device,
+        fsType: fs,
+        label: cleanLabel,
+        confirmationToken: job.isPartitionScope
+            ? job.device.serialNumber
+            : confirmationToken,
+        deviceSerial: job.device.serialNumber,
+        targetPartition: partition,
+        tableType: effectiveTable,
+        verifiedReceiptPath: receiptPath,
+        dryRun: dryRun,
+      );
+
+      if (!report.success) {
+        final detail = report.stderr.trim();
+        _filesystemRecreationError = detail.isNotEmpty
+            ? detail
+            : 'Filesystem recreation failed (exit code ${report.exitCode}).';
+        return null;
+      }
+
+      final record = FilesystemRecreationRecord(
+        tool: report.tool,
+        fsType: report.fsType.isEmpty ? fs : report.fsType,
+        label: report.label.isEmpty ? cleanLabel : report.label,
+        time: report.time,
+        sanitizationVerifiedBeforeFormat:
+            report.sanitizationVerifiedBeforeFormat,
+        scope: report.scope,
+        partitionTableCreated: report.partitionTableCreated,
+        partitionTableType: report.partitionTableType,
+      );
+      _filesystemRecreation = record;
+
+      // Remember only the fs/label pair; the action itself stays default-OFF.
+      _formatPreference = FilesystemRecreationPreference(
+        fsType: record.fsType,
+        label: record.label,
+      );
+      _formatPreferenceStore.save(fsType: record.fsType, label: record.label);
+
+      // Re-sign the certificate with the separate format record when present.
+      String? certSha;
+      final cert = _completedCertificate;
+      if (cert != null) {
+        try {
+          final updated = _certificateService.withFilesystemRecreation(
+            cert,
+            record,
+          );
+          _completedCertificate = updated;
+          final (_, sha) = await _auditLogService.saveCertificate(updated);
+          certSha = sha;
+        } catch (_) {}
+      }
+
+      // Separate audit entry for the format step (wipe entry is untouched).
+      try {
+        await _auditLogService.appendEntry(
+          AuditLogEntry(
+            timestamp: record.time,
+            jobId: job.jobId,
+            deviceSerial: job.device.serialNumber,
+            devicePath: partition?.devicePath ?? _deviceNode(job.device),
+            deviceName: job.device.name,
+            scope: record.scope,
+            method: 'recreate filesystem (${record.fsType})',
+            methodClass: 'format',
+            standardReference: 'Post-wipe filesystem recreation',
+            nistCategory: 'FORMAT',
+            outcome: 'format_completed',
+            success: true,
+            verificationPassed: true,
+            certificateId: _completedCertificate?.certificateId,
+            certificateSha256: certSha,
+            fingerprintHash: 'FORMAT_VERIFIED',
+            entropyScore: 1.0,
+            sampleCount: 0,
+            commandLog: report.commandLog,
+            isSimulated: false,
+            filesystemRecreation: record,
+          ),
+        );
+      } catch (_) {}
+
+      _addLog(
+        'FORMAT: Recreated ${record.fsType} (${record.tool}) on '
+        '${partition?.devicePath ?? _deviceNode(job.device)} — '
+        'wipe result unchanged.',
+      );
+      _verifiedFormatReceipts.clear();
+      _deleteReceiptBestEffort(receiptPath);
+      return record;
+    } catch (e) {
+      _filesystemRecreationError = 'Filesystem recreation failed: $e';
+      return null;
+    } finally {
+      _isFormattingFilesystem = false;
+      notifyListeners();
+    }
   }
 
   // Getters
@@ -628,6 +986,7 @@ class SanitizationController extends ChangeNotifier {
     _isRealMode = !value;
     notifyListeners();
   }
+
   String? get lastScanError => _intelligenceService.lastScanError;
   bool get isAutoPollingActive => _autoPollTimer?.isActive ?? false;
   ClassificationService get classificationService => _classificationService;
@@ -679,7 +1038,9 @@ class SanitizationController extends ChangeNotifier {
 
   Future<void> refreshDevices({bool silent = false}) async {
     if (_isMockingDevices || _isDisposed) return;
-    final freshDevices = await _platformBackend.discoverDevices(realMode: _isRealMode);
+    final freshDevices = await _platformBackend.discoverDevices(
+      realMode: _isRealMode,
+    );
     if (_isMockingDevices || _isDisposed) return;
 
     // Check if device list changed
@@ -689,7 +1050,8 @@ class SanitizationController extends ChangeNotifier {
         if (freshDevices[i].id != _devices[i].id ||
             freshDevices[i].name != _devices[i].name ||
             freshDevices[i].capacityBytes != _devices[i].capacityBytes ||
-            freshDevices[i].isWipedNoFilesystem != _devices[i].isWipedNoFilesystem ||
+            freshDevices[i].isWipedNoFilesystem !=
+                _devices[i].isWipedNoFilesystem ||
             freshDevices[i].hasFilesystem != _devices[i].hasFilesystem) {
           hasChanged = true;
           break;
@@ -701,16 +1063,21 @@ class SanitizationController extends ChangeNotifier {
       _devices = freshDevices;
       if (isJobRunning && _currentJob != null) {
         final target = _currentJob!.device;
-        final stillPresent = _devices.any((d) =>
-            d.stableId == target.stableId ||
-            (d.id == target.id && d.capacityBytes == target.capacityBytes));
+        final stillPresent = _devices.any(
+          (d) =>
+              d.stableId == target.stableId ||
+              (d.id == target.id && d.capacityBytes == target.capacityBytes),
+        );
         if (!stillPresent) {
           // Mid-job disappearance = "interrupted"
           final job = _currentJob!;
           job.status = JobStatus.failed;
           job.endTime = DateTime.now();
-          job.currentStageDescription = 'Drive Disconnected: Sanitization Interrupted';
-          _addLog('ERROR: Drive ${target.name} (${target.id}) was disconnected during operation.');
+          job.currentStageDescription =
+              'Drive Disconnected: Sanitization Interrupted';
+          _addLog(
+            'ERROR: Drive ${target.name} (${target.id}) was disconnected during operation.',
+          );
           _auditLogService.appendEntry(
             AuditLogEntry(
               timestamp: DateTime.now().toIso8601String(),
@@ -728,7 +1095,9 @@ class SanitizationController extends ChangeNotifier {
               entropyScore: 0.0,
               sampleCount: 0,
               commandLog: List<String>.from(job.logs)
-                ..add('Drive disconnected during operation - interrupted, state unknown.'),
+                ..add(
+                  'Drive disconnected during operation - interrupted, state unknown.',
+                ),
               partitions: _buildPartitionOutcomes(job, false),
             ),
           );
@@ -737,11 +1106,14 @@ class SanitizationController extends ChangeNotifier {
       }
       if (!isJobRunning) {
         if (_devices.isNotEmpty) {
-          if (_selectedDevice == null || !_devices.any((d) => d.id == _selectedDevice!.id)) {
+          if (_selectedDevice == null ||
+              !_devices.any((d) => d.id == _selectedDevice!.id)) {
             _selectedDevice = _devices.first;
           } else {
             // Refresh selected device reference with new profile
-            _selectedDevice = _devices.firstWhere((d) => d.id == _selectedDevice!.id);
+            _selectedDevice = _devices.firstWhere(
+              (d) => d.id == _selectedDevice!.id,
+            );
           }
         } else {
           _selectedDevice = null;
@@ -822,9 +1194,10 @@ class SanitizationController extends ChangeNotifier {
 
     try {
       final bin = await _platformBackend.resolveEngineBinaryPath();
-      final res =
-          await Process.run(bin, ['probe-windows', partition.devicePath])
-              .timeout(const Duration(seconds: 30));
+      final res = await Process.run(bin, [
+        'probe-windows',
+        partition.devicePath,
+      ]).timeout(const Duration(seconds: 30));
       final out = res.stdout as String? ?? '';
       const marker = 'WINDOWS_PROBE:';
       final idx = out.indexOf(marker);
@@ -833,7 +1206,8 @@ class SanitizationController extends ChangeNotifier {
         return fail(err.isEmpty ? 'Probe failed' : 'Probe failed: $err');
       }
       final probe =
-          jsonDecode(out.substring(idx + marker.length)) as Map<String, dynamic>;
+          jsonDecode(out.substring(idx + marker.length))
+              as Map<String, dynamic>;
       if (probe['mounted_read_only'] != true) {
         return fail(probe['error'] as String? ?? 'read-only mount failed');
       }
@@ -906,11 +1280,13 @@ class SanitizationController extends ChangeNotifier {
           effectiveRecMethod != SanitizationMethod.multiPassOverwrite) {
         effectiveRecMethod = SanitizationMethod.singlePassOverwrite;
         standardRef = 'NIST SP 800-88 R1 Clear (Partition Scope Overwrite)';
-        explanation = 'Partition-scoped wiping only supports overwrite methods. Firmware sanitize and crypto commands affect the whole drive and cannot be scoped to a single partition.';
+        explanation =
+            'Partition-scoped wiping only supports overwrite methods. Firmware sanitize and crypto commands affect the whole drive and cannot be scoped to a single partition.';
       }
     }
 
-    final jobId = 'JOB-${DateTime.now().millisecondsSinceEpoch.toString().substring(6)}';
+    final jobId =
+        'JOB-${DateTime.now().millisecondsSinceEpoch.toString().substring(6)}';
 
     _currentJob = SanitizationJob(
       jobId: jobId,
@@ -956,6 +1332,8 @@ class SanitizationController extends ChangeNotifier {
     final job = _currentJob!;
     job.startTime = DateTime.now();
     job.logs.clear();
+    // Phase F: every job starts with no format eligibility or prompt.
+    _resetFilesystemRecreationState();
 
     _addLog('POLICY: Validating requested operation whitelist...');
     final policy = _policyLayer.validateOperation(job);
@@ -969,7 +1347,9 @@ class SanitizationController extends ChangeNotifier {
       return;
     }
 
-    _addLog('SUCCESS: Whitelist verified. Target: ${job.device.name} [${job.device.serialNumber}]');
+    _addLog(
+      'SUCCESS: Whitelist verified. Target: ${job.device.name} [${job.device.serialNumber}]',
+    );
     notifyListeners();
 
     // B4: fail-closed pre-flight — EVERY selected partition must pass the
@@ -981,19 +1361,24 @@ class SanitizationController extends ChangeNotifier {
         if (!perPart.isAllowed) {
           job.status = JobStatus.failed;
           job.currentStageDescription = perPart.policyMessage;
-          _addLog('ERROR: Pre-flight refused partition ${t.name}: ${perPart.policyMessage}');
+          _addLog(
+            'ERROR: Pre-flight refused partition ${t.name}: ${perPart.policyMessage}',
+          );
           notifyListeners();
           return;
         }
       }
-      _addLog('SUCCESS: Pre-flight passed for all ${job.targetPartitions.length} selected partitions.');
+      _addLog(
+        'SUCCESS: Pre-flight passed for all ${job.targetPartitions.length} selected partitions.',
+      );
       notifyListeners();
     }
 
     if (_isRealMode) {
       if (kIsWeb) {
         job.status = JobStatus.failed;
-        job.currentStageDescription = 'Real mode is not supported on Web. Please run natively on Linux.';
+        job.currentStageDescription =
+            'Real mode is not supported on Web. Please run natively on Linux.';
         _addLog('ERROR: Real mode is not supported on Web.');
         notifyListeners();
         return;
@@ -1020,8 +1405,11 @@ class SanitizationController extends ChangeNotifier {
         // Stage 1: Detecting & unmounting filesystems
         job.status = JobStatus.unmounting;
         job.progress = null; // Honest indeterminate state
-        job.currentStageDescription = 'Preparing device: zt_engine handling partition unmounts...';
-        _addLog('SYSTEM: Initializing device preparation (zt_engine managing unmount)...');
+        job.currentStageDescription =
+            'Preparing device: zt_engine handling partition unmounts...';
+        _addLog(
+          'SYSTEM: Initializing device preparation (zt_engine managing unmount)...',
+        );
         notifyListeners();
 
         // B4: execution targets — whole device = single pass; partition
@@ -1031,7 +1419,8 @@ class SanitizationController extends ChangeNotifier {
 
         // Stage 2: Sanitization execution (sequential per target)
         job.status = JobStatus.sanitizing;
-        job.progress = null; // Honest indeterminate state until write progress arrives
+        job.progress =
+            null; // Honest indeterminate state until write progress arrives
         job.currentStageDescription = targets.length > 1
             ? 'Executing partition wipe 1/${targets.length}...'
             : 'Executing real-hardware sanitization...';
@@ -1040,13 +1429,21 @@ class SanitizationController extends ChangeNotifier {
         _lastHeartbeatTime = DateTime.now();
         _isStalled = false;
         _stallWatchdogTimer?.cancel();
-        _stallWatchdogTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-          if (job.status == JobStatus.sanitizing && _lastHeartbeatTime != null) {
-            final secondsSinceHeartbeat = DateTime.now().difference(_lastHeartbeatTime!).inSeconds;
+        _stallWatchdogTimer = Timer.periodic(const Duration(seconds: 1), (
+          timer,
+        ) {
+          if (job.status == JobStatus.sanitizing &&
+              _lastHeartbeatTime != null) {
+            final secondsSinceHeartbeat = DateTime.now()
+                .difference(_lastHeartbeatTime!)
+                .inSeconds;
             if (secondsSinceHeartbeat >= 30 && !_isStalled) {
               _isStalled = true;
-              job.currentStageDescription = 'Drive I/O stalled - waiting for hardware response...';
-              _addLog('WARNING: No progress or heartbeat received for ${secondsSinceHeartbeat}s; drive I/O may be stalled.');
+              job.currentStageDescription =
+                  'Drive I/O stalled - waiting for hardware response...';
+              _addLog(
+                'WARNING: No progress or heartbeat received for ${secondsSinceHeartbeat}s; drive I/O may be stalled.',
+              );
               notifyListeners();
             } else if (secondsSinceHeartbeat < 30 && _isStalled) {
               _isStalled = false;
@@ -1060,127 +1457,170 @@ class SanitizationController extends ChangeNotifier {
           final String targetPath = target != null
               ? target.devicePath
               : (job.device.id.startsWith('real_')
-                  ? '/dev/${job.device.id.substring(5)}'
-                  : '/dev/sdb');
+                    ? '/dev/${job.device.id.substring(5)}'
+                    : '/dev/sdb');
           if (targets.length > 1) {
             job.currentStageDescription =
                 'Wiping partition ${ti + 1}/${targets.length}: ${target!.name}...';
-            _addLog('SCOPE: Partition ${ti + 1}/${targets.length}: ${target.devicePath} '
-                '(range only — partition table untouched)');
+            _addLog(
+              'SCOPE: Partition ${ti + 1}/${targets.length}: ${target.devicePath} '
+              '(range only — partition table untouched)',
+            );
             notifyListeners();
           }
 
-          await _jobStateFile.saveActiveJob(ActiveJobState(
-            jobId: job.jobId,
-            deviceSerial: job.device.serialNumber,
-            devicePath: targetPath,
-            deviceName: job.device.name,
-            method: job.effectiveMethod.displayName,
-            methodKind: _methodKind(job.effectiveMethod),
-            deviceSize: job.device.capacityBytes,
-            startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
-            partitionNumber: target?.partitionNumber,
-            partitionStartSector: target?.startSector,
-            partitionSizeSectors: target?.sizeSectors,
-            scope: job.isPartitionScope ? 'partial' : 'full',
-            limitation: job.isPartitionScope
-                ? 'Partition wipe: partition table and unselected sectors are not overwritten'
-                : null,
-          ));
+          await _jobStateFile.saveActiveJob(
+            ActiveJobState(
+              jobId: job.jobId,
+              deviceSerial: job.device.serialNumber,
+              devicePath: targetPath,
+              deviceName: job.device.name,
+              method: job.effectiveMethod.displayName,
+              methodKind: _methodKind(job.effectiveMethod),
+              deviceSize: job.device.capacityBytes,
+              startedAt:
+                  job.startTime?.toIso8601String() ??
+                  DateTime.now().toIso8601String(),
+              partitionNumber: target?.partitionNumber,
+              partitionStartSector: target?.startSector,
+              partitionSizeSectors: target?.sizeSectors,
+              scope: job.isPartitionScope ? 'partial' : 'full',
+              limitation: job.isPartitionScope
+                  ? 'Partition wipe: partition table and unselected sectors are not overwritten'
+                  : null,
+            ),
+          );
 
           _lastHeartbeatTime = DateTime.now();
 
-        final report = await _realSanitizeService.executeSanitization(
-          device: job.device,
-          method: job.effectiveMethod,
-          confirmationToken: job.device.serialNumber, // verified by dialog retype
-          deviceSerial: job.device.serialNumber,
-          targetPartition: target,
-          dryRun: false,
-          onProgress: (event) {
-            _lastHeartbeatTime = DateTime.now();
-            if (_isStalled) {
-              _isStalled = false;
-            }
-            if (event.isHeartbeat) {
+          final report = await _realSanitizeService.executeSanitization(
+            device: job.device,
+            method: job.effectiveMethod,
+            confirmationToken:
+                job.device.serialNumber, // verified by dialog retype
+            deviceSerial: job.device.serialNumber,
+            targetPartition: target,
+            dryRun: false,
+            onProgress: (event) {
+              _lastHeartbeatTime = DateTime.now();
+              if (_isStalled) {
+                _isStalled = false;
+              }
+              if (event.isHeartbeat) {
+                notifyListeners();
+                return;
+              }
+
+              _currentSpeedBytesPerSec = event.speedBytesPerSec;
+              _currentEtaSeconds = event.etaSeconds;
+
+              // Firmware sanitize methods have percent == null -> indeterminate
+              // Software overwrite has real percent computed by native engine
+              // B4: fold per-partition progress into overall job progress.
+              job.progress = (targets.length > 1 && event.percent != null)
+                  ? (ti + event.percent!) / targets.length
+                  : event.percent;
+
+              if (event.bytesTotal > 0 && event.bytesDone > 0) {
+                final doneGb = (event.bytesDone / 1e9).toStringAsFixed(1);
+                final totalGb = (event.bytesTotal / 1e9).toStringAsFixed(1);
+                final speedMb = (event.speedBytesPerSec / 1e6).toStringAsFixed(
+                  1,
+                );
+                final etaStr =
+                    event.etaSeconds != null && event.speedBytesPerSec > 1024
+                    ? 'ETA: ${event.etaSeconds}s'
+                    : 'Estimating ETA...';
+                job.currentStageDescription =
+                    '${event.message} ($doneGb / $totalGb GB @ $speedMb MB/s, $etaStr)';
+              } else {
+                job.currentStageDescription = event.message;
+              }
+
+              final pctStr = event.percent != null
+                  ? ' (${(event.percent! * 100).toInt()}%)'
+                  : '';
+              _addLog('PROGRESS: [${event.phase}] ${event.message}$pctStr');
               notifyListeners();
-              return;
-            }
-
-            _currentSpeedBytesPerSec = event.speedBytesPerSec;
-            _currentEtaSeconds = event.etaSeconds;
-
-            // Firmware sanitize methods have percent == null -> indeterminate
-            // Software overwrite has real percent computed by native engine
-            // B4: fold per-partition progress into overall job progress.
-            job.progress = (targets.length > 1 && event.percent != null)
-                ? (ti + event.percent!) / targets.length
-                : event.percent;
-
-            if (event.bytesTotal > 0 && event.bytesDone > 0) {
-              final doneGb = (event.bytesDone / 1e9).toStringAsFixed(1);
-              final totalGb = (event.bytesTotal / 1e9).toStringAsFixed(1);
-              final speedMb = (event.speedBytesPerSec / 1e6).toStringAsFixed(1);
-              final etaStr = event.etaSeconds != null && event.speedBytesPerSec > 1024
-                  ? 'ETA: ${event.etaSeconds}s'
-                  : 'Estimating ETA...';
-              job.currentStageDescription = '${event.message} ($doneGb / $totalGb GB @ $speedMb MB/s, $etaStr)';
-            } else {
-              job.currentStageDescription = event.message;
-            }
-
-            final pctStr = event.percent != null ? ' (${(event.percent! * 100).toInt()}%)' : '';
-            _addLog('PROGRESS: [${event.phase}] ${event.message}$pctStr');
-            notifyListeners();
-          },
-          onRawLog: (rawLine) {
-            _addLog(rawLine);
-            notifyListeners();
-          },
-        );
-        aggregatedCommandLog.addAll(report.commandLog);
-        lastReport = report;
+            },
+            onRawLog: (rawLine) {
+              _addLog(rawLine);
+              notifyListeners();
+            },
+          );
+          aggregatedCommandLog.addAll(report.commandLog);
+          lastReport = report;
 
           if (!report.success) {
             job.status = JobStatus.failed;
             job.endTime = DateTime.now();
             if (report.exitCode == 130) {
-              job.currentStageDescription = 'Sanitization Cancelled: Partially Wiped';
-              _addLog('CANCEL: Sanitization cancelled by user. Partially wiped.');
+              job.currentStageDescription =
+                  'Sanitization Cancelled: Partially Wiped';
+              _addLog(
+                'CANCEL: Sanitization cancelled by user. Partially wiped.',
+              );
             } else {
-              job.currentStageDescription = 'Sanitization Failed: ${report.stderr}';
-              _addLog('ERROR: Sanitization command failed with code ${report.exitCode}');
+              job.currentStageDescription =
+                  'Sanitization Failed: ${report.stderr}';
+              _addLog(
+                'ERROR: Sanitization command failed with code ${report.exitCode}',
+              );
               _addLog('ERROR Details: ${report.stderr}');
             }
             if (target != null) {
-              outcomes.add(PartitionAuditOutcome.forPartition(target, success: false));
+              outcomes.add(
+                PartitionAuditOutcome.forPartition(target, success: false),
+              );
             }
-            _addLog('ERROR: Wipe stopped; $wipedTargets/${targets.length} target(s) completed.');
+            _addLog(
+              'ERROR: Wipe stopped; $wipedTargets/${targets.length} target(s) completed.',
+            );
             await _jobStateFile.clearActiveJob();
             notifyListeners();
             return;
           }
           if (target != null) {
-            outcomes.add(PartitionAuditOutcome.forPartition(target, success: true));
+            outcomes.add(
+              PartitionAuditOutcome.forPartition(target, success: true),
+            );
           }
           wipedTargets++;
 
           // Stage 3: Verification LBA sampling — immediately after each
           // target's wipe so every wiped range is sampled.
           job.status = JobStatus.verifying;
-          job.progress = targets.length > 1 ? wipedTargets / targets.length : null;
+          job.progress = targets.length > 1
+              ? wipedTargets / targets.length
+              : null;
           job.currentStageDescription = targets.length > 1
               ? 'Verifying partition ${ti + 1}/${targets.length}: ${target!.name}...'
               : 'Verifying sector erasure via LBA sampling...';
-          _addLog('VERIFICATION: Running post-sanitize verify LBA sampling'
-              '${targets.length > 1 ? ' for ${target!.devicePath}' : ''}...');
+          _addLog(
+            'VERIFICATION: Running post-sanitize verify LBA sampling'
+            '${targets.length > 1 ? ' for ${target!.devicePath}' : ''}...',
+          );
           notifyListeners();
 
-          final cliMethod = _realSanitizeService.mapMethodToCliArg(job.effectiveMethod, job.device);
-          final isCryptoMethod = job.effectiveMethod == SanitizationMethod.cryptographicErase ||
+          final cliMethod = _realSanitizeService.mapMethodToCliArg(
+            job.effectiveMethod,
+            job.device,
+          );
+          final isCryptoMethod =
+              job.effectiveMethod == SanitizationMethod.cryptographicErase ||
               report.methodUsed.toLowerCase().contains('crypto') ||
               report.methodUsed.toLowerCase().contains('reverttper');
           final expectZeros = !isCryptoMethod;
+
+          // Phase F: ask the engine to leave a one-shot verified-wipe receipt
+          // for this exact target. It is the only proof the separate `format`
+          // process will accept.
+          final receiptFile = target != null
+              ? _appPaths.verifiedWipeReceiptFile(
+                  job.jobId,
+                  partitionNumber: target.partitionNumber,
+                )
+              : _appPaths.verifiedWipeReceiptFile(job.jobId);
 
           RealVerificationReport? verifyReport;
           try {
@@ -1191,15 +1631,21 @@ class SanitizationController extends ChangeNotifier {
               targetPartition: target,
               sampleCount: 50,
               expectZeros: expectZeros,
+              verifiedReceiptPath: receiptFile.path,
             );
           } catch (verifyErr) {
             _addLog('WARNING: Verification sampling failed: $verifyErr');
-            _addLog('NOTE: Disk write operation itself completed successfully.');
+            _addLog(
+              'NOTE: Disk write operation itself completed successfully.',
+            );
           }
           if (verifyReport != null) {
             anyVerifyRan = true;
             allVerifiesPassed = allVerifiesPassed && verifyReport.pass;
             verifyReports.add(verifyReport);
+            if (verifyReport.pass) {
+              _verifiedFormatReceipts[targetPath] = receiptFile.path;
+            }
           }
         } // end per-target wipe loop (B4)
 
@@ -1219,9 +1665,12 @@ class SanitizationController extends ChangeNotifier {
         // B4: aggregate verification over every target. Single-target runs
         // keep the exact A8 semantics: no verify report = pass=false in the
         // evidence, but the wipe itself still counts as successful.
-        final bool verificationPassed = anyVerifyRan ? allVerifiesPassed : false;
-        final RealVerificationReport? verifyReport =
-            verifyReports.isEmpty ? null : verifyReports.last;
+        final bool verificationPassed = anyVerifyRan
+            ? allVerifiesPassed
+            : false;
+        final RealVerificationReport? verifyReport = verifyReports.isEmpty
+            ? null
+            : verifyReports.last;
 
         // Construct VerificationEvidence from real report(s). Sample offsets
         // are absolute device LBAs, so multi-target samples never collide.
@@ -1242,21 +1691,24 @@ class SanitizationController extends ChangeNotifier {
           // populate dummy offsets if none returned to avoid UI crashes
           sampleOffsets.addAll(List.generate(50, (index) => index * 1000));
           for (final offset in sampleOffsets) {
-            sampleHashes[offset] = '0000000000000000000000000000000000000000000000000000000000000000';
+            sampleHashes[offset] =
+                '0000000000000000000000000000000000000000000000000000000000000000';
           }
         }
 
         final statusCode = verificationPassed ? 0 : 1;
         final controllerConfirmation = verifyReports.isNotEmpty
             ? (verifyReports.length == 1
-                ? 'VERIFICATION: Pass: ${verifyReports.single.pass} | Samples: ${verifyReports.single.sampleCount} | Entropy: ${verifyReports.single.entropyScore}'
-                : 'VERIFICATION: Pass: $allVerifiesPassed '
-                    '(${verifyReports.where((v) => v.pass).length}/${targets.length} partitions) | '
-                    'Samples: ${verifyReports.fold<int>(0, (a, v) => a + v.sampleCount)} | '
-                    'Entropy: ${verifyReports.last.entropyScore}')
+                  ? 'VERIFICATION: Pass: ${verifyReports.single.pass} | Samples: ${verifyReports.single.sampleCount} | Entropy: ${verifyReports.single.entropyScore}'
+                  : 'VERIFICATION: Pass: $allVerifiesPassed '
+                        '(${verifyReports.where((v) => v.pass).length}/${targets.length} partitions) | '
+                        'Samples: ${verifyReports.fold<int>(0, (a, v) => a + v.sampleCount)} | '
+                        'Entropy: ${verifyReports.last.entropyScore}')
             : 'VERIFICATION: Sampling unavailable (disk wipe command succeeded)';
 
-        final limitations = _verificationService.getTailoredLimitations(job.recommendedMethod);
+        final limitations = _verificationService.getTailoredLimitations(
+          job.recommendedMethod,
+        );
 
         final evidence = VerificationEvidence(
           statusCode: statusCode,
@@ -1281,8 +1733,8 @@ class SanitizationController extends ChangeNotifier {
         job.endTime = DateTime.now();
         job.currentStageDescription = isJobSuccessful
             ? (verificationPassed
-                ? 'Sanitization & Audit Verification Complete.'
-                : 'Disk wipe succeeded. Verification sampling unavailable — review logs.')
+                  ? 'Sanitization & Audit Verification Complete.'
+                  : 'Disk wipe succeeded. Verification sampling unavailable — review logs.')
             : 'Verification Failed: Non-zero or dirty sectors detected.';
         notifyListeners();
 
@@ -1293,7 +1745,8 @@ class SanitizationController extends ChangeNotifier {
             job: job,
             evidence: evidence,
             executionMode: 'real',
-            actualMethodExecuted: lastReport?.methodUsed ?? job.effectiveMethod.displayName,
+            actualMethodExecuted:
+                lastReport?.methodUsed ?? job.effectiveMethod.displayName,
             // A7: sign the ordered engine steps actually executed (B4: the
             // aggregated command log of every sequential target).
             stepsExecuted: aggregatedCommandLog,
@@ -1303,21 +1756,28 @@ class SanitizationController extends ChangeNotifier {
             // from the live medium).
             bootEnvironment: LiveBootDetector.detect().name,
           );
-          _addLog('CERTIFICATE: Issued ${completedCertificate!.certificateId} signed with ECDSA P-256 key.');
+          _addLog(
+            'CERTIFICATE: Issued ${completedCertificate!.certificateId} signed with ECDSA P-256 key.',
+          );
         } catch (certErr) {
           _addLog('WARNING: Certificate generation failed: $certErr');
           _addLog('NOTE: The disk sanitization itself completed successfully.');
-          job.currentStageDescription = 'Sanitization succeeded. Certificate generation failed — see logs.';
+          job.currentStageDescription =
+              'Sanitization succeeded. Certificate generation failed — see logs.';
         }
 
         if (verifyReport != null) {
-          _addLog('VERIFICATION: Entropy score: ${verifyReport.entropyScore}. Fingerprint: ${verifyReport.fingerprintHash}');
+          _addLog(
+            'VERIFICATION: Entropy score: ${verifyReport.entropyScore}. Fingerprint: ${verifyReport.fingerprintHash}',
+          );
         }
 
         String? certSha;
         if (completedCertificate != null) {
           try {
-            final (_, sha) = await _auditLogService.saveCertificate(_completedCertificate!);
+            final (_, sha) = await _auditLogService.saveCertificate(
+              _completedCertificate!,
+            );
             certSha = sha;
           } catch (_) {}
         }
@@ -1330,8 +1790,8 @@ class SanitizationController extends ChangeNotifier {
             devicePath: job.isPartitionScope
                 ? job.targetPartition!.devicePath
                 : (job.device.id.startsWith('real_')
-                    ? '/dev/${job.device.id.substring(5)}'
-                    : '/dev/null'),
+                      ? '/dev/${job.device.id.substring(5)}'
+                      : '/dev/null'),
             deviceName: job.device.name,
             scope: job.isPartitionScope ? 'partial' : 'full',
             method: job.recommendedMethod.displayName,
@@ -1376,36 +1836,42 @@ class SanitizationController extends ChangeNotifier {
             bootEnvironment: LiveBootDetector.detect().name,
           );
           _completedCertificate = report;
-          final (_, reportSha) = await _auditLogService.saveFailureReport(report);
-          await _auditLogService.appendEntry(AuditLogEntry(
-            timestamp: DateTime.now().toIso8601String(),
-            jobId: job.jobId,
-            deviceSerial: job.device.serialNumber,
-            devicePath: job.isPartitionScope
-                ? job.targetPartition!.devicePath
-                : (job.device.id.startsWith('real_') ? '/dev/${job.device.id.substring(5)}' : '/dev/null'),
-            deviceName: job.device.name,
-            scope: job.isPartitionScope ? 'partial' : 'full',
-            method: job.recommendedMethod.displayName,
-            methodClass: _deriveMethodClass(job.effectiveMethod),
-            standardReference: job.standardReference,
-            nistCategory: job.effectiveNistCategoryDisplayName,
-            outcome: 'wipe_failed',
-            success: false,
-            verificationPassed: false,
-            certificateId: report.certificateId,
-            certificateSha256: reportSha,
-            fingerprintHash: 'EXECUTION_FAILED',
-            entropyScore: 0.0,
-            sampleCount: 0,
-            commandLog: List<String>.from(job.logs),
-            isSimulated: false,
-            partitions: _buildPartitionOutcomes(
-              job,
-              false,
-              override: outcomes.isNotEmpty ? outcomes : null,
+          final (_, reportSha) = await _auditLogService.saveFailureReport(
+            report,
+          );
+          await _auditLogService.appendEntry(
+            AuditLogEntry(
+              timestamp: DateTime.now().toIso8601String(),
+              jobId: job.jobId,
+              deviceSerial: job.device.serialNumber,
+              devicePath: job.isPartitionScope
+                  ? job.targetPartition!.devicePath
+                  : (job.device.id.startsWith('real_')
+                        ? '/dev/${job.device.id.substring(5)}'
+                        : '/dev/null'),
+              deviceName: job.device.name,
+              scope: job.isPartitionScope ? 'partial' : 'full',
+              method: job.recommendedMethod.displayName,
+              methodClass: _deriveMethodClass(job.effectiveMethod),
+              standardReference: job.standardReference,
+              nistCategory: job.effectiveNistCategoryDisplayName,
+              outcome: 'wipe_failed',
+              success: false,
+              verificationPassed: false,
+              certificateId: report.certificateId,
+              certificateSha256: reportSha,
+              fingerprintHash: 'EXECUTION_FAILED',
+              entropyScore: 0.0,
+              sampleCount: 0,
+              commandLog: List<String>.from(job.logs),
+              isSimulated: false,
+              partitions: _buildPartitionOutcomes(
+                job,
+                false,
+                override: outcomes.isNotEmpty ? outcomes : null,
+              ),
             ),
-          ));
+          );
         } catch (_) {}
 
         await _jobStateFile.clearActiveJob();
@@ -1420,7 +1886,8 @@ class SanitizationController extends ChangeNotifier {
     await Future.delayed(const Duration(milliseconds: 800));
     job.status = JobStatus.unmounting;
     job.progress = 0.20;
-    job.currentStageDescription = 'Unmounting filesystems & requesting target device lock...';
+    job.currentStageDescription =
+        'Unmounting filesystems & requesting target device lock...';
     _addLog('DISCOVERY: Classifying media topology & bus capabilities...');
     _addLog('SYSTEM: Unmounted partitions on ${job.device.name}');
     notifyListeners();
@@ -1429,19 +1896,26 @@ class SanitizationController extends ChangeNotifier {
     await Future.delayed(const Duration(milliseconds: 1000));
     job.status = JobStatus.sanitizing;
     job.progress = 0.40;
-    job.currentStageDescription = 'Executing ${job.effectiveMethod.displayName}...';
-    _addLog('EXECUTION: Invoking controller command payload [Simulated Engine]...');
+    job.currentStageDescription =
+        'Executing ${job.effectiveMethod.displayName}...';
+    _addLog(
+      'EXECUTION: Invoking controller command payload [Simulated Engine]...',
+    );
 
-    await _jobStateFile.saveActiveJob(ActiveJobState(
-      jobId: job.jobId,
-      deviceSerial: job.device.serialNumber,
-      devicePath: '/dev/sdb',
-      deviceName: job.device.name,
-      method: job.effectiveMethod.displayName,
-      methodKind: _methodKind(job.effectiveMethod),
-      deviceSize: job.device.capacityBytes,
-      startedAt: job.startTime?.toIso8601String() ?? DateTime.now().toIso8601String(),
-    ));
+    await _jobStateFile.saveActiveJob(
+      ActiveJobState(
+        jobId: job.jobId,
+        deviceSerial: job.device.serialNumber,
+        devicePath: '/dev/sdb',
+        deviceName: job.device.name,
+        method: job.effectiveMethod.displayName,
+        methodKind: _methodKind(job.effectiveMethod),
+        deviceSize: job.device.capacityBytes,
+        startedAt:
+            job.startTime?.toIso8601String() ??
+            DateTime.now().toIso8601String(),
+      ),
+    );
 
     // Progress updates during sanitization
     for (int p = 45; p <= 80; p += 10) {
@@ -1456,9 +1930,12 @@ class SanitizationController extends ChangeNotifier {
       await Future.delayed(const Duration(milliseconds: 600));
       job.status = JobStatus.failed;
       job.endTime = DateTime.now();
-      job.currentStageDescription = 'Sanitization Interrupted: Hardware Controller Time-out';
-      _addLog('ERROR: Controller returned STATUS_ERR_TIMEOUT (Simulated Failure Injected)');
-      
+      job.currentStageDescription =
+          'Sanitization Interrupted: Hardware Controller Time-out';
+      _addLog(
+        'ERROR: Controller returned STATUS_ERR_TIMEOUT (Simulated Failure Injected)',
+      );
+
       final evidence = _verificationService.verify(job, isSuccess: false);
       _completedCertificate = _certificateService.generateCertificate(
         job: job,
@@ -1467,30 +1944,34 @@ class SanitizationController extends ChangeNotifier {
         bootEnvironment: LiveBootDetector.detect().name,
       );
       try {
-        final (_, reportSha) = await _auditLogService.saveFailureReport(_completedCertificate!);
-        await _auditLogService.appendEntry(AuditLogEntry(
-          timestamp: DateTime.now().toIso8601String(),
-          jobId: job.jobId,
-          deviceSerial: job.device.serialNumber,
-          devicePath: '/dev/sdb',
-          deviceName: job.device.name,
-          scope: job.isPartitionScope ? 'partial' : 'full',
-          method: job.effectiveMethod.displayName,
-          methodClass: _deriveMethodClass(job.effectiveMethod),
-          standardReference: job.standardReference,
-          nistCategory: job.effectiveNistCategoryDisplayName,
-          outcome: 'wipe_failed',
-          success: false,
-          verificationPassed: false,
-          certificateId: _completedCertificate!.certificateId,
-          certificateSha256: reportSha,
-          fingerprintHash: 'SIMULATED_FAILURE',
-          entropyScore: 0.0,
-          sampleCount: 0,
-          commandLog: List<String>.from(job.logs),
-          isSimulated: true,
-          partitions: _buildPartitionOutcomes(job, false),
-        ));
+        final (_, reportSha) = await _auditLogService.saveFailureReport(
+          _completedCertificate!,
+        );
+        await _auditLogService.appendEntry(
+          AuditLogEntry(
+            timestamp: DateTime.now().toIso8601String(),
+            jobId: job.jobId,
+            deviceSerial: job.device.serialNumber,
+            devicePath: '/dev/sdb',
+            deviceName: job.device.name,
+            scope: job.isPartitionScope ? 'partial' : 'full',
+            method: job.effectiveMethod.displayName,
+            methodClass: _deriveMethodClass(job.effectiveMethod),
+            standardReference: job.standardReference,
+            nistCategory: job.effectiveNistCategoryDisplayName,
+            outcome: 'wipe_failed',
+            success: false,
+            verificationPassed: false,
+            certificateId: _completedCertificate!.certificateId,
+            certificateSha256: reportSha,
+            fingerprintHash: 'SIMULATED_FAILURE',
+            entropyScore: 0.0,
+            sampleCount: 0,
+            commandLog: List<String>.from(job.logs),
+            isSimulated: true,
+            partitions: _buildPartitionOutcomes(job, false),
+          ),
+        );
       } catch (_) {}
 
       await _jobStateFile.clearActiveJob();
@@ -1503,7 +1984,8 @@ class SanitizationController extends ChangeNotifier {
     await Future.delayed(const Duration(milliseconds: 600));
     job.status = JobStatus.verifying;
     job.progress = 0.90;
-    job.currentStageDescription = 'Verifying sector erasure via 50-point readback sampling...';
+    job.currentStageDescription =
+        'Verifying sector erasure via 50-point readback sampling...';
     _addLog('VERIFICATION: Executing sector sampling across full LBA range...');
     notifyListeners();
 
@@ -1513,7 +1995,9 @@ class SanitizationController extends ChangeNotifier {
     job.progress = 1.0;
     job.endTime = DateTime.now();
     job.currentStageDescription = 'Sanitization & Audit Verification Complete.';
-    _addLog('VERIFICATION: 50/50 Sector Samples zero-verified. SHA-256 evidence calculated.');
+    _addLog(
+      'VERIFICATION: 50/50 Sector Samples zero-verified. SHA-256 evidence calculated.',
+    );
 
     final evidence = _verificationService.verify(job, isSuccess: true);
     _completedCertificate = _certificateService.generateCertificate(
@@ -1522,33 +2006,39 @@ class SanitizationController extends ChangeNotifier {
       executionMode: 'simulated',
       bootEnvironment: LiveBootDetector.detect().name,
     );
-    _addLog('CERTIFICATE: Issued ${completedCertificate!.certificateId} signed with ECDSA P-256 key.');
+    _addLog(
+      'CERTIFICATE: Issued ${completedCertificate!.certificateId} signed with ECDSA P-256 key.',
+    );
 
     try {
-      final (_, certSha) = await _auditLogService.saveCertificate(_completedCertificate!);
-      await _auditLogService.appendEntry(AuditLogEntry(
-        timestamp: DateTime.now().toIso8601String(),
-        jobId: job.jobId,
-        deviceSerial: job.device.serialNumber,
-        devicePath: '/dev/sdb',
-        deviceName: job.device.name,
-        scope: job.isPartitionScope ? 'partial' : 'full',
-        method: job.effectiveMethod.displayName,
-        methodClass: _deriveMethodClass(job.effectiveMethod),
-        standardReference: job.standardReference,
-        nistCategory: job.effectiveNistCategoryDisplayName,
-        outcome: 'completed',
-        success: true,
-        verificationPassed: true,
-        certificateId: _completedCertificate!.certificateId,
-        certificateSha256: certSha,
-        fingerprintHash: evidence.evidenceHash,
-        entropyScore: 0.0,
-        sampleCount: 50,
-        commandLog: List<String>.from(job.logs),
-        isSimulated: true,
-        partitions: _buildPartitionOutcomes(job, true),
-      ));
+      final (_, certSha) = await _auditLogService.saveCertificate(
+        _completedCertificate!,
+      );
+      await _auditLogService.appendEntry(
+        AuditLogEntry(
+          timestamp: DateTime.now().toIso8601String(),
+          jobId: job.jobId,
+          deviceSerial: job.device.serialNumber,
+          devicePath: '/dev/sdb',
+          deviceName: job.device.name,
+          scope: job.isPartitionScope ? 'partial' : 'full',
+          method: job.effectiveMethod.displayName,
+          methodClass: _deriveMethodClass(job.effectiveMethod),
+          standardReference: job.standardReference,
+          nistCategory: job.effectiveNistCategoryDisplayName,
+          outcome: 'completed',
+          success: true,
+          verificationPassed: true,
+          certificateId: _completedCertificate!.certificateId,
+          certificateSha256: certSha,
+          fingerprintHash: evidence.evidenceHash,
+          entropyScore: 0.0,
+          sampleCount: 50,
+          commandLog: List<String>.from(job.logs),
+          isSimulated: true,
+          partitions: _buildPartitionOutcomes(job, true),
+        ),
+      );
     } catch (_) {}
 
     await _jobStateFile.clearActiveJob();

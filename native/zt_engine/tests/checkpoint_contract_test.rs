@@ -54,7 +54,10 @@ fn checkpoint_writer_shape_matches_dart_fixture() {
     );
 
     let written_path = dir.path().join("active_checkpoint.json");
-    assert!(written_path.exists(), "engine must write active_checkpoint.json");
+    assert!(
+        written_path.exists(),
+        "engine must write active_checkpoint.json"
+    );
 
     let written: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&written_path).expect("read written"))
@@ -82,7 +85,10 @@ fn checkpoint_writer_shape_matches_dart_fixture() {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|name| name.ends_with(".tmp"))
         .collect();
-    assert!(leftovers.is_empty(), "no temp files may linger: {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "no temp files may linger: {leftovers:?}"
+    );
 }
 
 #[test]

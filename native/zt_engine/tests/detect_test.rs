@@ -6,11 +6,7 @@
 use zt_engine::detect::*;
 
 fn load_fixture(name: &str) -> String {
-    let path = format!(
-        "{}/tests/fixtures/{}",
-        env!("CARGO_MANIFEST_DIR"),
-        name
-    );
+    let path = format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("Failed to load fixture '{}': {}", path, e))
 }

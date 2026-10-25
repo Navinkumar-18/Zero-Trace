@@ -26,7 +26,8 @@ class VerificationEvidence {
     return VerificationEvidence(
       statusCode: json['statusCode'] as int? ?? 0,
       controllerConfirmation: json['controllerConfirmation'] as String? ?? '',
-      sampleOffsets: (json['sampleOffsets'] as List<dynamic>?)
+      sampleOffsets:
+          (json['sampleOffsets'] as List<dynamic>?)
               ?.map((e) => (e as num).toInt())
               .toList() ??
           [],
@@ -38,14 +39,78 @@ class VerificationEvidence {
   }
 
   Map<String, dynamic> toJson() => {
-        'statusCode': statusCode,
-        'controllerConfirmation': controllerConfirmation,
-        'sampleOffsets': sampleOffsets,
-        'sampleHashes': sampleHashes.map((k, v) => MapEntry(k.toString(), v)),
-        'evidenceHash': evidenceHash,
-        'limitations': limitations,
-        'verifiedPassed': verifiedPassed,
-      };
+    'statusCode': statusCode,
+    'controllerConfirmation': controllerConfirmation,
+    'sampleOffsets': sampleOffsets,
+    'sampleHashes': sampleHashes.map((k, v) => MapEntry(k.toString(), v)),
+    'evidenceHash': evidenceHash,
+    'limitations': limitations,
+    'verifiedPassed': verifiedPassed,
+  };
+}
+
+/// Phase F: separate record for the optional post-wipe filesystem recreation
+/// step (format). It is attached to a certificate/audit entry only when a
+/// format actually ran, so certificates issued before Phase F — and wipe-only
+/// certificates issued after it — keep their exact signed bytes.
+class FilesystemRecreationRecord {
+  /// External formatter tool that was executed (e.g. `mkfs.vfat`).
+  final String tool;
+
+  /// Canonical filesystem token: `vfat`, `exfat`, `ntfs` or `ext4`.
+  final String fsType;
+  final String label;
+
+  /// ISO-8601 timestamp of the format step.
+  final String time;
+
+  /// Explicit evidence that the wipe was verified before the format ran.
+  final bool sanitizationVerifiedBeforeFormat;
+
+  /// Wipe scope this format belongs to — `full` or `partial`.
+  final String scope;
+
+  /// True when the step also created a new partition table.
+  final bool partitionTableCreated;
+
+  /// `gpt` or `mbr` when [partitionTableCreated] is true.
+  final String? partitionTableType;
+
+  const FilesystemRecreationRecord({
+    required this.tool,
+    required this.fsType,
+    required this.label,
+    required this.time,
+    required this.sanitizationVerifiedBeforeFormat,
+    required this.scope,
+    this.partitionTableCreated = false,
+    this.partitionTableType,
+  });
+
+  factory FilesystemRecreationRecord.fromJson(Map<String, dynamic> json) {
+    return FilesystemRecreationRecord(
+      tool: json['tool'] as String? ?? '',
+      fsType: json['fsType'] as String? ?? '',
+      label: json['label'] as String? ?? '',
+      time: json['time'] as String? ?? '',
+      sanitizationVerifiedBeforeFormat:
+          json['sanitizationVerifiedBeforeFormat'] as bool? ?? false,
+      scope: json['scope'] as String? ?? 'full',
+      partitionTableCreated: json['partitionTableCreated'] as bool? ?? false,
+      partitionTableType: json['partitionTableType'] as String?,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'tool': tool,
+    'fsType': fsType,
+    'label': label,
+    'time': time,
+    'sanitizationVerifiedBeforeFormat': sanitizationVerifiedBeforeFormat,
+    'scope': scope,
+    if (partitionTableCreated) 'partitionTableCreated': true,
+    if (partitionTableType != null) 'partitionTableType': partitionTableType,
+  };
 }
 
 class SanitizationCertificate {
@@ -117,6 +182,11 @@ class SanitizationCertificate {
   final String? platform;
   final String? backend;
 
+  /// Phase F: optional, separately signed record of the post-wipe filesystem
+  /// recreation (format) step. Absent for wipe-only certificates, so v1–v4
+  /// verification stays byte-identical.
+  final FilesystemRecreationRecord? filesystemRecreation;
+
   SanitizationCertificate({
     this.certVersion = 2,
     required this.certificateId,
@@ -154,10 +224,12 @@ class SanitizationCertificate {
     this.bootEnvironment,
     this.platform,
     this.backend,
-  }) : simulationDisclaimer = simulationDisclaimer ??
-            (executionMode == 'simulated'
-                ? 'SIMULATED, not a valid sanitization record'
-                : null);
+    this.filesystemRecreation,
+  }) : simulationDisclaimer =
+           simulationDisclaimer ??
+           (executionMode == 'simulated'
+               ? 'SIMULATED, not a valid sanitization record'
+               : null);
 
   factory SanitizationCertificate.fromJson(Map<String, dynamic> json) {
     final certVer = json['certVersion'] as int? ?? 1;
@@ -175,9 +247,20 @@ class SanitizationCertificate {
           );
 
     // v4 stores partitions under 'partitions'; v3 under 'partitionsWiped'.
-    final rawWiped = (json['partitions'] as List<dynamic>?) ??
+    final rawWiped =
+        (json['partitions'] as List<dynamic>?) ??
         (json['partitionsWiped'] as List<dynamic>?);
-    final partitionsWiped = rawWiped?.map((e) => Map<String, dynamic>.from(e as Map)).toList();
+    final partitionsWiped = rawWiped
+        ?.map((e) => Map<String, dynamic>.from(e as Map))
+        .toList();
+
+    // Phase F: optional format-step record; absent on pre-Phase-F certs.
+    final rawFormat = json['filesystemRecreation'];
+    final filesystemRecreation = rawFormat is Map
+        ? FilesystemRecreationRecord.fromJson(
+            Map<String, dynamic>.from(rawFormat),
+          )
+        : null;
 
     return SanitizationCertificate(
       certVersion: certVer,
@@ -189,9 +272,12 @@ class SanitizationCertificate {
       capacity: json['capacity'] as String? ?? '',
       method: json['method'] as String? ?? '',
       standardReference: json['standardReference'] as String? ?? '',
-      sanitizationCategory: json['sanitizationCategory'] as String? ??
+      sanitizationCategory:
+          json['sanitizationCategory'] as String? ??
           (json['standardReference'] != null &&
-                  json['standardReference'].toString().toLowerCase().contains('purge')
+                  json['standardReference'].toString().toLowerCase().contains(
+                    'purge',
+                  )
               ? 'Purge'
               : 'Clear'),
       busType: json['busType'] as String? ?? 'Unknown',
@@ -200,8 +286,8 @@ class SanitizationCertificate {
       operatorNote: json['operatorNote'] as String?,
       warningLine: json['warningLine'] as String?,
       verificationSampleCount: json['verificationSampleCount'] as int?,
-      verificationEntropyScore:
-          (json['verificationEntropyScore'] as num?)?.toDouble(),
+      verificationEntropyScore: (json['verificationEntropyScore'] as num?)
+          ?.toDouble(),
       simulationDisclaimer: json['simulationDisclaimer'] as String?,
       startTime: json['startTime'] != null
           ? DateTime.tryParse(json['startTime'].toString()) ?? DateTime.now()
@@ -227,57 +313,67 @@ class SanitizationCertificate {
       bootEnvironment: json['bootEnvironment'] as String?,
       platform: json['platform'] as String?,
       backend: json['backend'] as String?,
+      filesystemRecreation: filesystemRecreation,
     );
   }
 
   Map<String, dynamic> toJson() => {
-        'certVersion': certVersion,
-        'certificateId': certificateId,
-        'jobId': jobId,
-        'deviceModel': deviceModel,
-        'deviceSerial': deviceSerial,
-        'mediaType': mediaType,
-        'capacity': capacity,
-        'method': method,
-        'standardReference': standardReference,
-        'sanitizationCategory': sanitizationCategory,
-        'busType': busType,
-        'supportLevel': supportLevel,
-        'executionMode': executionMode,
-        if (simulationDisclaimer != null)
-          'simulationDisclaimer': simulationDisclaimer,
-        if (operatorNote != null) 'operatorNote': operatorNote,
-        if (warningLine != null) 'warningLine': warningLine,
-        if (verificationSampleCount != null)
-          'verificationSampleCount': verificationSampleCount,
-        if (verificationEntropyScore != null)
-          'verificationEntropyScore': verificationEntropyScore,
-        if (certVersion >= 3 && scope != null) 'scope': scope,
-        if (certVersion >= 3 && limitation != null) 'limitation': limitation,
-        // v3 serialized partitions under 'partitionsWiped'; v4 uses 'partitions'.
-        if (certVersion == 3 && partitionsWiped != null) 'partitionsWiped': partitionsWiped,
-        if (certVersion >= 4 && partitionsWiped != null) 'partitions': partitionsWiped,
-        if (certVersion >= 3 && bytesOverwritten != null) 'bytesOverwritten': bytesOverwritten,
-        if (certVersion >= 3 && totalDeviceBytes != null) 'totalDeviceBytes': totalDeviceBytes,
-        if (certVersion >= 4 && sanitizationLevel != null)
-          'sanitizationLevel': sanitizationLevel,
-        if (certVersion >= 4 && stepsExecuted != null) 'stepsExecuted': stepsExecuted,
-        // B5: signed boot-environment claim ("live"/"normal"/"container");
-        // omitted when absent so pre-B5 v4 certificates still round-trip.
-        if (certVersion >= 4 && bootEnvironment != null)
-          'bootEnvironment': bootEnvironment,
-        // C7: signed platform/backend identity of the issuer; omitted when
-        // absent so pre-C7 certificates round-trip byte-identically.
-        if (certVersion >= 4 && platform != null) 'platform': platform,
-        if (certVersion >= 4 && backend != null) 'backend': backend,
-        'startTime': startTime.toIso8601String(),
-        'endTime': endTime.toIso8601String(),
-        'timestamp': endTime.toIso8601String(),
-        'result': result,
-        'verificationSummary': verificationSummary,
-        'evidence': evidence.toJson(),
-        'softwareVersion': softwareVersion,
-        'signature': signature,
-        'publicKeyPem': publicKeyPem,
-      };
+    'certVersion': certVersion,
+    'certificateId': certificateId,
+    'jobId': jobId,
+    'deviceModel': deviceModel,
+    'deviceSerial': deviceSerial,
+    'mediaType': mediaType,
+    'capacity': capacity,
+    'method': method,
+    'standardReference': standardReference,
+    'sanitizationCategory': sanitizationCategory,
+    'busType': busType,
+    'supportLevel': supportLevel,
+    'executionMode': executionMode,
+    if (simulationDisclaimer != null)
+      'simulationDisclaimer': simulationDisclaimer,
+    if (operatorNote != null) 'operatorNote': operatorNote,
+    if (warningLine != null) 'warningLine': warningLine,
+    if (verificationSampleCount != null)
+      'verificationSampleCount': verificationSampleCount,
+    if (verificationEntropyScore != null)
+      'verificationEntropyScore': verificationEntropyScore,
+    if (certVersion >= 3 && scope != null) 'scope': scope,
+    if (certVersion >= 3 && limitation != null) 'limitation': limitation,
+    // v3 serialized partitions under 'partitionsWiped'; v4 uses 'partitions'.
+    if (certVersion == 3 && partitionsWiped != null)
+      'partitionsWiped': partitionsWiped,
+    if (certVersion >= 4 && partitionsWiped != null)
+      'partitions': partitionsWiped,
+    if (certVersion >= 3 && bytesOverwritten != null)
+      'bytesOverwritten': bytesOverwritten,
+    if (certVersion >= 3 && totalDeviceBytes != null)
+      'totalDeviceBytes': totalDeviceBytes,
+    if (certVersion >= 4 && sanitizationLevel != null)
+      'sanitizationLevel': sanitizationLevel,
+    if (certVersion >= 4 && stepsExecuted != null)
+      'stepsExecuted': stepsExecuted,
+    // B5: signed boot-environment claim ("live"/"normal"/"container");
+    // omitted when absent so pre-B5 v4 certificates still round-trip.
+    if (certVersion >= 4 && bootEnvironment != null)
+      'bootEnvironment': bootEnvironment,
+    // C7: signed platform/backend identity of the issuer; omitted when
+    // absent so pre-C7 certificates round-trip byte-identically.
+    if (certVersion >= 4 && platform != null) 'platform': platform,
+    if (certVersion >= 4 && backend != null) 'backend': backend,
+    // Phase F: optional format-step record; omitted when no format ran so
+    // v1–v4 certificates round-trip exactly as before.
+    if (certVersion >= 4 && filesystemRecreation != null)
+      'filesystemRecreation': filesystemRecreation!.toJson(),
+    'startTime': startTime.toIso8601String(),
+    'endTime': endTime.toIso8601String(),
+    'timestamp': endTime.toIso8601String(),
+    'result': result,
+    'verificationSummary': verificationSummary,
+    'evidence': evidence.toJson(),
+    'softwareVersion': softwareVersion,
+    'signature': signature,
+    'publicKeyPem': publicKeyPem,
+  };
 }

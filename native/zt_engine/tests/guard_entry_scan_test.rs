@@ -61,13 +61,19 @@ const WRAPPER_DELEGATIONS: &[(&str, &str)] = &[
         "compute_partition_table_fingerprint",
         "crate::guard::compute_partition_table_fingerprint",
     ),
-    ("is_mbr_extended_partition", "crate::guard::is_mbr_extended_partition"),
+    (
+        "is_mbr_extended_partition",
+        "crate::guard::is_mbr_extended_partition",
+    ),
     (
         "unmount_target_partition_and_holders",
         "crate::guard::unmount_target_partition_and_holders",
     ),
     ("resolve_parent_disk", "crate::guard::resolve_parent_disk"),
-    ("resolve_parent_serial", "crate::guard::resolve_parent_serial"),
+    (
+        "resolve_parent_serial",
+        "crate::guard::resolve_parent_serial",
+    ),
     (
         "validate_partition_target",
         "crate::guard::validate_partition_target",
@@ -114,9 +120,7 @@ fn fn_blocks(src: &str) -> Vec<(String, String)> {
 /// All identifiers immediately followed by `(` in a body.
 fn called_fns(body: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for word in body
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-    {
+    for word in body.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')) {
         // A call is `name(`; the split removed the `(` itself, so detect via
         // the original text instead — simple approach: check `word(` in body.
         if word.is_empty() {
@@ -227,7 +231,10 @@ const ALLOWED_STD_OPENS: &[(&str, &str)] = &[];
 /// Production `.rs` files under `src/`, excluding the backend directory.
 fn production_sources_outside_backend() -> Vec<(String, String)> {
     let mut out = Vec::new();
-    collect_rs(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
+    collect_rs(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        &mut out,
+    );
     out
 }
 
@@ -298,8 +305,7 @@ fn no_direct_device_opens_or_ioctls_outside_backend() {
 
             // 1. Raw open: any `libc::open(` outside backend/ must be a
             //    documented file-creation helper.
-            if line.contains("libc::open(")
-                && !ALLOWED_LIBC_OPEN_FNS.contains(&current_fn.as_str())
+            if line.contains("libc::open(") && !ALLOWED_LIBC_OPEN_FNS.contains(&current_fn.as_str())
             {
                 violations.push(format!(
                     "{}: raw `libc::open(` in fn `{}` — device opens live in backend/",

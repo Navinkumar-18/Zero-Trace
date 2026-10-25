@@ -167,7 +167,11 @@ async fn test_partition_table_fingerprint_mismatch_refused() {
     // Create device file
     fs::write(dev_root.join("sdb1"), vec![0u8; 1024]).unwrap();
 
-    let ctx = FsContext { sys_root, proc_root, dev_root };
+    let ctx = FsContext {
+        sys_root,
+        proc_root,
+        dev_root,
+    };
     let (tx, _rx) = mpsc::channel(16);
 
     let params = PartitionTargetParams {
@@ -175,7 +179,8 @@ async fn test_partition_table_fingerprint_mismatch_refused() {
         expected_start_sector: 2048,
         expected_size_sectors: 204800,
         expected_partuuid: None,
-        expected_table_fingerprint: "0000000000000000000000000000000000000000000000000000000000000000".to_string(), // Mismatched!
+        expected_table_fingerprint:
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string(), // Mismatched!
     };
 
     let res = software_overwrite_partition_ctx(
@@ -188,12 +193,20 @@ async fn test_partition_table_fingerprint_mismatch_refused() {
         true, // dry_run
         tx,
         &ctx,
-    ).await;
+    )
+    .await;
 
-    assert!(res.is_err(), "Must refuse execution on partition table fingerprint mismatch");
+    assert!(
+        res.is_err(),
+        "Must refuse execution on partition table fingerprint mismatch"
+    );
     match res.unwrap_err() {
         ExecuteError::IdentityMismatch(msg) => {
-            assert!(msg.contains("Partition table changed"), "Expected mismatch msg, got: {}", msg);
+            assert!(
+                msg.contains("Partition table changed"),
+                "Expected mismatch msg, got: {}",
+                msg
+            );
         }
         other => panic!("Expected IdentityMismatch, got {:?}", other),
     }
@@ -237,7 +250,10 @@ fn test_refuse_mbr_extended_partition_dos_fixture() {
     };
 
     let is_ext = is_mbr_extended_partition("/dev/sda1", "/dev/sda", &ctx).unwrap();
-    assert!(is_ext, "DOS MBR extended partition (type 0x05) must be detected as extended");
+    assert!(
+        is_ext,
+        "DOS MBR extended partition (type 0x05) must be detected as extended"
+    );
 }
 
 #[test]
@@ -274,7 +290,10 @@ fn test_allow_gpt_partition_fixture() {
     };
 
     let is_ext = is_mbr_extended_partition("/dev/sda1", "/dev/sda", &ctx).unwrap();
-    assert!(!is_ext, "GPT partition with protective MBR (0xEE) must NOT be detected as MBR extended");
+    assert!(
+        !is_ext,
+        "GPT partition with protective MBR (0xEE) must NOT be detected as MBR extended"
+    );
 }
 
 #[test]
@@ -295,18 +314,29 @@ fn test_refuse_partition_active_md_lvm_holder_unmount_failure() {
     fs::write(holders_dir.join("dm-0"), "").unwrap();
 
     // In /proc/mounts, /dev/dm-0 is mounted
-    fs::write(proc_root.join("mounts"), "/dev/dm-0 /mnt/secret_vol ext4 rw,relatime 0 0\n").unwrap();
+    fs::write(
+        proc_root.join("mounts"),
+        "/dev/dm-0 /mnt/secret_vol ext4 rw,relatime 0 0\n",
+    )
+    .unwrap();
 
     // Create device nodes in dev_root
     fs::write(dev_root.join("sda1"), vec![0u8; 512]).unwrap();
     fs::write(dev_root.join("dm-0"), vec![0u8; 512]).unwrap();
 
-    let ctx = FsContext { sys_root, proc_root, dev_root };
+    let ctx = FsContext {
+        sys_root,
+        proc_root,
+        dev_root,
+    };
     let mut command_log = Vec::new();
 
     // Attempting unmount on active holder will fail because real 'umount' cannot unmount mock file
     let res = unmount_target_partition_and_holders("/dev/sda1", false, &mut command_log, &ctx);
-    assert!(res.is_err(), "Must refuse when active holder cannot be unmounted");
+    assert!(
+        res.is_err(),
+        "Must refuse when active holder cannot be unmounted"
+    );
     match res.unwrap_err() {
         ExecuteError::CommandFailed(msg) => {
             assert!(
@@ -389,7 +419,11 @@ async fn test_dry_run_partition_assert_zero_write_opens() {
     fs::write(proc_root.join("self/mountinfo"), mountinfo).unwrap();
 
     // Compute expected fingerprint
-    let ctx = FsContext { sys_root, proc_root, dev_root };
+    let ctx = FsContext {
+        sys_root,
+        proc_root,
+        dev_root,
+    };
     let fp = compute_partition_table_fingerprint("sda", &ctx).unwrap();
 
     let (tx, _rx) = mpsc::channel(16);
@@ -411,17 +445,25 @@ async fn test_dry_run_partition_assert_zero_write_opens() {
         true, // dry_run = true
         tx,
         &ctx,
-    ).await.expect("Dry run should succeed without opening device for writing");
+    )
+    .await
+    .expect("Dry run should succeed without opening device for writing");
 
     assert!(report.success);
     assert!(report.dry_run);
     assert_eq!(report.bytes_written, 0, "Dry run must write ZERO bytes");
     assert_eq!(report.io_mode, "dry_run");
-    assert!(report.command_log.iter().all(|line| line.starts_with("[DRY RUN]")));
+    assert!(report
+        .command_log
+        .iter()
+        .all(|line| line.starts_with("[DRY RUN]")));
 
     // Verify that the read-only file was never written to
     let current_data = fs::read(&dev_file_path).unwrap();
-    assert_eq!(current_data, initial_data, "Underlying file data must be completely unmodified");
+    assert_eq!(
+        current_data, initial_data,
+        "Underlying file data must be completely unmodified"
+    );
 }
 
 // =========================================================================
@@ -483,13 +525,17 @@ fn test_partition_range_writer_bounds_and_isolation() {
 
     // Bytes 0..16384 (MBR + gaps outside partition): strictly byte-identical (0xAA)
     assert!(
-        final_data[0..part_start as usize].iter().all(|&b| b == 0xAA),
+        final_data[0..part_start as usize]
+            .iter()
+            .all(|&b| b == 0xAA),
         "Sectors before partition (MBR/gaps) MUST remain completely unmodified"
     );
 
     // Bytes 16384..24576: overwritten with zeros
     assert!(
-        final_data[part_start as usize..(part_start + 8192) as usize].iter().all(|&b| b == 0x00),
+        final_data[part_start as usize..(part_start + 8192) as usize]
+            .iter()
+            .all(|&b| b == 0x00),
         "Target partition range was properly overwritten with zeros"
     );
 
@@ -520,7 +566,8 @@ fn test_scoped_verification_report_fields() {
         Some(10),
         true, // expect_zeros
         None,
-    ).expect("Scoped verification should succeed");
+    )
+    .expect("Scoped verification should succeed");
 
     assert!(report.pass);
     assert_eq!(report.bytes_overwritten, partition_size);
@@ -647,7 +694,11 @@ fn test_cli_refuse_partition_without_mode_partition() {
         .output()
         .expect("Failed to execute zt_engine CLI");
 
-    assert_eq!(output.status.code(), Some(1), "Target partition without --mode partition must exit with 1");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "Target partition without --mode partition must exit with 1"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("target '/dev/sdb1' appears to be a partition, but --mode partition was not specified (fail closed)"),
@@ -659,11 +710,23 @@ fn test_cli_refuse_partition_without_mode_partition() {
 fn test_cli_missing_expected_flags_in_partition_mode() {
     let binary = env!("CARGO_BIN_EXE_zt_engine");
     let output = Command::new(binary)
-        .args(["sanitize", "/dev/sdb1", "overwrite-zero", "TOKEN", "SERIAL", "--mode", "partition"])
+        .args([
+            "sanitize",
+            "/dev/sdb1",
+            "overwrite-zero",
+            "TOKEN",
+            "SERIAL",
+            "--mode",
+            "partition",
+        ])
         .output()
         .expect("Failed to execute zt_engine CLI");
 
-    assert_eq!(output.status.code(), Some(1), "Partition mode missing expected flags must exit with 1");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "Partition mode missing expected flags must exit with 1"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("Partition mode requires --expected-part-num, --expected-start-sector, --expected-size-sectors, and --expected-table-fingerprint"),
@@ -698,7 +761,11 @@ async fn test_partition_geometry_mismatch_refused() {
     fs::create_dir_all(proc_root.join("self")).unwrap();
     fs::write(proc_root.join("self/mountinfo"), mountinfo).unwrap();
 
-    let ctx = FsContext { sys_root, proc_root, dev_root };
+    let ctx = FsContext {
+        sys_root,
+        proc_root,
+        dev_root,
+    };
     let fp = compute_partition_table_fingerprint("sdb", &ctx).unwrap();
     let (tx, _rx) = mpsc::channel(16);
 
@@ -721,12 +788,19 @@ async fn test_partition_geometry_mismatch_refused() {
         true,
         tx,
         &ctx,
-    ).await;
+    )
+    .await;
 
     assert!(res.is_err(), "Must refuse on geometry mismatch");
     match res.unwrap_err() {
         ExecuteError::IdentityMismatch(msg) => {
-            assert!(msg.contains("Partition start sector mismatch: expected 99999, got sysfs start 2048"), "Got: {}", msg);
+            assert!(
+                msg.contains(
+                    "Partition start sector mismatch: expected 99999, got sysfs start 2048"
+                ),
+                "Got: {}",
+                msg
+            );
         }
         other => panic!("Expected IdentityMismatch, got {:?}", other),
     }
@@ -865,7 +939,11 @@ async fn test_partition_start_size_alignment_refusal() {
     fs::create_dir_all(proc_root.join("self")).unwrap();
     fs::write(proc_root.join("self/mountinfo"), mountinfo).unwrap();
 
-    let ctx = FsContext { sys_root, proc_root, dev_root };
+    let ctx = FsContext {
+        sys_root,
+        proc_root,
+        dev_root,
+    };
     let fp = compute_partition_table_fingerprint("sdb", &ctx).unwrap();
     let (tx, _rx) = mpsc::channel(16);
 
@@ -887,9 +965,13 @@ async fn test_partition_start_size_alignment_refusal() {
         true,
         tx,
         &ctx,
-    ).await;
+    )
+    .await;
 
-    assert!(res.is_err(), "Must refuse execution when partition start/size is not aligned to logical block size");
+    assert!(
+        res.is_err(),
+        "Must refuse execution when partition start/size is not aligned to logical block size"
+    );
     match res.unwrap_err() {
         ExecuteError::UnsupportedOperation(msg) => {
             assert!(
@@ -928,7 +1010,11 @@ fn test_unmount_touches_only_target_sibling_stays_mounted() {
 /dev/sdb2 /mnt/sibling_usb ext4 rw,relatime 0 0\n";
     fs::write(proc_root.join("mounts"), mounts_content).unwrap();
 
-    let ctx = FsContext { sys_root, proc_root, dev_root };
+    let ctx = FsContext {
+        sys_root,
+        proc_root,
+        dev_root,
+    };
     let mut command_log = Vec::new();
 
     // In dry-run mode, unmount_target_partition_and_holders logs what it would touch
@@ -1008,17 +1094,30 @@ fn test_verify_cli_whole_device_without_total_device_size_flag() {
         .output()
         .expect("Failed to execute zt_engine verify CLI");
 
-    assert_eq!(output.status.code(), Some(0), "Whole device verify CLI without --total-device-size must exit with 0");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Whole device verify CLI without --total-device-size must exit with 0"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("VERIFY_REPORT:"));
 
-    let json_line = stdout.lines().find(|l| l.starts_with("VERIFY_REPORT:")).unwrap();
+    let json_line = stdout
+        .lines()
+        .find(|l| l.starts_with("VERIFY_REPORT:"))
+        .unwrap();
     let json_str = &json_line["VERIFY_REPORT:".len()..];
     let report: VerificationReport = serde_json::from_str(json_str).unwrap();
 
     assert!(report.pass);
-    assert_eq!(report.bytes_overwritten, size, "Without flag, bytes_overwritten must equal device size");
-    assert_eq!(report.total_device_bytes, size, "Without flag, total_device_bytes must equal device size");
+    assert_eq!(
+        report.bytes_overwritten, size,
+        "Without flag, bytes_overwritten must equal device size"
+    );
+    assert_eq!(
+        report.total_device_bytes, size,
+        "Without flag, total_device_bytes must equal device size"
+    );
 }
 
 #[test]
@@ -1044,15 +1143,28 @@ fn test_verify_cli_scoped_with_total_device_size_flag() {
         .output()
         .expect("Failed to execute zt_engine verify CLI");
 
-    assert_eq!(output.status.code(), Some(0), "Scoped verify CLI with --total-device-size must exit with 0");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Scoped verify CLI with --total-device-size must exit with 0"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("VERIFY_REPORT:"));
 
-    let json_line = stdout.lines().find(|l| l.starts_with("VERIFY_REPORT:")).unwrap();
+    let json_line = stdout
+        .lines()
+        .find(|l| l.starts_with("VERIFY_REPORT:"))
+        .unwrap();
     let json_str = &json_line["VERIFY_REPORT:".len()..];
     let report: VerificationReport = serde_json::from_str(json_str).unwrap();
 
     assert!(report.pass);
-    assert_eq!(report.bytes_overwritten, part_size, "bytes_overwritten must equal partition size");
-    assert_eq!(report.total_device_bytes, total_size, "total_device_bytes must equal total device size");
+    assert_eq!(
+        report.bytes_overwritten, part_size,
+        "bytes_overwritten must equal partition size"
+    );
+    assert_eq!(
+        report.total_device_bytes, total_size,
+        "total_device_bytes must equal total device size"
+    );
 }

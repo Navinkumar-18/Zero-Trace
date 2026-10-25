@@ -10,7 +10,10 @@
 //! - Supports dry_run mode (logs commands without executing)
 //! - Streams ProgressEvents for real-time UI updates
 
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs;
 use std::io;
@@ -18,10 +21,7 @@ use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
-use rand::{RngCore, SeedableRng};
-use rand_chacha::ChaCha20Rng;
-use sha2::{Digest, Sha256};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 // Phase C: the guard chain now lives in `crate::guard` over `crate::backend`
@@ -32,9 +32,9 @@ use crate::backend::{BackendError, BlockBackend, ExclusiveHandle};
 use crate::guard::ValidatedTarget;
 pub use crate::types::{
     dev_major, dev_minor, is_mount_unmountable_allowlisted, parse_major_minor, BlockWriter,
-    BootEnvironment, ExecuteError, GuardIdentity, PartitionTargetParams, ValidatedPartitionTarget,
+    BootEnvironment, ExecuteError, FilesystemRecreationRecord, FilesystemType, GuardIdentity,
+    PartitionTableType, PartitionTargetParams, ValidatedPartitionTarget,
 };
-
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -125,7 +125,6 @@ pub struct ExecutionReport {
     pub io_mode: String,
 }
 
-
 // ---------------------------------------------------------------------------
 // Safety checks & Hardened Boot-Disk Protection
 // ---------------------------------------------------------------------------
@@ -148,8 +147,6 @@ impl Default for FsContext {
     }
 }
 
-
-
 /// Canonicalize target device path, resolving symlinks such as /dev/disk/by-id/*
 pub fn canonicalize_device_path(
     device: &str,
@@ -158,7 +155,9 @@ pub fn canonicalize_device_path(
 ) -> Result<String, ExecuteError> {
     let dev_str = device.trim();
     if dev_str.is_empty() {
-        return Err(ExecuteError::BootDiskProtection("Empty device path provided".to_string()));
+        return Err(ExecuteError::BootDiskProtection(
+            "Empty device path provided".to_string(),
+        ));
     }
 
     if ctx.dev_root == Path::new("/dev") {
@@ -170,14 +169,20 @@ pub fn canonicalize_device_path(
                     if dry_run {
                         Ok(dev_str.to_string())
                     } else {
-                        Err(ExecuteError::DeviceNotFound(format!("Device not found (cannot canonicalize {}): {}", dev_str, e)))
+                        Err(ExecuteError::DeviceNotFound(format!(
+                            "Device not found (cannot canonicalize {}): {}",
+                            dev_str, e
+                        )))
                     }
                 }
             }
         } else if dry_run {
             Ok(dev_str.to_string())
         } else {
-            Err(ExecuteError::DeviceNotFound(format!("Device does not exist: {}", dev_str)))
+            Err(ExecuteError::DeviceNotFound(format!(
+                "Device does not exist: {}",
+                dev_str
+            )))
         }
     } else {
         // Fixture context resolution
@@ -189,10 +194,18 @@ pub fn canonicalize_device_path(
         if fixture_target.exists() || fs::symlink_metadata(&fixture_target).is_ok() {
             let mut curr = fixture_target;
             let mut hops = 0;
-            while fs::symlink_metadata(&curr).map(|m| m.file_type().is_symlink()).unwrap_or(false) && hops < 20 {
+            while fs::symlink_metadata(&curr)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+                && hops < 20
+            {
                 hops += 1;
                 let target = fs::read_link(&curr).map_err(|e| {
-                    ExecuteError::BootDiskProtection(format!("Broken symlink {}: {}", curr.display(), e))
+                    ExecuteError::BootDiskProtection(format!(
+                        "Broken symlink {}: {}",
+                        curr.display(),
+                        e
+                    ))
                 })?;
                 curr = if target.is_absolute() {
                     let rel = target.strip_prefix("/dev/").unwrap_or(&target);
@@ -202,20 +215,31 @@ pub fn canonicalize_device_path(
                     parent.join(target)
                 };
             }
-            let dev_name = curr.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let dev_name = curr
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             Ok(format!("/dev/{}", dev_name))
         } else if dry_run {
             Ok(dev_str.to_string())
         } else {
-            Err(ExecuteError::DeviceNotFound(format!("Device does not exist in fixture: {}", dev_str)))
+            Err(ExecuteError::DeviceNotFound(format!(
+                "Device does not exist in fixture: {}",
+                dev_str
+            )))
         }
     }
 }
 
-
 /// Kernel cmdline markers that identify a live boot.
 const LIVE_CMDLINE_MARKERS: &[&str] = &[
-    "boot=live", "casper", "archiso", "livecd", "boot=archiso", "livemedia",
+    "boot=live",
+    "casper",
+    "archiso",
+    "livecd",
+    "boot=archiso",
+    "livemedia",
 ];
 
 /// Detect the boot environment from mountinfo (root fs type) and
@@ -294,7 +318,11 @@ pub fn verify_exclusive_access_and_recheck(
     dry_run: bool,
     ctx: &FsContext,
 ) -> Result<(), ExecuteError> {
-    crate::guard::verify_exclusive_access_and_recheck(&LinuxBackend::new(ctx.clone()), device, dry_run)
+    crate::guard::verify_exclusive_access_and_recheck(
+        &LinuxBackend::new(ctx.clone()),
+        device,
+        dry_run,
+    )
 }
 
 /// Inspects device and captures guard identity (canonical path, st_rdev, major, minor, is_block, serial).
@@ -304,14 +332,16 @@ pub fn get_guard_identity(
     device_serial: &str,
     ctx: &FsContext,
 ) -> Result<GuardIdentity, ExecuteError> {
-    crate::guard::get_guard_identity(&LinuxBackend::new(ctx.clone()), device, dry_run, device_serial)
+    crate::guard::get_guard_identity(
+        &LinuxBackend::new(ctx.clone()),
+        device,
+        dry_run,
+        device_serial,
+    )
 }
 
 /// Re-checks boot disk protection against system mountinfo using an opened device's major:minor dev_t.
-pub fn recheck_protection_by_dev_t(
-    dev: libc::dev_t,
-    ctx: &FsContext,
-) -> Result<(), ExecuteError> {
+pub fn recheck_protection_by_dev_t(dev: libc::dev_t, ctx: &FsContext) -> Result<(), ExecuteError> {
     crate::guard::recheck_protection_by_dev_t(&LinuxBackend::new(ctx.clone()), dev)
 }
 
@@ -327,17 +357,19 @@ async fn send_progress(
     message: &str,
     eta_seconds: Option<u32>,
 ) {
-    let _ = tx.send(ProgressEvent {
-        schema_version: 2,
-        phase,
-        bytes_done: 0,
-        bytes_total: 0,
-        percent: None,
-        speed_bytes_per_sec: 0.0,
-        eta_seconds,
-        message: message.to_string(),
-        is_heartbeat: false,
-    }).await;
+    let _ = tx
+        .send(ProgressEvent {
+            schema_version: 2,
+            phase,
+            bytes_done: 0,
+            bytes_total: 0,
+            percent: None,
+            speed_bytes_per_sec: 0.0,
+            eta_seconds,
+            message: message.to_string(),
+            is_heartbeat: false,
+        })
+        .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -352,17 +384,19 @@ async fn send_detailed_progress(
     message: &str,
     is_heartbeat: bool,
 ) {
-    let _ = tx.send(ProgressEvent {
-        schema_version: 2,
-        phase,
-        bytes_done,
-        bytes_total,
-        percent,
-        speed_bytes_per_sec,
-        eta_seconds,
-        message: message.to_string(),
-        is_heartbeat,
-    }).await;
+    let _ = tx
+        .send(ProgressEvent {
+            schema_version: 2,
+            phase,
+            bytes_done,
+            bytes_total,
+            percent,
+            speed_bytes_per_sec,
+            eta_seconds,
+            message: message.to_string(),
+            is_heartbeat,
+        })
+        .await;
 }
 
 /// P2: run one external tool step for an execution flow.
@@ -405,9 +439,874 @@ pub fn run_firmware_cmd(
         ));
     }
 
-    backend.exec(program, args).map_err(|e| {
-        ExecuteError::CommandFailed(format!("Failed to run {}: {}", program, e))
+    backend
+        .exec(program, args)
+        .map_err(|e| ExecuteError::CommandFailed(format!("Failed to run {}: {}", program, e)))
+}
+
+// ---------------------------------------------------------------------------
+// Phase F: optional filesystem recreation after a verified wipe
+// ---------------------------------------------------------------------------
+
+/// A verification stamp minted by the wipe+verify flow. Only a target with a
+/// live stamp in this process (or a receipt written by the verify process) is
+/// eligible for filesystem recreation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedWipeStamp {
+    pub canonical_path: String,
+    pub device_serial: String,
+    pub rdev: u64,
+    pub ino: u64,
+    pub scope: String,
+    pub parent_name: Option<String>,
+    pub partition_number: Option<u32>,
+    pub partition_table_fingerprint: Option<String>,
+    pub verified_at_epoch_secs: u64,
+}
+
+/// Report for the optional post-wipe format step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilesystemRecreationReport {
+    pub success: bool,
+    pub tool: String,
+    pub fs_type: String,
+    pub label: String,
+    pub time: String,
+    pub sanitization_verified_before_format: bool,
+    pub scope: String,
+    #[serde(default)]
+    pub partition_table_created: bool,
+    #[serde(default)]
+    pub partition_table_type: Option<String>,
+    pub command_log: Vec<String>,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub duration_ms: u64,
+    pub dry_run: bool,
+}
+
+impl FilesystemRecreationReport {
+    pub fn record(&self) -> FilesystemRecreationRecord {
+        FilesystemRecreationRecord {
+            tool: self.tool.clone(),
+            fs_type: self.fs_type.clone(),
+            label: self.label.clone(),
+            time: self.time.clone(),
+            sanitization_verified_before_format: self.sanitization_verified_before_format,
+            scope: self.scope.clone(),
+            partition_table_created: self.partition_table_created,
+            partition_table_type: self.partition_table_type.clone(),
+        }
+    }
+}
+
+struct RegistryEntry {
+    stamp: VerifiedWipeStamp,
+    recorded_at: Instant,
+}
+
+thread_local! {
+    /// Per-process/thread verification registry. The UI/CLI invokes mark and
+    /// format from the same execution context; isolating it per thread also
+    /// keeps parallel test jobs from seeing each other's targets.
+    static VERIFIED_WIPES: std::cell::RefCell<Vec<RegistryEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_verified_wipes<R>(f: impl FnOnce(&mut Vec<RegistryEntry>) -> R) -> R {
+    VERIFIED_WIPES.with(|cell| f(&mut cell.borrow_mut()))
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+}
+
+fn iso8601_now() -> String {
+    // Keep the engine dependency-light: RFC3339 UTC from epoch seconds.
+    let secs = now_epoch_secs();
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (year, month, day) = civil_from_days(days as i64);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year,
+        month,
+        day,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Howard Hinnant's days-from-civil inverse (no external chrono dependency).
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
+fn target_scope_token(target: &ValidatedTarget) -> &'static str {
+    match target.scope() {
+        crate::guard::TargetScope::WholeDisk => "full",
+        crate::guard::TargetScope::Partition { .. } => "partial",
+    }
+}
+
+fn target_stamp(backend: &dyn BlockBackend, target: &ValidatedTarget) -> VerifiedWipeStamp {
+    let id = target.guard_identity();
+    #[allow(clippy::useless_conversion)]
+    let rdev = u64::from(id.st_rdev);
+    let (parent_name, partition_number, fingerprint) = match target.scope() {
+        crate::guard::TargetScope::Partition {
+            parent_name,
+            partition_number,
+            ..
+        } => (
+            Some(parent_name.clone()),
+            Some(*partition_number),
+            crate::guard::compute_partition_table_fingerprint(backend, parent_name).ok(),
+        ),
+        crate::guard::TargetScope::WholeDisk => (None, None, None),
+    };
+    VerifiedWipeStamp {
+        canonical_path: target.canonical_path().to_string(),
+        device_serial: target.device_serial().to_string(),
+        rdev,
+        ino: id.st_ino,
+        scope: target_scope_token(target).to_string(),
+        parent_name,
+        partition_number,
+        partition_table_fingerprint: fingerprint,
+        verified_at_epoch_secs: now_epoch_secs(),
+    }
+}
+
+fn stamp_matches_target(stamp: &VerifiedWipeStamp, target: &ValidatedTarget) -> bool {
+    let id = target.guard_identity();
+    #[allow(clippy::useless_conversion)]
+    let rdev = u64::from(id.st_rdev);
+    stamp.canonical_path == target.canonical_path()
+        && stamp.device_serial == target.device_serial()
+        && stamp.rdev == rdev
+        && (stamp.ino == 0 || stamp.ino == id.st_ino)
+        && stamp.scope == target_scope_token(target)
+}
+
+/// Mark a guard-minted target as **wiped and verified in this job**. This is
+/// the only way to make [`recreate_filesystem`] eligible. Call it from the
+/// pipeline only after post-wipe verification passed.
+pub fn mark_wiped_and_verified(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+) -> Result<VerifiedWipeStamp, ExecuteError> {
+    let stamp = target_stamp(backend, target);
+    with_verified_wipes(|registry| {
+        registry.retain(|entry| {
+            entry.recorded_at.elapsed() < Duration::from_secs(60 * 60)
+                && entry.stamp.canonical_path != stamp.canonical_path
+        });
+        registry.push(RegistryEntry {
+            stamp: stamp.clone(),
+            recorded_at: Instant::now(),
+        });
+    });
+    Ok(stamp)
+}
+
+/// Alias kept for callers that name the action rather than the state.
+pub fn record_verified_wipe(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+) -> Result<VerifiedWipeStamp, ExecuteError> {
+    mark_wiped_and_verified(backend, target)
+}
+
+/// Build a receipt stamp for a verified path. Used by the `verify` CLI after
+/// verification passed, so the separate `format` process can prove it is
+/// formatting the same just-verified target.
+pub fn verified_wipe_stamp_for_path(
+    backend: &dyn BlockBackend,
+    device_path: &str,
+    device_serial: &str,
+) -> Result<VerifiedWipeStamp, ExecuteError> {
+    let stat = backend.stat_path(device_path).map_err(|e| {
+        ExecuteError::IdentityMismatch(format!(
+            "cannot stat verified target {}: {}",
+            device_path, e
+        ))
+    })?;
+    let name = device_path.strip_prefix("/dev/").unwrap_or(device_path);
+    let part_attr = backend
+        .sysfs_class_attr(name, "partition")
+        .unwrap_or_default();
+    let (scope, parent_name, partition_number, fingerprint) = match part_attr {
+        Some(raw) => {
+            let num = raw.trim().parse::<u32>().unwrap_or(0);
+            let parent = crate::guard::resolve_parent_disk(backend, device_path)?;
+            (
+                "partial".to_string(),
+                Some(parent.clone()),
+                Some(num),
+                Some(crate::guard::compute_partition_table_fingerprint(
+                    backend, &parent,
+                )?),
+            )
+        }
+        None => ("full".to_string(), None, None, None),
+    };
+    Ok(VerifiedWipeStamp {
+        canonical_path: device_path.to_string(),
+        device_serial: device_serial.to_string(),
+        rdev: stat.rdev,
+        ino: stat.ino,
+        scope,
+        parent_name,
+        partition_number,
+        partition_table_fingerprint: fingerprint,
+        verified_at_epoch_secs: now_epoch_secs(),
     })
+}
+
+/// Persist a verification receipt (0600) for the separate format process.
+pub fn write_verified_wipe_receipt(
+    path: &Path,
+    stamp: &VerifiedWipeStamp,
+) -> Result<(), ExecuteError> {
+    let data = serde_json::to_vec_pretty(stamp).map_err(|e| {
+        ExecuteError::FilesystemRecreationFailed(format!("cannot serialize receipt: {}", e))
+    })?;
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(path, data).map_err(|e| {
+        ExecuteError::FilesystemRecreationFailed(format!(
+            "cannot write verification receipt {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+pub fn read_verified_wipe_receipt(path: &Path) -> Result<VerifiedWipeStamp, ExecuteError> {
+    let data = fs::read(path).map_err(|_| ExecuteError::NotWipedAndVerified)?;
+    let stamp: VerifiedWipeStamp =
+        serde_json::from_slice(&data).map_err(|_| ExecuteError::NotWipedAndVerified)?;
+    let age = now_epoch_secs().saturating_sub(stamp.verified_at_epoch_secs);
+    if age > 60 * 60 {
+        return Err(ExecuteError::NotWipedAndVerified);
+    }
+    Ok(stamp)
+}
+
+/// Adopt a receipt written by the verify process only when it describes the
+/// exact target handed to the formatter. Table fingerprint is re-checked too.
+pub fn adopt_verified_wipe_receipt(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+    receipt: &VerifiedWipeStamp,
+) -> Result<(), ExecuteError> {
+    if !stamp_matches_target(receipt, target) {
+        return Err(ExecuteError::NotWipedAndVerified);
+    }
+    if let (Some(parent), Some(expected)) = (
+        receipt.parent_name.clone(),
+        receipt.partition_table_fingerprint.clone(),
+    ) {
+        let current = crate::guard::compute_partition_table_fingerprint(backend, &parent)?;
+        if current != expected {
+            return Err(ExecuteError::IdentityMismatch(format!(
+                "Partition table changed after verification (expected {}, got {})",
+                expected, current
+            )));
+        }
+    }
+    with_verified_wipes(|registry| {
+        registry.push(RegistryEntry {
+            stamp: receipt.clone(),
+            recorded_at: Instant::now(),
+        });
+    });
+    Ok(())
+}
+
+fn consume_verified_stamp(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+) -> Result<VerifiedWipeStamp, ExecuteError> {
+    let entry = with_verified_wipes(|registry| {
+        let idx = registry.iter().position(|entry| {
+            entry.recorded_at.elapsed() < Duration::from_secs(60 * 60)
+                && stamp_matches_target(&entry.stamp, target)
+        });
+        idx.map(|idx| registry.remove(idx))
+    });
+    let Some(entry) = entry else {
+        return Err(ExecuteError::NotWipedAndVerified);
+    };
+    let mut stamp = entry.stamp;
+    // The table fingerprint must still match the one captured at verification
+    // time (partition scope only).
+    if let (Some(parent), Some(expected)) = (
+        stamp.parent_name.clone(),
+        stamp.partition_table_fingerprint.clone(),
+    ) {
+        let current = crate::guard::compute_partition_table_fingerprint(backend, &parent)?;
+        if current != expected {
+            return Err(ExecuteError::IdentityMismatch(format!(
+                "Partition table changed after verification (expected {}, got {})",
+                expected, current
+            )));
+        }
+    }
+    stamp.verified_at_epoch_secs = now_epoch_secs();
+    Ok(stamp)
+}
+
+/// F1: refuse unless the target node really belongs to the validated scope.
+/// A partition-scoped target must point at that partition node (never at the
+/// parent/whole-disk node); a whole-disk target must not point at a partition.
+fn assert_format_scope(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+) -> Result<(), ExecuteError> {
+    let canonical = target.canonical_path();
+    let name = canonical.strip_prefix("/dev/").unwrap_or(canonical);
+    match target.scope() {
+        crate::guard::TargetScope::Partition {
+            parent_name,
+            partition_number,
+            ..
+        } => {
+            if name == parent_name {
+                return Err(ExecuteError::FilesystemScopeMismatch(format!(
+                    "partition scope #{} was handed the whole-disk node {}",
+                    partition_number, canonical
+                )));
+            }
+            let actual = backend
+                .sysfs_class_attr(name, "partition")
+                .unwrap_or_default()
+                .unwrap_or_default();
+            if actual.trim().parse::<u32>().ok() != Some(*partition_number) {
+                return Err(ExecuteError::FilesystemScopeMismatch(format!(
+                    "{} is not partition #{} of {}",
+                    canonical, partition_number, parent_name
+                )));
+            }
+        }
+        crate::guard::TargetScope::WholeDisk => {
+            if matches!(backend.sysfs_class_attr(name, "partition"), Ok(Some(_))) {
+                return Err(ExecuteError::FilesystemScopeMismatch(format!(
+                    "whole-disk scope was handed the partition node {}",
+                    canonical
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn format_tool_argv(
+    _target: &ValidatedTarget,
+    fs: FilesystemType,
+    label: &str,
+    node: &str,
+) -> Vec<String> {
+    match fs {
+        FilesystemType::Vfat32 => vec![
+            "mkfs.vfat".to_string(),
+            "-F".to_string(),
+            "32".to_string(),
+            "-n".to_string(),
+            label.to_string(),
+            node.to_string(),
+        ],
+        FilesystemType::Exfat => vec![
+            "mkfs.exfat".to_string(),
+            "-n".to_string(),
+            label.to_string(),
+            node.to_string(),
+        ],
+        FilesystemType::Ntfs => vec![
+            "mkfs.ntfs".to_string(),
+            "-Q".to_string(),
+            "-L".to_string(),
+            label.to_string(),
+            node.to_string(),
+        ],
+        FilesystemType::Ext4 => vec![
+            "mkfs.ext4".to_string(),
+            "-F".to_string(),
+            "-L".to_string(),
+            label.to_string(),
+            node.to_string(),
+        ],
+    }
+}
+
+/// The only function that may name/spawn an `mkfs.*` tool. It takes the
+/// guard-minted target and re-validates identity immediately before exec.
+#[allow(clippy::too_many_arguments)]
+fn run_format_tool(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+    node: &str,
+    fs: FilesystemType,
+    label: &str,
+    dry_run: bool,
+    command_log: &mut Vec<String>,
+) -> Result<(String, String, i32, String), ExecuteError> {
+    // Hard gate: only a just-wiped, verified target is eligible.
+    consume_verified_stamp(backend, target)?;
+    assert_format_scope(backend, target)?;
+    crate::guard::revalidate_target_identity(backend, target, dry_run)?;
+    crate::guard::assert_target_not_mounted(backend, target)?;
+    crate::guard::assert_target_not_system_partition(backend, target)?;
+
+    let argv = format_tool_argv(target, fs, label, node);
+    let program = argv.first().cloned().unwrap_or_default();
+    let args: Vec<&str> = argv.iter().skip(1).map(String::as_str).collect();
+    let cmdline = format!("{} {}", program, args.join(" "));
+    command_log.push(format!("[format] {}", cmdline));
+    if dry_run {
+        return Ok((
+            format!("[DRY RUN] Would execute: {}", cmdline),
+            String::new(),
+            0,
+            program,
+        ));
+    }
+    let (out, err, code) = backend
+        .exec(&program, &args)
+        .map_err(|e| ExecuteError::CommandFailed(format!("Failed to run {}: {}", program, e)))?;
+    if code != 0 {
+        let detail = if err.trim().is_empty() {
+            format!("exit code {}", code)
+        } else {
+            err.trim().to_string()
+        };
+        return Err(ExecuteError::FilesystemRecreationFailed(format!(
+            "{} failed: {}",
+            program, detail
+        )));
+    }
+    Ok((out, err, code, program))
+}
+
+/// F1: recreate a filesystem on an already wiped+verified target.
+///
+/// The target is re-validated immediately before the tool runs; partition
+/// scope always formats the partition node, never the parent disk.
+pub fn recreate_filesystem(
+    target: &ValidatedTarget,
+    fs_type: &str,
+    label: &str,
+) -> Result<FilesystemRecreationReport, ExecuteError> {
+    recreate_filesystem_with(
+        &LinuxBackend::new(FsContext::default()),
+        target,
+        fs_type,
+        label,
+        false,
+    )
+}
+
+/// Backend-injectable form used by tests and the CLI.
+pub fn recreate_filesystem_with(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+    fs_type: &str,
+    label: &str,
+    dry_run: bool,
+) -> Result<FilesystemRecreationReport, ExecuteError> {
+    let fs = FilesystemType::parse(fs_type)?;
+    let start = Instant::now();
+    let mut command_log = Vec::new();
+    let node = target.canonical_path().to_string();
+
+    let (stdout, stderr, code, tool) =
+        run_format_tool(backend, target, &node, fs, label, dry_run, &mut command_log)?;
+
+    if !dry_run {
+        // F2: request a table re-read so the partition node exists again. The
+        // filesystem already exists at this point, so a re-read failure is a
+        // warning (the table itself is untouched), never a format failure.
+        match backend.reread_partition_table(target) {
+            Ok(()) => {
+                command_log.push("[format] kernel partition-table re-read complete".to_string())
+            }
+            Err(e) => command_log.push(format!(
+                "[format] warning: kernel partition-table re-read failed (table unchanged): {}",
+                e
+            )),
+        }
+    }
+
+    Ok(FilesystemRecreationReport {
+        success: true,
+        tool,
+        fs_type: fs.as_str().to_string(),
+        label: label.to_string(),
+        time: iso8601_now(),
+        sanitization_verified_before_format: true,
+        scope: target_scope_token(target).to_string(),
+        partition_table_created: false,
+        partition_table_type: None,
+        command_log,
+        stdout,
+        stderr,
+        exit_code: code,
+        duration_ms: start.elapsed().as_millis() as u64,
+        dry_run,
+    })
+}
+
+// -- Whole-device recreation (new GPT/MBR + one partition + filesystem) -----
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+fn put_u16(buf: &mut [u8], off: usize, value: u16) {
+    buf[off..off + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u32(buf: &mut [u8], off: usize, value: u32) {
+    buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(buf: &mut [u8], off: usize, value: u64) {
+    buf[off..off + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn deterministic_guid(seed: &[u8]) -> [u8; 16] {
+    let hash = Sha256::digest(seed);
+    let mut guid = [0u8; 16];
+    guid.copy_from_slice(&hash[..16]);
+    // RFC 4122 version/variant bits (pure cosmetics; deterministic per device).
+    guid[6] = (guid[6] & 0x0f) | 0x40;
+    guid[8] = (guid[8] & 0x3f) | 0x80;
+    guid
+}
+
+/// Build a one-partition GPT image: protective MBR (LBA0), primary header
+/// (LBA1), 128 entries (LBA2..33), backup entries and backup header at the
+/// end. The single partition starts at LBA 2048 and spans the remaining disk.
+fn build_gpt_one_partition(
+    total_sectors: u64,
+    seed: &[u8],
+) -> Result<Vec<(u64, Vec<u8>)>, ExecuteError> {
+    if total_sectors < 4096 {
+        return Err(ExecuteError::FilesystemRecreationFailed(
+            "device is too small for a GPT (needs at least 2 MiB)".to_string(),
+        ));
+    }
+    let first_usable = 2048u64;
+    let last_usable = total_sectors - 34;
+    if last_usable <= first_usable {
+        return Err(ExecuteError::FilesystemRecreationFailed(
+            "device has no room for a partition".to_string(),
+        ));
+    }
+    let disk_guid = deterministic_guid(seed);
+    let part_guid = deterministic_guid(&[seed, b"partition-1"].concat());
+
+    let mut writes = Vec::new();
+    // Protective MBR.
+    let mut mbr = vec![0u8; 512];
+    mbr[446 + 4] = 0xee;
+    put_u32(&mut mbr, 446 + 8, 1);
+    put_u32(
+        &mut mbr,
+        446 + 12,
+        total_sectors.saturating_sub(1).min(u32::MAX as u64) as u32,
+    );
+    mbr[510] = 0x55;
+    mbr[511] = 0xaa;
+    writes.push((0u64, mbr));
+
+    // GPT partition entry array (128 * 128 bytes = 32 sectors).
+    let mut entries = vec![0u8; 128 * 128];
+    // Linux filesystem data GUID 0FC63DAF-8483-4772-8E79-3D69D8477DE4
+    entries[0..16].copy_from_slice(&[
+        0xaf, 0x3d, 0xc6, 0x0f, 0x83, 0x84, 0x72, 0x47, 0x8e, 0x79, 0x3d, 0x69, 0xd8, 0x47, 0x7d,
+        0xe4,
+    ]);
+    entries[16..32].copy_from_slice(&part_guid);
+    put_u64(&mut entries, 32, first_usable);
+    put_u64(&mut entries, 40, last_usable);
+    put_u16(&mut entries, 56, b'Z' as u16); // UTF-16LE first char, harmless fallback name
+
+    let entries_crc = crc32(&entries);
+
+    let make_header = |current: u64, backup: u64, entries_lba: u64| {
+        let mut h = vec![0u8; 512];
+        h[0..8].copy_from_slice(b"EFI PART");
+        put_u32(&mut h, 8, 0x0001_0000);
+        put_u32(&mut h, 12, 92);
+        put_u64(&mut h, 24, current);
+        put_u64(&mut h, 32, backup);
+        put_u64(&mut h, 40, first_usable);
+        put_u64(&mut h, 48, last_usable);
+        h[56..72].copy_from_slice(&disk_guid);
+        put_u64(&mut h, 72, entries_lba);
+        put_u32(&mut h, 80, 128);
+        put_u32(&mut h, 84, 128);
+        put_u32(&mut h, 88, entries_crc);
+        let crc = crc32(&h[..92]);
+        put_u32(&mut h, 16, crc);
+        h
+    };
+
+    writes.push((512, make_header(1, total_sectors - 1, 2)));
+    writes.push((1024, entries.clone()));
+    let backup_entries_lba = total_sectors - 33;
+    let backup_header_lba = total_sectors - 1;
+    writes.push((backup_entries_lba * 512, entries));
+    writes.push((
+        backup_header_lba * 512,
+        make_header(backup_header_lba, 1, backup_entries_lba),
+    ));
+    Ok(writes)
+}
+
+fn build_mbr_one_partition(
+    total_sectors: u64,
+    seed: &[u8],
+) -> Result<Vec<(u64, Vec<u8>)>, ExecuteError> {
+    if total_sectors < 4096 {
+        return Err(ExecuteError::FilesystemRecreationFailed(
+            "device is too small for an MBR partition (needs at least 2 MiB)".to_string(),
+        ));
+    }
+    let start = 2048u64;
+    let count = (total_sectors - start).min(u32::MAX as u64);
+    if count == 0 {
+        return Err(ExecuteError::FilesystemRecreationFailed(
+            "device has no room for a partition".to_string(),
+        ));
+    }
+    let mut mbr = vec![0u8; 512];
+    let e = 446;
+    mbr[e] = 0x00; // not bootable
+    mbr[e + 1] = 0xfe;
+    mbr[e + 2] = 0xff;
+    mbr[e + 3] = 0xff;
+    mbr[e + 4] = 0x83; // Linux filesystem
+    mbr[e + 5] = 0xfe;
+    mbr[e + 6] = 0xff;
+    mbr[e + 7] = 0xff;
+    put_u32(&mut mbr, e + 8, start as u32);
+    put_u32(&mut mbr, e + 12, count as u32);
+    mbr[510] = 0x55;
+    mbr[511] = 0xaa;
+    let _ = seed;
+    Ok(vec![(0u64, mbr)])
+}
+
+fn child_partition_node(parent: &str) -> String {
+    let name = parent.strip_prefix("/dev/").unwrap_or(parent);
+    let digit_ending = name.chars().last().is_some_and(|c| c.is_ascii_digit());
+    if digit_ending {
+        format!("{}p1", parent)
+    } else {
+        format!("{}1", parent)
+    }
+}
+
+/// F3: after a whole-device wipe, optionally create a new GPT/MBR with one
+/// partition spanning the device and put a filesystem on it. This is a
+/// separate operation with its own typed confirmation token.
+pub fn recreate_whole_device(
+    target: &ValidatedTarget,
+    table_type: &str,
+    fs_type: &str,
+    label: &str,
+    confirmation_token: &str,
+    dry_run: bool,
+) -> Result<FilesystemRecreationReport, ExecuteError> {
+    recreate_whole_device_with(
+        &LinuxBackend::new(FsContext::default()),
+        target,
+        table_type,
+        fs_type,
+        label,
+        confirmation_token,
+        dry_run,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn recreate_whole_device_with(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+    table_type: &str,
+    fs_type: &str,
+    label: &str,
+    confirmation_token: &str,
+    dry_run: bool,
+) -> Result<FilesystemRecreationReport, ExecuteError> {
+    if !matches!(target.scope(), crate::guard::TargetScope::WholeDisk) {
+        return Err(ExecuteError::FilesystemScopeMismatch(
+            "whole-device recreation requires whole-disk scope".to_string(),
+        ));
+    }
+    // Own typed token: the confirmation flow must re-enter the device serial.
+    crate::guard::verify_confirmation(confirmation_token, target.device_serial())?;
+    consume_verified_stamp(backend, target)?;
+    crate::guard::revalidate_target_identity(backend, target, dry_run)?;
+    crate::guard::assert_target_not_mounted(backend, target)?;
+    crate::guard::assert_target_not_system_partition(backend, target)?;
+
+    let table = PartitionTableType::parse(table_type)?;
+    let fs = FilesystemType::parse(fs_type)?;
+    let start = Instant::now();
+    let mut command_log = Vec::new();
+
+    if dry_run {
+        command_log.push(format!(
+            "[DRY RUN] Would create {} with one partition on {} and format {} ({})",
+            table.as_str(),
+            target.canonical_path(),
+            fs.as_str(),
+            label
+        ));
+        return Ok(FilesystemRecreationReport {
+            success: true,
+            tool: format!("recreate-{}", table.as_str()),
+            fs_type: fs.as_str().to_string(),
+            label: label.to_string(),
+            time: iso8601_now(),
+            sanitization_verified_before_format: true,
+            scope: "full".to_string(),
+            partition_table_created: true,
+            partition_table_type: Some(table.as_str().to_string()),
+            command_log,
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: 0,
+            duration_ms: start.elapsed().as_millis() as u64,
+            dry_run: true,
+        });
+    }
+
+    let mut handle = open_validated_writer(backend, target)?;
+    let total_bytes = handle.total_size().map_err(ExecuteError::IoError)?;
+    let total_sectors = total_bytes / 512;
+    let seed = format!("{}:{}", target.device_serial(), target.canonical_path());
+    let writes = match table {
+        PartitionTableType::Gpt => build_gpt_one_partition(total_sectors, seed.as_bytes())?,
+        PartitionTableType::Mbr => build_mbr_one_partition(total_sectors, seed.as_bytes())?,
+    };
+    for (offset, bytes) in &writes {
+        handle.write_at(*offset, bytes).map_err(|e| {
+            ExecuteError::FilesystemRecreationFailed(format!(
+                "writing {} partition table at {} failed: {}",
+                table.as_str(),
+                offset,
+                e
+            ))
+        })?;
+    }
+    handle.flush().map_err(ExecuteError::IoError)?;
+    command_log.push(format!(
+        "[table] wrote new {} with one partition spanning {}",
+        table.as_str(),
+        target.canonical_path()
+    ));
+    backend.reread_partition_table(target).map_err(|e| {
+        ExecuteError::FilesystemRecreationFailed(format!(
+            "partition-table re-read failed after table creation: {}",
+            e
+        ))
+    })?;
+    command_log.push("[table] kernel partition-table re-read complete".to_string());
+
+    // Format the new first partition. The node is derived from the validated
+    // parent path (never supplied by a caller); identity is re-checked again
+    // by run_format_tool against the same physical target.
+    let node = child_partition_node(target.canonical_path());
+    let stamp = target_stamp(backend, target);
+    with_verified_wipes(|registry| {
+        registry.push(RegistryEntry {
+            stamp,
+            recorded_at: Instant::now(),
+        });
+    });
+    let (stdout, stderr, code, tool) =
+        run_format_tool(backend, target, &node, fs, label, false, &mut command_log)?;
+
+    Ok(FilesystemRecreationReport {
+        success: true,
+        tool,
+        fs_type: fs.as_str().to_string(),
+        label: label.to_string(),
+        time: iso8601_now(),
+        sanitization_verified_before_format: true,
+        scope: "full".to_string(),
+        partition_table_created: true,
+        partition_table_type: Some(table.as_str().to_string()),
+        command_log,
+        stdout,
+        stderr,
+        exit_code: code,
+        duration_ms: start.elapsed().as_millis() as u64,
+        dry_run: false,
+    })
+}
+
+/// F2: after a partition wipe, assert the fingerprint is unchanged and ask
+/// the kernel to re-read the table so the partition appears again.
+fn finish_partition_wipe(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+    params: &PartitionTargetParams,
+    report: &mut ExecutionReport,
+) -> Result<(), ExecuteError> {
+    let unchanged = crate::guard::assert_partition_table_unchanged(
+        backend,
+        target.scope(),
+        &params.expected_table_fingerprint,
+    )?;
+    report.command_log.push(format!(
+        "[guard] partition table fingerprint unchanged after wipe: {}",
+        unchanged
+    ));
+    backend.reread_partition_table(target).map_err(|e| {
+        ExecuteError::FilesystemRecreationFailed(format!(
+            "partition table re-read failed after wipe: {}",
+            e
+        ))
+    })?;
+    report
+        .command_log
+        .push("[guard] kernel partition-table re-read complete".to_string());
+    Ok(())
 }
 
 /// P2: unmount every mounted partition backing the validated target.
@@ -543,12 +1442,22 @@ pub async fn nvme_sanitize_with(
     let method_name = format!("NVMe Sanitize ({})", action_arg);
 
     // Phase 1: Security Unlock
-    send_progress(&tx, ExecutionPhase::SecurityUnlock,
-        "Checking NVMe controller security state...", Some(5)).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::SecurityUnlock,
+        "Checking NVMe controller security state...",
+        Some(5),
+    )
+    .await;
 
     // Phase 2: Issue sanitize command
-    send_progress(&tx, ExecutionPhase::FirmwareCommand,
-        &format!("Issuing nvme sanitize -a {} on {}", action_arg, device), None).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::FirmwareCommand,
+        &format!("Issuing nvme sanitize -a {} on {}", action_arg, device),
+        None,
+    )
+    .await;
 
     let (stdout, stderr, code) = run_firmware_cmd(
         backend,
@@ -573,14 +1482,23 @@ pub async fn nvme_sanitize_with(
             duration_ms: start.elapsed().as_millis() as u64,
             dry_run,
             bytes_written: 0,
-            io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
+            io_mode: if dry_run {
+                "dry_run".to_string()
+            } else {
+                "firmware".to_string()
+            },
         });
     }
 
     // Phase 2 continued: Poll sanitize-log for completion
     if dry_run {
-        send_progress(&tx, ExecutionPhase::FirmwareCommand,
-            "[DRY RUN] Firmware sanitize command sent to controller", None).await;
+        send_progress(
+            &tx,
+            ExecutionPhase::FirmwareCommand,
+            "[DRY RUN] Firmware sanitize command sent to controller",
+            None,
+        )
+        .await;
         let (s, e, _) = run_firmware_cmd(
             backend,
             target,
@@ -595,16 +1513,31 @@ pub async fn nvme_sanitize_with(
     }
 
     // Phase 3: Key Destruction
-    send_progress(&tx, ExecutionPhase::KeyDestruction,
-        "NVMe controller internal key zeroization complete.", Some(2)).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::KeyDestruction,
+        "NVMe controller internal key zeroization complete.",
+        Some(2),
+    )
+    .await;
 
     // Phase 4: Cache Flush
-    send_progress(&tx, ExecutionPhase::CacheFlush,
-        "Flushing volatile caches and translation tables...", Some(1)).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::CacheFlush,
+        "Flushing volatile caches and translation tables...",
+        Some(1),
+    )
+    .await;
 
     // Phase 5: Ready for verification
-    send_progress(&tx, ExecutionPhase::Verification,
-        "Sanitize command completed. Ready for post-verification.", Some(1)).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::Verification,
+        "Sanitize command completed. Ready for post-verification.",
+        Some(1),
+    )
+    .await;
 
     Ok(ExecutionReport {
         success: true,
@@ -616,7 +1549,11 @@ pub async fn nvme_sanitize_with(
         duration_ms: start.elapsed().as_millis() as u64,
         dry_run,
         bytes_written: 0,
-        io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
+        io_mode: if dry_run {
+            "dry_run".to_string()
+        } else {
+            "firmware".to_string()
+        },
     })
 }
 
@@ -687,8 +1624,13 @@ pub async fn ata_secure_erase_with(
     crate::guard::verify_exclusive_access_and_recheck(backend, device, dry_run)?;
 
     // Phase 1: Check frozen state
-    send_progress(&tx, ExecutionPhase::SecurityUnlock,
-        "Checking ATA security frozen state with hdparm -I...", Some(10)).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::SecurityUnlock,
+        "Checking ATA security frozen state with hdparm -I...",
+        Some(10),
+    )
+    .await;
 
     let (stdout, stderr, _) = run_firmware_cmd(
         backend,
@@ -702,16 +1644,30 @@ pub async fn ata_secure_erase_with(
     all_stdout.push_str(&stdout);
     all_stderr.push_str(&stderr);
 
-    if !dry_run && stdout.to_lowercase().contains("frozen") && !stdout.to_lowercase().contains("not\tfrozen") && !stdout.to_lowercase().contains("not frozen") {
-        send_progress(&tx, ExecutionPhase::SecurityUnlock,
-            "WARNING: ATA security is FROZEN. Attempting suspend/resume cycle...", None).await;
+    if !dry_run
+        && stdout.to_lowercase().contains("frozen")
+        && !stdout.to_lowercase().contains("not\tfrozen")
+        && !stdout.to_lowercase().contains("not frozen")
+    {
+        send_progress(
+            &tx,
+            ExecutionPhase::SecurityUnlock,
+            "WARNING: ATA security is FROZEN. Attempting suspend/resume cycle...",
+            None,
+        )
+        .await;
         // In a real bootable environment, we could issue a sleep/wake cycle
         // For now, report the frozen state
     }
 
     // Phase 1b: Set security password
-    send_progress(&tx, ExecutionPhase::SecurityUnlock,
-        "Setting temporary ATA security password...", Some(8)).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::SecurityUnlock,
+        "Setting temporary ATA security password...",
+        Some(8),
+    )
+    .await;
 
     let (stdout, stderr, code) = run_firmware_cmd(
         backend,
@@ -736,15 +1692,28 @@ pub async fn ata_secure_erase_with(
             duration_ms: start.elapsed().as_millis() as u64,
             dry_run,
             bytes_written: 0,
-            io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
+            io_mode: if dry_run {
+                "dry_run".to_string()
+            } else {
+                "firmware".to_string()
+            },
         });
     }
 
     // Phase 2: Issue secure erase
-    let erase_arg = if enhanced { "--security-erase-enhanced" } else { "--security-erase" };
+    let erase_arg = if enhanced {
+        "--security-erase-enhanced"
+    } else {
+        "--security-erase"
+    };
 
-    send_progress(&tx, ExecutionPhase::FirmwareCommand,
-        &format!("Issuing hdparm {} on {}...", erase_arg, device), None).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::FirmwareCommand,
+        &format!("Issuing hdparm {} on {}...", erase_arg, device),
+        None,
+    )
+    .await;
 
     let (stdout, stderr, code) = run_firmware_cmd(
         backend,
@@ -759,8 +1728,13 @@ pub async fn ata_secure_erase_with(
     all_stderr.push_str(&stderr);
 
     if dry_run {
-        send_progress(&tx, ExecutionPhase::FirmwareCommand,
-            "[DRY RUN] ATA Secure Erase executing on controller", None).await;
+        send_progress(
+            &tx,
+            ExecutionPhase::FirmwareCommand,
+            "[DRY RUN] ATA Secure Erase executing on controller",
+            None,
+        )
+        .await;
     }
 
     if !dry_run && code != 0 {
@@ -774,17 +1748,31 @@ pub async fn ata_secure_erase_with(
             duration_ms: start.elapsed().as_millis() as u64,
             dry_run,
             bytes_written: 0,
-            io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
+            io_mode: if dry_run {
+                "dry_run".to_string()
+            } else {
+                "firmware".to_string()
+            },
         });
     }
 
     // Phase 3: Key destruction (implicit in ATA SE)
-    send_progress(&tx, ExecutionPhase::KeyDestruction,
-        "ATA controller key destruction complete.", Some(2)).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::KeyDestruction,
+        "ATA controller key destruction complete.",
+        Some(2),
+    )
+    .await;
 
     // Phase 4: Cache flush
-    send_progress(&tx, ExecutionPhase::CacheFlush,
-        "Flushing write cache...", Some(1)).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::CacheFlush,
+        "Flushing write cache...",
+        Some(1),
+    )
+    .await;
 
     if !dry_run {
         let (s, e, _) = run_firmware_cmd(
@@ -800,8 +1788,13 @@ pub async fn ata_secure_erase_with(
         all_stderr.push_str(&e);
     }
 
-    send_progress(&tx, ExecutionPhase::Verification,
-        "ATA Secure Erase completed. Ready for post-verification.", Some(1)).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::Verification,
+        "ATA Secure Erase completed. Ready for post-verification.",
+        Some(1),
+    )
+    .await;
 
     Ok(ExecutionReport {
         success: true,
@@ -813,7 +1806,11 @@ pub async fn ata_secure_erase_with(
         duration_ms: start.elapsed().as_millis() as u64,
         dry_run,
         bytes_written: 0,
-        io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
+        io_mode: if dry_run {
+            "dry_run".to_string()
+        } else {
+            "firmware".to_string()
+        },
     })
 }
 
@@ -884,11 +1881,21 @@ pub async fn ata_sanitize_with(
         AtaSanitizeAction::Overwrite => ("overwrite", "ATA Sanitize Overwrite"),
     };
 
-    send_progress(&tx, ExecutionPhase::SecurityUnlock,
-        "Checking device sanitize feature set support...", Some(5)).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::SecurityUnlock,
+        "Checking device sanitize feature set support...",
+        Some(5),
+    )
+    .await;
 
-    send_progress(&tx, ExecutionPhase::FirmwareCommand,
-        &format!("Issuing ATA Sanitize {} on {}...", action_arg, device), None).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::FirmwareCommand,
+        &format!("Issuing ATA Sanitize {} on {}...", action_arg, device),
+        None,
+    )
+    .await;
 
     // hdparm --sanitize-block-erase / --sanitize-crypto-scramble
     let hdparm_arg = format!("--sanitize-{}", action_arg);
@@ -905,16 +1912,36 @@ pub async fn ata_sanitize_with(
     all_stderr.push_str(&stderr);
 
     if dry_run {
-        send_progress(&tx, ExecutionPhase::FirmwareCommand,
-            "[DRY RUN] ATA Sanitize executing on controller", None).await;
+        send_progress(
+            &tx,
+            ExecutionPhase::FirmwareCommand,
+            "[DRY RUN] ATA Sanitize executing on controller",
+            None,
+        )
+        .await;
     }
 
-    send_progress(&tx, ExecutionPhase::KeyDestruction,
-        "ATA Sanitize controller key handling complete.", Some(2)).await;
-    send_progress(&tx, ExecutionPhase::CacheFlush,
-        "Flushing caches...", Some(1)).await;
-    send_progress(&tx, ExecutionPhase::Verification,
-        "ATA Sanitize completed. Ready for post-verification.", Some(1)).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::KeyDestruction,
+        "ATA Sanitize controller key handling complete.",
+        Some(2),
+    )
+    .await;
+    send_progress(
+        &tx,
+        ExecutionPhase::CacheFlush,
+        "Flushing caches...",
+        Some(1),
+    )
+    .await;
+    send_progress(
+        &tx,
+        ExecutionPhase::Verification,
+        "ATA Sanitize completed. Ready for post-verification.",
+        Some(1),
+    )
+    .await;
 
     Ok(ExecutionReport {
         success: dry_run || code == 0,
@@ -926,7 +1953,11 @@ pub async fn ata_sanitize_with(
         duration_ms: start.elapsed().as_millis() as u64,
         dry_run,
         bytes_written: 0,
-        io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
+        io_mode: if dry_run {
+            "dry_run".to_string()
+        } else {
+            "firmware".to_string()
+        },
     })
 }
 
@@ -991,8 +2022,13 @@ pub async fn opal_revert_with(
     // Verify exclusive access and re-check boot protection post-unmount
     crate::guard::verify_exclusive_access_and_recheck(backend, device, dry_run)?;
 
-    send_progress(&tx, ExecutionPhase::SecurityUnlock,
-        "Querying TCG OPAL SED state...", Some(3)).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::SecurityUnlock,
+        "Querying TCG OPAL SED state...",
+        Some(3),
+    )
+    .await;
 
     // Query OPAL state first
     let (stdout, stderr, _) = run_firmware_cmd(
@@ -1007,34 +2043,75 @@ pub async fn opal_revert_with(
     all_stdout.push_str(&stdout);
     all_stderr.push_str(&stderr);
 
-    send_progress(&tx, ExecutionPhase::FirmwareCommand,
-        "Issuing TCG OPAL revertTPer command...", None).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::FirmwareCommand,
+        "Issuing TCG OPAL revertTPer command...",
+        None,
+    )
+    .await;
 
     // PSID revert or password-based revert
     let (stdout, stderr, code) = if let Some(psid_val) = psid {
-        run_firmware_cmd(backend, target, "sedutil-cli",
-            &["--yesIreallywanttoERASEALLmydatausingthePSID", psid_val, device],
-            true, dry_run, &mut command_log)?
+        run_firmware_cmd(
+            backend,
+            target,
+            "sedutil-cli",
+            &[
+                "--yesIreallywanttoERASEALLmydatausingthePSID",
+                psid_val,
+                device,
+            ],
+            true,
+            dry_run,
+            &mut command_log,
+        )?
     } else {
         // Try with default SID
-        run_firmware_cmd(backend, target, "sedutil-cli",
+        run_firmware_cmd(
+            backend,
+            target,
+            "sedutil-cli",
             &["--revertTPer", "SID", device],
-            true, dry_run, &mut command_log)?
+            true,
+            dry_run,
+            &mut command_log,
+        )?
     };
     all_stdout.push_str(&stdout);
     all_stderr.push_str(&stderr);
 
     if dry_run {
-        send_progress(&tx, ExecutionPhase::FirmwareCommand,
-            "[DRY RUN] OPAL revert executing on controller", None).await;
+        send_progress(
+            &tx,
+            ExecutionPhase::FirmwareCommand,
+            "[DRY RUN] OPAL revert executing on controller",
+            None,
+        )
+        .await;
     }
 
-    send_progress(&tx, ExecutionPhase::KeyDestruction,
-        "TCG OPAL Media Encryption Key (MEK) destroyed.", Some(2)).await;
-    send_progress(&tx, ExecutionPhase::CacheFlush,
-        "SED controller state reset complete.", Some(1)).await;
-    send_progress(&tx, ExecutionPhase::Verification,
-        "OPAL revert completed. Ready for post-verification.", Some(1)).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::KeyDestruction,
+        "TCG OPAL Media Encryption Key (MEK) destroyed.",
+        Some(2),
+    )
+    .await;
+    send_progress(
+        &tx,
+        ExecutionPhase::CacheFlush,
+        "SED controller state reset complete.",
+        Some(1),
+    )
+    .await;
+    send_progress(
+        &tx,
+        ExecutionPhase::Verification,
+        "OPAL revert completed. Ready for post-verification.",
+        Some(1),
+    )
+    .await;
 
     Ok(ExecutionReport {
         success: dry_run || code == 0,
@@ -1046,7 +2123,11 @@ pub async fn opal_revert_with(
         duration_ms: start.elapsed().as_millis() as u64,
         dry_run,
         bytes_written: 0,
-        io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
+        io_mode: if dry_run {
+            "dry_run".to_string()
+        } else {
+            "firmware".to_string()
+        },
     })
 }
 
@@ -1107,11 +2188,21 @@ pub async fn emmc_sanitize_with(
     // Verify exclusive access and re-check boot protection post-unmount
     crate::guard::verify_exclusive_access_and_recheck(backend, device, dry_run)?;
 
-    send_progress(&tx, ExecutionPhase::SecurityUnlock,
-        "Reading eMMC extcsd sanitize capability...", Some(3)).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::SecurityUnlock,
+        "Reading eMMC extcsd sanitize capability...",
+        Some(3),
+    )
+    .await;
 
-    send_progress(&tx, ExecutionPhase::FirmwareCommand,
-        &format!("Issuing mmc sanitize on {}...", device), None).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::FirmwareCommand,
+        &format!("Issuing mmc sanitize on {}...", device),
+        None,
+    )
+    .await;
 
     let (stdout, stderr, code) = run_firmware_cmd(
         backend,
@@ -1126,16 +2217,36 @@ pub async fn emmc_sanitize_with(
     all_stderr.push_str(&stderr);
 
     if dry_run {
-        send_progress(&tx, ExecutionPhase::FirmwareCommand,
-            "[DRY RUN] eMMC sanitize executing on controller", None).await;
+        send_progress(
+            &tx,
+            ExecutionPhase::FirmwareCommand,
+            "[DRY RUN] eMMC sanitize executing on controller",
+            None,
+        )
+        .await;
     }
 
-    send_progress(&tx, ExecutionPhase::KeyDestruction,
-        "eMMC controller internal cleanup complete.", Some(2)).await;
-    send_progress(&tx, ExecutionPhase::CacheFlush,
-        "Flushing eMMC write buffer...", Some(1)).await;
-    send_progress(&tx, ExecutionPhase::Verification,
-        "eMMC Sanitize completed. Ready for post-verification.", Some(1)).await;
+    send_progress(
+        &tx,
+        ExecutionPhase::KeyDestruction,
+        "eMMC controller internal cleanup complete.",
+        Some(2),
+    )
+    .await;
+    send_progress(
+        &tx,
+        ExecutionPhase::CacheFlush,
+        "Flushing eMMC write buffer...",
+        Some(1),
+    )
+    .await;
+    send_progress(
+        &tx,
+        ExecutionPhase::Verification,
+        "eMMC Sanitize completed. Ready for post-verification.",
+        Some(1),
+    )
+    .await;
 
     Ok(ExecutionReport {
         success: dry_run || code == 0,
@@ -1147,7 +2258,11 @@ pub async fn emmc_sanitize_with(
         duration_ms: start.elapsed().as_millis() as u64,
         dry_run,
         bytes_written: 0,
-        io_mode: if dry_run { "dry_run".to_string() } else { "firmware".to_string() },
+        io_mode: if dry_run {
+            "dry_run".to_string()
+        } else {
+            "firmware".to_string()
+        },
     })
 }
 
@@ -1187,7 +2302,9 @@ pub fn build_discard_chunks(
         .checked_add(gran - 1)
         .map(|v| v / gran * gran)
         .ok_or_else(|| {
-            ExecuteError::UnsupportedOperation("Discard range start overflows during alignment".into())
+            ExecuteError::UnsupportedOperation(
+                "Discard range start overflows during alignment".into(),
+            )
         })?;
     let aligned_end = (range_end / gran) * gran;
 
@@ -1372,7 +2489,11 @@ pub async fn discard_erase_ctx(
     //    write-open below.
     let backend = LinuxBackend::new(ctx.clone());
     let validated_target = validate_whole_disk_flow_target_ctx(
-        device, confirmation_token, device_serial, dry_run, ctx,
+        device,
+        confirmation_token,
+        device_serial,
+        dry_run,
+        ctx,
     )?;
     command_log.push(format!(
         "{}[guard] boot-disk protection and confirmation verified for {}",
@@ -1384,10 +2505,11 @@ pub async fn discard_erase_ctx(
     // 2. Dry-run: plan from sysfs geometry — no unmounts, no device opens.
     if dry_run {
         let name = device.strip_prefix("/dev/").unwrap_or(device);
-        let size_bytes = fs::read_to_string(ctx.sys_root.join("class/block").join(name).join("size"))
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map(|sectors| sectors.saturating_mul(512));
+        let size_bytes =
+            fs::read_to_string(ctx.sys_root.join("class/block").join(name).join("size"))
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .map(|sectors| sectors.saturating_mul(512));
         match size_bytes {
             Some(size) if size > 0 => {
                 let chunks = build_discard_chunks(0, size, granularity, max_chunk)?;
@@ -1407,10 +2529,30 @@ pub async fn discard_erase_ctx(
                 ));
             }
         }
-        send_detailed_progress(&tx, ExecutionPhase::FirmwareCommand, 0, 0, None, 0.0, None,
-            "[DRY RUN] Simulated BLKDISCARD complete", false).await;
-        send_detailed_progress(&tx, ExecutionPhase::Flushing, 0, 0, None, 0.0, None,
-            "[DRY RUN] Cache flush simulated", false).await;
+        send_detailed_progress(
+            &tx,
+            ExecutionPhase::FirmwareCommand,
+            0,
+            0,
+            None,
+            0.0,
+            None,
+            "[DRY RUN] Simulated BLKDISCARD complete",
+            false,
+        )
+        .await;
+        send_detailed_progress(
+            &tx,
+            ExecutionPhase::Flushing,
+            0,
+            0,
+            None,
+            0.0,
+            None,
+            "[DRY RUN] Cache flush simulated",
+            false,
+        )
+        .await;
         return Ok(ExecutionReport {
             success: true,
             method_used: method_name,
@@ -1425,11 +2567,22 @@ pub async fn discard_erase_ctx(
         });
     }
 
-    send_detailed_progress(&tx, ExecutionPhase::Preparing, 0, 0, None, 0.0, Some(5),
-        "Unmounting filesystems on target device...", false).await;
+    send_detailed_progress(
+        &tx,
+        ExecutionPhase::Preparing,
+        0,
+        0,
+        None,
+        0.0,
+        Some(5),
+        "Unmounting filesystems on target device...",
+        false,
+    )
+    .await;
 
     // 3. Unmount any active partitions on the device
-    let (_stdout, _stderr) = unmount_target_if_mounted(&backend, &validated_target, false, &mut command_log);
+    let (_stdout, _stderr) =
+        unmount_target_if_mounted(&backend, &validated_target, false, &mut command_log);
 
     // 4. Verify exclusive access and re-check boot protection post-unmount
     verify_exclusive_access_and_recheck(device, false, ctx)?;
@@ -1460,11 +2613,20 @@ pub async fn discard_erase_ctx(
     writer.flush_buffers().map_err(ExecuteError::IoError)?;
     command_log.push(format!("[flush] BLKFLSBUF on {}", device));
 
-    send_detailed_progress(&tx, ExecutionPhase::Verification, discarded, size_bytes,
-        Some(100.0), 0.0, None,
-        "BLKDISCARD complete. Ready for post-verification.", false).await;
+    send_detailed_progress(
+        &tx,
+        ExecutionPhase::Verification,
+        discarded,
+        size_bytes,
+        Some(100.0),
+        0.0,
+        None,
+        "BLKDISCARD complete. Ready for post-verification.",
+        false,
+    )
+    .await;
 
-    Ok(ExecutionReport {
+    let mut report = ExecutionReport {
         success: true,
         method_used: method_name,
         command_log,
@@ -1475,7 +2637,17 @@ pub async fn discard_erase_ctx(
         dry_run: false,
         bytes_written: discarded,
         io_mode: "discard".to_string(),
-    })
+    };
+    match backend.reread_partition_table(&validated_target) {
+        Ok(()) => report
+            .command_log
+            .push("[guard] kernel partition-table re-read complete".to_string()),
+        Err(e) => report.command_log.push(format!(
+            "[guard] warning: kernel partition-table re-read failed: {}",
+            e
+        )),
+    }
+    Ok(report)
 }
 
 /// A6: partition-range discard — same geometry/fingerprint guard chain as
@@ -1523,12 +2695,15 @@ pub async fn discard_erase_partition_ctx(
     //    C2a: same guard chain in the same order, now also minting the
     //    validated target whose open_exclusive is the only write-open path.
     let backend = LinuxBackend::new(ctx.clone());
-    let validated_target = crate::guard::validate_partition_target(
-        &backend, device, params, dry_run, device_serial,
-    )?;
-    let target = validated_target.to_legacy_partition_target().ok_or_else(|| {
-        ExecuteError::UnsupportedOperation("validated target is not partition-scoped".to_string())
-    })?;
+    let validated_target =
+        crate::guard::validate_partition_target(&backend, device, params, dry_run, device_serial)?;
+    let target = validated_target
+        .to_legacy_partition_target()
+        .ok_or_else(|| {
+            ExecuteError::UnsupportedOperation(
+                "validated target is not partition-scoped".to_string(),
+            )
+        })?;
     command_log.push(format!(
         "{}[guard] partition geometry and table fingerprint verified for {} ({} bytes)",
         step_prefix, device, target.size_bytes
@@ -1547,10 +2722,30 @@ pub async fn discard_erase_partition_ctx(
             granularity,
             max_chunk
         ));
-        send_detailed_progress(&tx, ExecutionPhase::FirmwareCommand, 0, 0, None, 0.0, None,
-            "[DRY RUN] Simulated partition BLKDISCARD complete", false).await;
-        send_detailed_progress(&tx, ExecutionPhase::Flushing, 0, 0, None, 0.0, None,
-            "[DRY RUN] Cache flush simulated", false).await;
+        send_detailed_progress(
+            &tx,
+            ExecutionPhase::FirmwareCommand,
+            0,
+            0,
+            None,
+            0.0,
+            None,
+            "[DRY RUN] Simulated partition BLKDISCARD complete",
+            false,
+        )
+        .await;
+        send_detailed_progress(
+            &tx,
+            ExecutionPhase::Flushing,
+            0,
+            0,
+            None,
+            0.0,
+            None,
+            "[DRY RUN] Cache flush simulated",
+            false,
+        )
+        .await;
         return Ok(ExecutionReport {
             success: true,
             method_used: method_name,
@@ -1565,11 +2760,22 @@ pub async fn discard_erase_partition_ctx(
         });
     }
 
-    send_detailed_progress(&tx, ExecutionPhase::Preparing, 0, 0, None, 0.0, Some(5),
-        "Unmounting filesystems on target partition...", false).await;
+    send_detailed_progress(
+        &tx,
+        ExecutionPhase::Preparing,
+        0,
+        0,
+        None,
+        0.0,
+        Some(5),
+        "Unmounting filesystems on target partition...",
+        false,
+    )
+    .await;
 
     // 4. Targeted unmount: target partition & holders only
-    let (_stdout, _stderr) = unmount_target_partition_and_holders(device, false, &mut command_log, ctx)?;
+    let (_stdout, _stderr) =
+        unmount_target_partition_and_holders(device, false, &mut command_log, ctx)?;
 
     // 5. Verify exclusive access on the partition node
     verify_exclusive_access_and_recheck(device, false, ctx)?;
@@ -1608,22 +2814,37 @@ pub async fn discard_erase_partition_ctx(
     writer.flush_buffers().map_err(ExecuteError::IoError)?;
     command_log.push(format!("[flush] BLKFLSBUF on {}", device));
 
-    send_detailed_progress(&tx, ExecutionPhase::Verification, discarded, target.size_bytes,
-        Some(100.0), 0.0, None,
-        "Partition BLKDISCARD complete. Ready for post-verification.", false).await;
+    send_detailed_progress(
+        &tx,
+        ExecutionPhase::Verification,
+        discarded,
+        target.size_bytes,
+        Some(100.0),
+        0.0,
+        None,
+        "Partition BLKDISCARD complete. Ready for post-verification.",
+        false,
+    )
+    .await;
 
-    Ok(ExecutionReport {
+    let mut report = ExecutionReport {
         success: true,
         method_used: method_name,
         command_log,
-        stdout: format!("Partition BLKDISCARD completed: {} bytes discarded", discarded),
+        stdout: format!(
+            "Partition BLKDISCARD completed: {} bytes discarded",
+            discarded
+        ),
         stderr: String::new(),
         exit_code: 0,
         duration_ms: start.elapsed().as_millis() as u64,
         dry_run: false,
         bytes_written: discarded,
         io_mode: "discard".to_string(),
-    })
+    };
+    // F2: table must be unchanged; re-read so the partition reappears.
+    finish_partition_wipe(&backend, &validated_target, params, &mut report)?;
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -1744,7 +2965,10 @@ impl<W: BlockWriter> BlockWriter for PartitionRangeWriter<W> {
     fn write_chunk(&mut self, offset: u64, data: &[u8]) -> Result<usize, io::Error> {
         let chunk_len = data.len() as u64;
         let end = offset.checked_add(chunk_len).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "Offset overflow in partition write")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Offset overflow in partition write",
+            )
         })?;
         if end > self.length {
             return Err(io::Error::new(
@@ -1756,7 +2980,10 @@ impl<W: BlockWriter> BlockWriter for PartitionRangeWriter<W> {
             ));
         }
         let target_offset = self.start_offset.checked_add(offset).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "Target offset overflow in partition write")
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Target offset overflow in partition write",
+            )
         })?;
         self.inner.write_chunk(target_offset, data)
     }
@@ -1932,7 +3159,10 @@ pub fn get_checkpoint_dir() -> PathBuf {
                     if !passwd.is_null() {
                         let pw_dir = unsafe { std::ffi::CStr::from_ptr((*passwd).pw_dir) };
                         if let Ok(home_str) = pw_dir.to_str() {
-                            return PathBuf::from(home_str).join(".local").join("state").join("zero_trace");
+                            return PathBuf::from(home_str)
+                                .join(".local")
+                                .join("state")
+                                .join("zero_trace");
                         }
                     }
                 }
@@ -1946,21 +3176,36 @@ pub fn get_checkpoint_dir() -> PathBuf {
     }
     if let Ok(home) = std::env::var("HOME") {
         if !home.trim().is_empty() {
-            return PathBuf::from(home).join(".local").join("state").join("zero_trace");
+            return PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("zero_trace");
         }
     }
     PathBuf::from("/tmp/zero_trace")
 }
 
 pub fn write_checkpoint_file(job_id: &str, serial: &str, device_size: u64, bytes_done: u64) {
-    write_checkpoint_file_in_dir(&get_checkpoint_dir(), job_id, serial, device_size, bytes_done);
+    write_checkpoint_file_in_dir(
+        &get_checkpoint_dir(),
+        job_id,
+        serial,
+        device_size,
+        bytes_done,
+    );
 }
 
 pub fn remove_checkpoint_file() {
     remove_checkpoint_file_in_dir(&get_checkpoint_dir());
 }
 
-pub fn write_checkpoint_file_in_dir(dir: &Path, job_id: &str, serial: &str, device_size: u64, bytes_done: u64) {
+pub fn write_checkpoint_file_in_dir(
+    dir: &Path,
+    job_id: &str,
+    serial: &str,
+    device_size: u64,
+    bytes_done: u64,
+) {
     let _ = fs::create_dir_all(dir);
     #[cfg(unix)]
     {
@@ -2011,10 +3256,16 @@ pub fn write_checkpoint_file_in_dir(dir: &Path, job_id: &str, serial: &str, devi
         };
         if fd >= 0 {
             // Chown to calling user if running under sudo or pkexec
-            if let Ok(uid_str) = std::env::var("SUDO_UID").or_else(|_| std::env::var("PKEXEC_UID")) {
+            if let Ok(uid_str) = std::env::var("SUDO_UID").or_else(|_| std::env::var("PKEXEC_UID"))
+            {
                 if let Ok(uid) = uid_str.trim().parse::<libc::uid_t>() {
-                    let gid = std::env::var("SUDO_GID").ok().and_then(|g| g.trim().parse::<libc::gid_t>().ok()).unwrap_or(uid);
-                    unsafe { libc::fchown(fd, uid, gid); }
+                    let gid = std::env::var("SUDO_GID")
+                        .ok()
+                        .and_then(|g| g.trim().parse::<libc::gid_t>().ok())
+                        .unwrap_or(uid);
+                    unsafe {
+                        libc::fchown(fd, uid, gid);
+                    }
                 }
             }
 
@@ -2061,7 +3312,8 @@ pub async fn execute_writer_overwrite<W: BlockWriter>(
         start,
         tx,
         None,
-    ).await
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2075,16 +3327,23 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
     tx: mpsc::Sender<ProgressEvent>,
     external_cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Result<ExecutionReport, ExecuteError> {
-    let command_log = vec![format!("Native block overwrite ({} passes, mode: {})", total_passes, writer.io_mode())];
+    let command_log = vec![format!(
+        "Native block overwrite ({} passes, mode: {})",
+        total_passes,
+        writer.io_mode()
+    )];
     let device_size = writer.total_size().map_err(ExecuteError::IoError)?;
     let total_bytes = total_passes as u64 * device_size;
 
     let device_id_hash = format!("{:x}", Sha256::digest(device_serial.as_bytes()));
-    let job_id = std::env::var("ZT_JOB_ID").unwrap_or_else(|_| format!("job-{}", &device_id_hash[..12]));
+    let job_id =
+        std::env::var("ZT_JOB_ID").unwrap_or_else(|_| format!("job-{}", &device_id_hash[..12]));
 
     let cancel_flag = external_cancel_flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-    let _term_hook = signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&cancel_flag));
-    let _int_hook = signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&cancel_flag));
+    let _term_hook =
+        signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&cancel_flag));
+    let _int_hook =
+        signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&cancel_flag));
 
     let chunk_size = 2 * 1024 * 1024usize; // 2 MiB chunks
     let mut aligned_buf = AlignedBuffer::new(chunk_size);
@@ -2164,17 +3423,23 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
                 write_checkpoint_file(&job_id, device_serial, device_size, overall_bytes_done);
                 let _ = hb_stop_tx.send(());
                 let _ = hb_task.await;
-                let _ = tx.send(ProgressEvent {
-                    schema_version: 2,
-                    phase: ExecutionPhase::FirmwareCommand,
-                    bytes_done: overall_bytes_done,
-                    bytes_total: total_bytes,
-                    percent: if total_bytes > 0 { Some(overall_bytes_done as f32 / total_bytes as f32) } else { None },
-                    speed_bytes_per_sec: 0.0,
-                    eta_seconds: None,
-                    message: "Sanitization cancelled by user".to_string(),
-                    is_heartbeat: false,
-                }).await;
+                let _ = tx
+                    .send(ProgressEvent {
+                        schema_version: 2,
+                        phase: ExecutionPhase::FirmwareCommand,
+                        bytes_done: overall_bytes_done,
+                        bytes_total: total_bytes,
+                        percent: if total_bytes > 0 {
+                            Some(overall_bytes_done as f32 / total_bytes as f32)
+                        } else {
+                            None
+                        },
+                        speed_bytes_per_sec: 0.0,
+                        eta_seconds: None,
+                        message: "Sanitization cancelled by user".to_string(),
+                        is_heartbeat: false,
+                    })
+                    .await;
                 return Ok(ExecutionReport {
                     success: false,
                     method_used: method_name.to_string(),
@@ -2205,17 +3470,23 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
                     write_checkpoint_file(&job_id, device_serial, device_size, overall_bytes_done);
                     let _ = hb_stop_tx.send(());
                     let _ = hb_task.await;
-                    let _ = tx.send(ProgressEvent {
-                        schema_version: 2,
-                        phase: ExecutionPhase::FirmwareCommand,
-                        bytes_done: overall_bytes_done,
-                        bytes_total: total_bytes,
-                        percent: if total_bytes > 0 { Some(overall_bytes_done as f32 / total_bytes as f32) } else { None },
-                        speed_bytes_per_sec: 0.0,
-                        eta_seconds: None,
-                        message: "Sanitization cancelled by user".to_string(),
-                        is_heartbeat: false,
-                    }).await;
+                    let _ = tx
+                        .send(ProgressEvent {
+                            schema_version: 2,
+                            phase: ExecutionPhase::FirmwareCommand,
+                            bytes_done: overall_bytes_done,
+                            bytes_total: total_bytes,
+                            percent: if total_bytes > 0 {
+                                Some(overall_bytes_done as f32 / total_bytes as f32)
+                            } else {
+                                None
+                            },
+                            speed_bytes_per_sec: 0.0,
+                            eta_seconds: None,
+                            message: "Sanitization cancelled by user".to_string(),
+                            is_heartbeat: false,
+                        })
+                        .await;
                     return Ok(ExecutionReport {
                         success: false,
                         method_used: method_name.to_string(),
@@ -2235,14 +3506,18 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
                     Ok(0) => {
                         let _ = hb_stop_tx.send(());
                         let _ = hb_task.await;
-                        return Err(ExecuteError::PrematureEndOfDevice("Write returned 0 bytes (ENOSPC)".into()));
+                        return Err(ExecuteError::PrematureEndOfDevice(
+                            "Write returned 0 bytes (ENOSPC)".into(),
+                        ));
                     }
                     Ok(n) => {
                         written_for_chunk += n;
                         if is_buffered_mode {
                             uncommitted_buffered_bytes += n as u64;
                             // In buffered mode, flush periodically (e.g. 16MB) or when pass finishes
-                            if uncommitted_buffered_bytes >= 16 * 1024 * 1024 || (offset + written_for_chunk as u64 >= device_size) {
+                            if uncommitted_buffered_bytes >= 16 * 1024 * 1024
+                                || (offset + written_for_chunk as u64 >= device_size)
+                            {
                                 if let Err(e) = writer.sync_data() {
                                     let _ = hb_stop_tx.send(());
                                     let _ = hb_task.await;
@@ -2261,17 +3536,29 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
                     Err(e) if e.raw_os_error() == Some(libc::EIO) => {
                         let _ = hb_stop_tx.send(());
                         let _ = hb_task.await;
-                        return Err(ExecuteError::HardwareIo(format!("EIO at offset {}: {}", offset + written_for_chunk as u64, e)));
+                        return Err(ExecuteError::HardwareIo(format!(
+                            "EIO at offset {}: {}",
+                            offset + written_for_chunk as u64,
+                            e
+                        )));
                     }
                     Err(e) if e.raw_os_error() == Some(libc::ENODEV) => {
                         let _ = hb_stop_tx.send(());
                         let _ = hb_task.await;
-                        return Err(ExecuteError::DeviceDisconnected(format!("ENODEV at offset {}: {}", offset + written_for_chunk as u64, e)));
+                        return Err(ExecuteError::DeviceDisconnected(format!(
+                            "ENODEV at offset {}: {}",
+                            offset + written_for_chunk as u64,
+                            e
+                        )));
                     }
                     Err(e) if e.raw_os_error() == Some(libc::ENOSPC) => {
                         let _ = hb_stop_tx.send(());
                         let _ = hb_task.await;
-                        return Err(ExecuteError::PrematureEndOfDevice(format!("ENOSPC at offset {}: {}", offset + written_for_chunk as u64, e)));
+                        return Err(ExecuteError::PrematureEndOfDevice(format!(
+                            "ENOSPC at offset {}: {}",
+                            offset + written_for_chunk as u64,
+                            e
+                        )));
                     }
                     Err(e) => {
                         let _ = hb_stop_tx.send(());
@@ -2295,8 +3582,23 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
                     None
                 };
                 let pct = overall_bytes_done as f32 / total_bytes as f32;
-                let msg = format!("Pass {} of {}: writing to media", pass_idx + 1, total_passes);
-                send_detailed_progress(&tx, ExecutionPhase::FirmwareCommand, overall_bytes_done, total_bytes, Some(pct), cur_speed, eta, &msg, false).await;
+                let msg = format!(
+                    "Pass {} of {}: writing to media",
+                    pass_idx + 1,
+                    total_passes
+                );
+                send_detailed_progress(
+                    &tx,
+                    ExecutionPhase::FirmwareCommand,
+                    overall_bytes_done,
+                    total_bytes,
+                    Some(pct),
+                    cur_speed,
+                    eta,
+                    &msg,
+                    false,
+                )
+                .await;
             }
 
             // Periodic checkpoint file write (~every 2 seconds)
@@ -2309,7 +3611,18 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
 
     // Flush phase (Item 1, 2, 3)
     *phase_shared.lock().unwrap() = ExecutionPhase::Flushing;
-    send_detailed_progress(&tx, ExecutionPhase::Flushing, overall_bytes_done, total_bytes, None, 0.0, None, "Finalizing, flushing to drive", false).await;
+    send_detailed_progress(
+        &tx,
+        ExecutionPhase::Flushing,
+        overall_bytes_done,
+        total_bytes,
+        None,
+        0.0,
+        None,
+        "Finalizing, flushing to drive",
+        false,
+    )
+    .await;
 
     // Check cancellation promptly at start of flush
     if cancel_flag.load(Ordering::SeqCst) {
@@ -2361,7 +3674,18 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
     }
 
     *phase_shared.lock().unwrap() = ExecutionPhase::Verification;
-    send_detailed_progress(&tx, ExecutionPhase::Verification, overall_bytes_done, total_bytes, None, 0.0, None, "Verifying sector erasure...", false).await;
+    send_detailed_progress(
+        &tx,
+        ExecutionPhase::Verification,
+        overall_bytes_done,
+        total_bytes,
+        None,
+        0.0,
+        None,
+        "Verifying sector erasure...",
+        false,
+    )
+    .await;
 
     // Check cancellation promptly before verification
     if cancel_flag.load(Ordering::SeqCst) {
@@ -2392,7 +3716,10 @@ pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
         success: overall_bytes_done == total_bytes,
         method_used: method_name.to_string(),
         command_log,
-        stdout: format!("Successfully overwritten {} bytes in {} passes", overall_bytes_done, total_passes),
+        stdout: format!(
+            "Successfully overwritten {} bytes in {} passes",
+            overall_bytes_done, total_passes
+        ),
         stderr: String::new(),
         exit_code: 0,
         duration_ms: start.elapsed().as_millis() as u64,
@@ -2434,21 +3761,67 @@ pub async fn software_overwrite(
         _ => passes.max(1),
     };
 
-    let method_name = format!(
-        "Software Overwrite ({}-pass, {:?})",
-        total_passes, pattern
-    );
+    let method_name = format!("Software Overwrite ({}-pass, {:?})", total_passes, pattern);
 
     // 2. Item 2: Move dry-run branch before unmount step!
     if dry_run {
-        command_log.push(format!("[DRY RUN] Native block overwrite: {} passes ({:?}) on {}", total_passes, pattern, device));
-        send_detailed_progress(&tx, ExecutionPhase::FirmwareCommand, 0, 0, None, 0.0, None, "[DRY RUN] Starting simulated overwrite...", false).await;
+        command_log.push(format!(
+            "[DRY RUN] Native block overwrite: {} passes ({:?}) on {}",
+            total_passes, pattern, device
+        ));
+        send_detailed_progress(
+            &tx,
+            ExecutionPhase::FirmwareCommand,
+            0,
+            0,
+            None,
+            0.0,
+            None,
+            "[DRY RUN] Starting simulated overwrite...",
+            false,
+        )
+        .await;
         for pass in 1..=total_passes {
-            send_detailed_progress(&tx, ExecutionPhase::FirmwareCommand, 0, 0, None, 0.0, None,
-                &format!("[DRY RUN] Overwrite pass {} of {} complete", pass, total_passes), false).await;
+            send_detailed_progress(
+                &tx,
+                ExecutionPhase::FirmwareCommand,
+                0,
+                0,
+                None,
+                0.0,
+                None,
+                &format!(
+                    "[DRY RUN] Overwrite pass {} of {} complete",
+                    pass, total_passes
+                ),
+                false,
+            )
+            .await;
         }
-        send_detailed_progress(&tx, ExecutionPhase::Flushing, 0, 0, None, 0.0, None, "[DRY RUN] Flushing complete", false).await;
-        send_detailed_progress(&tx, ExecutionPhase::Verification, 0, 0, None, 0.0, None, "[DRY RUN] Post-verification complete", false).await;
+        send_detailed_progress(
+            &tx,
+            ExecutionPhase::Flushing,
+            0,
+            0,
+            None,
+            0.0,
+            None,
+            "[DRY RUN] Flushing complete",
+            false,
+        )
+        .await;
+        send_detailed_progress(
+            &tx,
+            ExecutionPhase::Verification,
+            0,
+            0,
+            None,
+            0.0,
+            None,
+            "[DRY RUN] Post-verification complete",
+            false,
+        )
+        .await;
         return Ok(ExecutionReport {
             success: true,
             method_used: method_name,
@@ -2463,11 +3836,22 @@ pub async fn software_overwrite(
         });
     }
 
-    send_detailed_progress(&tx, ExecutionPhase::SecurityUnlock, 0, 0, None, 0.0, Some(5),
-        "Unmounting filesystems on target device...", false).await;
+    send_detailed_progress(
+        &tx,
+        ExecutionPhase::SecurityUnlock,
+        0,
+        0,
+        None,
+        0.0,
+        Some(5),
+        "Unmounting filesystems on target device...",
+        false,
+    )
+    .await;
 
     // 3. Unmount any active partitions
-    let (_stdout, _stderr) = unmount_target_if_mounted(&backend, &validated_target, false, &mut command_log);
+    let (_stdout, _stderr) =
+        unmount_target_if_mounted(&backend, &validated_target, false, &mut command_log);
 
     // 4. Verify exclusive access and re-check boot protection post-unmount
     verify_exclusive_access_and_recheck(device, false, &FsContext::default())?;
@@ -2477,7 +3861,7 @@ pub async fn software_overwrite(
     let handle = open_validated_writer(&backend, &validated_target)?;
 
     // 6. Execute native overwrite
-    execute_writer_overwrite(
+    let mut report = execute_writer_overwrite(
         handle,
         total_passes,
         pattern,
@@ -2485,7 +3869,24 @@ pub async fn software_overwrite(
         &method_name,
         start,
         tx,
-    ).await
+    )
+    .await?;
+
+    // F2: best-effort kernel re-read after a whole-device wipe (the table is
+    // gone, but any stale partition nodes must disappear). A re-read failure
+    // is logged, not promoted into a wipe failure.
+    if report.success {
+        match backend.reread_partition_table(&validated_target) {
+            Ok(()) => report
+                .command_log
+                .push("[guard] kernel partition-table re-read complete".to_string()),
+            Err(e) => report.command_log.push(format!(
+                "[guard] warning: kernel partition-table re-read failed: {}",
+                e
+            )),
+        }
+    }
+    Ok(report)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2606,7 +4007,6 @@ pub fn validate_partition_method(method: &str) -> Result<EngineMethod, ExecuteEr
     Ok(engine_method)
 }
 
-
 /// Calculates the SHA-256 fingerprint of the partition table on the parent disk.
 /// Sorted ascending by partition number: format "{part_num}:{start_sector}:{size_sectors}\n".
 pub fn compute_partition_table_fingerprint(
@@ -2705,7 +4105,6 @@ pub fn resolve_parent_serial(device: &str, ctx: &FsContext) -> Result<String, Ex
     crate::guard::resolve_parent_serial(&LinuxBackend::new(ctx.clone()), device)
 }
 
-
 /// Validate a partition-mode target before any destructive open:
 /// sysfs geometry (number/start/size), optional PARTUUID, partition table
 /// fingerprint, MBR extended container refusal, logical-block alignment and
@@ -2718,7 +4117,8 @@ pub fn validate_partition_target(
     device_serial: &str,
 ) -> Result<ValidatedPartitionTarget, ExecuteError> {
     let backend = LinuxBackend::new(ctx.clone());
-    let target = crate::guard::validate_partition_target(&backend, device, params, dry_run, device_serial)?;
+    let target =
+        crate::guard::validate_partition_target(&backend, device, params, dry_run, device_serial)?;
     target.to_legacy_partition_target().ok_or_else(|| {
         ExecuteError::UnsupportedOperation("validated target is not partition-scoped".to_string())
     })
@@ -2745,7 +4145,8 @@ pub async fn software_overwrite_partition(
         dry_run,
         tx,
         &FsContext::default(),
-    ).await
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2772,22 +4173,22 @@ pub async fn software_overwrite_partition_ctx(
     //    mints the validated target whose open_exclusive is the only
     //    write-open path.
     let backend = LinuxBackend::new(ctx.clone());
-    let validated_target = crate::guard::validate_partition_target(
-        &backend, device, params, dry_run, device_serial,
-    )?;
-    let target = validated_target.to_legacy_partition_target().ok_or_else(|| {
-        ExecuteError::UnsupportedOperation("validated target is not partition-scoped".to_string())
-    })?;
+    let validated_target =
+        crate::guard::validate_partition_target(&backend, device, params, dry_run, device_serial)?;
+    let target = validated_target
+        .to_legacy_partition_target()
+        .ok_or_else(|| {
+            ExecuteError::UnsupportedOperation(
+                "validated target is not partition-scoped".to_string(),
+            )
+        })?;
     let verified_size_bytes = target.size_bytes;
 
     let total_passes = match pattern {
         OverwritePattern::MultiPass3 => 3u8,
         _ => passes.max(1),
     };
-    let method_name = format!(
-        "Partition Overwrite ({}-pass, {:?})",
-        total_passes, pattern
-    );
+    let method_name = format!("Partition Overwrite ({}-pass, {:?})", total_passes, pattern);
 
     // 6. Dry run early exit: no unmounts, zero write opens
     if dry_run {
@@ -2795,14 +4196,59 @@ pub async fn software_overwrite_partition_ctx(
             "[DRY RUN] Native partition block overwrite: {} passes ({:?}) on {} (size: {} bytes)",
             total_passes, pattern, device, verified_size_bytes
         ));
-        send_detailed_progress(&tx, ExecutionPhase::FirmwareCommand, 0, 0, None, 0.0, None,
-            "[DRY RUN] Starting simulated partition overwrite...", false).await;
+        send_detailed_progress(
+            &tx,
+            ExecutionPhase::FirmwareCommand,
+            0,
+            0,
+            None,
+            0.0,
+            None,
+            "[DRY RUN] Starting simulated partition overwrite...",
+            false,
+        )
+        .await;
         for pass in 1..=total_passes {
-            send_detailed_progress(&tx, ExecutionPhase::FirmwareCommand, 0, 0, None, 0.0, None,
-                &format!("[DRY RUN] Overwrite pass {} of {} complete", pass, total_passes), false).await;
+            send_detailed_progress(
+                &tx,
+                ExecutionPhase::FirmwareCommand,
+                0,
+                0,
+                None,
+                0.0,
+                None,
+                &format!(
+                    "[DRY RUN] Overwrite pass {} of {} complete",
+                    pass, total_passes
+                ),
+                false,
+            )
+            .await;
         }
-        send_detailed_progress(&tx, ExecutionPhase::Flushing, 0, 0, None, 0.0, None, "[DRY RUN] Flushing complete", false).await;
-        send_detailed_progress(&tx, ExecutionPhase::Verification, 0, 0, None, 0.0, None, "[DRY RUN] Post-verification complete", false).await;
+        send_detailed_progress(
+            &tx,
+            ExecutionPhase::Flushing,
+            0,
+            0,
+            None,
+            0.0,
+            None,
+            "[DRY RUN] Flushing complete",
+            false,
+        )
+        .await;
+        send_detailed_progress(
+            &tx,
+            ExecutionPhase::Verification,
+            0,
+            0,
+            None,
+            0.0,
+            None,
+            "[DRY RUN] Post-verification complete",
+            false,
+        )
+        .await;
         return Ok(ExecutionReport {
             success: true,
             method_used: method_name,
@@ -2817,11 +4263,22 @@ pub async fn software_overwrite_partition_ctx(
         });
     }
 
-    send_detailed_progress(&tx, ExecutionPhase::SecurityUnlock, 0, 0, None, 0.0, Some(5),
-        "Unmounting filesystems on target partition...", false).await;
+    send_detailed_progress(
+        &tx,
+        ExecutionPhase::SecurityUnlock,
+        0,
+        0,
+        None,
+        0.0,
+        Some(5),
+        "Unmounting filesystems on target partition...",
+        false,
+    )
+    .await;
 
     // 7. Targeted unmount: target partition & holders only
-    let (_stdout, _stderr) = unmount_target_partition_and_holders(device, false, &mut command_log, ctx)?;
+    let (_stdout, _stderr) =
+        unmount_target_partition_and_holders(device, false, &mut command_log, ctx)?;
 
     // 8. Verify exclusive access on the partition node
     verify_exclusive_access_and_recheck(device, false, ctx)?;
@@ -2841,7 +4298,7 @@ pub async fn software_overwrite_partition_ctx(
     let range_writer = PartitionRangeWriter::new(inner_writer, 0, verified_size_bytes);
 
     // 11. Execute native overwrite
-    execute_writer_overwrite(
+    let mut report = execute_writer_overwrite(
         range_writer,
         total_passes,
         pattern,
@@ -2849,7 +4306,13 @@ pub async fn software_overwrite_partition_ctx(
         &method_name,
         start,
         tx,
-    ).await
+    )
+    .await?;
+
+    // F2: partition-scope wipe must leave the partition table byte-identical;
+    // then ask the kernel to re-read it so the partition node reappears.
+    finish_partition_wipe(&backend, &validated_target, params, &mut report)?;
+    Ok(report)
 }
 
 // ---------------------------------------------------------------------------
@@ -2909,7 +4372,11 @@ mod tests {
         ) {
             let class_dir = self.path(&format!("sys/class/block/{}", name));
             fs::create_dir_all(&class_dir).unwrap();
-            fs::write(class_dir.join("dev"), format!("{}:{}\n", major_minor.0, major_minor.1)).unwrap();
+            fs::write(
+                class_dir.join("dev"),
+                format!("{}:{}\n", major_minor.0, major_minor.1),
+            )
+            .unwrap();
 
             if is_partition {
                 fs::write(class_dir.join("partition"), "1\n").unwrap();
@@ -2921,7 +4388,11 @@ mod tests {
             } else {
                 let block_dir = self.path(&format!("sys/block/{}", name));
                 fs::create_dir_all(&block_dir).unwrap();
-                fs::write(block_dir.join("dev"), format!("{}:{}\n", major_minor.0, major_minor.1)).unwrap();
+                fs::write(
+                    block_dir.join("dev"),
+                    format!("{}:{}\n", major_minor.0, major_minor.1),
+                )
+                .unwrap();
             }
 
             fs::write(self.path(&format!("dev/{}", name)), "").unwrap();
@@ -2957,11 +4428,17 @@ mod tests {
     fn test_boot_disk_protection_detects_root() {
         // Non-existent device in dry-run mode should pass without panicking
         let result = check_boot_disk_protection("/dev/nonexistent_safe_device", true);
-        assert!(result.is_ok(), "Non-existent device should pass boot disk check in dry-run");
+        assert!(
+            result.is_ok(),
+            "Non-existent device should pass boot disk check in dry-run"
+        );
 
         // Non-existent device in real mode must fail closed (DeviceNotFound)
         let real_result = check_boot_disk_protection("/dev/nonexistent_safe_device", false);
-        assert!(real_result.is_err(), "Non-existent device must be refused in real mode");
+        assert!(
+            real_result.is_err(),
+            "Non-existent device must be refused in real mode"
+        );
     }
 
     #[test]
@@ -2977,19 +4454,23 @@ mod tests {
         let ctx = f.ctx();
         // Target is whole disk -> must refuse because sda1 is root
         let res_disk = check_boot_disk_protection_ctx("/dev/sda", false, &ctx);
-        assert!(res_disk.is_err(), "Targeting /dev/sda must be refused when sda1 is root");
+        assert!(
+            res_disk.is_err(),
+            "Targeting /dev/sda must be refused when sda1 is root"
+        );
 
         // Target is partition -> must refuse because sda1 is root
         let res_part = check_boot_disk_protection_ctx("/dev/sda1", false, &ctx);
-        assert!(res_part.is_err(), "Targeting /dev/sda1 must be refused when sda1 is root");
+        assert!(
+            res_part.is_err(),
+            "Targeting /dev/sda1 must be refused when sda1 is root"
+        );
     }
 
     #[test]
     fn test_fixture_lvm_root() {
         let f = FixtureBuilder::new();
-        f.set_mountinfo(
-            "1 0 254:0 / / rw,relatime - ext4 /dev/mapper/vg-root rw\n",
-        );
+        f.set_mountinfo("1 0 254:0 / / rw,relatime - ext4 /dev/mapper/vg-root rw\n");
         f.add_block_device("sdb", (8, 16), false, None);
         f.add_block_device("sdb2", (8, 18), true, Some("sdb"));
         f.add_block_device("dm-0", (254, 0), false, None);
@@ -2998,7 +4479,10 @@ mod tests {
         let ctx = f.ctx();
         // Whole disk sdb has sdb2 which holds dm-0 (root)
         let res_disk = check_boot_disk_protection_ctx("/dev/sdb", false, &ctx);
-        assert!(res_disk.is_err(), "LVM root member whole-disk must be refused");
+        assert!(
+            res_disk.is_err(),
+            "LVM root member whole-disk must be refused"
+        );
 
         let res_part = check_boot_disk_protection_ctx("/dev/sdb2", false, &ctx);
         assert!(res_part.is_err(), "LVM root PV partition must be refused");
@@ -3069,24 +4553,24 @@ mod tests {
     #[test]
     fn test_fixture_by_id_symlink() {
         let f = FixtureBuilder::new();
-        f.set_mountinfo(
-            "1 0 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n",
-        );
+        f.set_mountinfo("1 0 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n");
         f.add_block_device("sda", (8, 0), false, None);
         f.add_block_device("sda1", (8, 1), true, Some("sda"));
         f.add_dev_symlink("disk/by-id/ata-WDC_WD10EZEX-00BN5A0", "../../sda");
 
         let ctx = f.ctx();
-        let res = check_boot_disk_protection_ctx("/dev/disk/by-id/ata-WDC_WD10EZEX-00BN5A0", false, &ctx);
-        assert!(res.is_err(), "Symlink resolving to root disk must be refused");
+        let res =
+            check_boot_disk_protection_ctx("/dev/disk/by-id/ata-WDC_WD10EZEX-00BN5A0", false, &ctx);
+        assert!(
+            res.is_err(),
+            "Symlink resolving to root disk must be refused"
+        );
     }
 
     #[test]
     fn test_fixture_swap_on_target() {
         let f = FixtureBuilder::new();
-        f.set_mountinfo(
-            "1 0 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n",
-        );
+        f.set_mountinfo("1 0 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n");
         f.set_swaps(
             "Filename\tType\tSize\tUsed\tPriority\n\
              /dev/sdf2\tpartition\t4194300\t0\t-2\n",
@@ -3099,7 +4583,10 @@ mod tests {
 
         let ctx = f.ctx();
         let res = check_boot_disk_protection_ctx("/dev/sdf", false, &ctx);
-        assert!(res.is_err(), "Disk hosting active swap partition must be refused");
+        assert!(
+            res.is_err(),
+            "Disk hosting active swap partition must be refused"
+        );
     }
 
     #[test]
@@ -3121,23 +4608,27 @@ mod tests {
 
         let ctx = f.ctx();
         let res = check_boot_disk_protection_ctx("/dev/sdc", false, &ctx);
-        assert!(res.is_err(), "Disk hosting filesystem with active swap file must be refused");
+        assert!(
+            res.is_err(),
+            "Disk hosting filesystem with active swap file must be refused"
+        );
     }
 
     #[test]
     fn test_fixture_btrfs_root() {
         let f = FixtureBuilder::new();
         // Btrfs root mount reports major:minor as 0:42
-        f.set_mountinfo(
-            "1 0 0:42 / / rw,relatime - btrfs /dev/sda2 rw,subvol=/root\n",
-        );
+        f.set_mountinfo("1 0 0:42 / / rw,relatime - btrfs /dev/sda2 rw,subvol=/root\n");
         f.add_block_device("sda", (8, 0), false, None);
         f.add_block_device("sda2", (8, 2), true, Some("sda"));
         f.add_btrfs_device("1111-2222-3333", "sda2");
 
         let ctx = f.ctx();
         let res = check_boot_disk_protection_ctx("/dev/sda", false, &ctx);
-        assert!(res.is_err(), "Btrfs single-device root disk must be refused");
+        assert!(
+            res.is_err(),
+            "Btrfs single-device root disk must be refused"
+        );
     }
 
     #[test]
@@ -3160,15 +4651,16 @@ mod tests {
 
         let ctx = f.ctx();
         let res_sdc = check_boot_disk_protection_ctx("/dev/sdc", false, &ctx);
-        assert!(res_sdc.is_err(), "Second device in multi-device btrfs /home must be refused");
+        assert!(
+            res_sdc.is_err(),
+            "Second device in multi-device btrfs /home must be refused"
+        );
     }
 
     #[test]
     fn test_fixture_dev_root_and_mapper_aliases() {
         let f = FixtureBuilder::new();
-        f.set_mountinfo(
-            "1 0 254:0 / / rw,relatime - ext4 /dev/root rw\n",
-        );
+        f.set_mountinfo("1 0 254:0 / / rw,relatime - ext4 /dev/root rw\n");
         f.add_block_device("sda", (8, 0), false, None);
         f.add_block_device("sda1", (8, 1), true, Some("sda"));
         f.add_block_device("dm-0", (254, 0), false, None);
@@ -3183,15 +4675,16 @@ mod tests {
     #[test]
     fn test_fixture_nvme_partition_naming() {
         let f = FixtureBuilder::new();
-        f.set_mountinfo(
-            "1 0 259:2 / / rw,relatime - ext4 /dev/nvme0n1p2 rw\n",
-        );
+        f.set_mountinfo("1 0 259:2 / / rw,relatime - ext4 /dev/nvme0n1p2 rw\n");
         f.add_block_device("nvme0n1", (259, 0), false, None);
         f.add_block_device("nvme0n1p2", (259, 2), true, Some("nvme0n1"));
 
         let ctx = f.ctx();
         let res_disk = check_boot_disk_protection_ctx("/dev/nvme0n1", false, &ctx);
-        assert!(res_disk.is_err(), "Targeting whole NVMe disk with root partition must be refused");
+        assert!(
+            res_disk.is_err(),
+            "Targeting whole NVMe disk with root partition must be refused"
+        );
     }
 
     #[test]
@@ -3217,26 +4710,33 @@ mod tests {
         let ctx = f.ctx();
         // Graph walker must terminate without infinite loop and allow unmounted/allowlisted sdg
         let res = check_boot_disk_protection_ctx("/dev/sdg", false, &ctx);
-        assert!(res.is_ok(), "Cyclic holders on unmounted data disk must terminate and be allowed");
+        assert!(
+            res.is_ok(),
+            "Cyclic holders on unmounted data disk must terminate and be allowed"
+        );
     }
 
     #[test]
     fn test_fixture_non_existent_target_real_vs_dry_run() {
         let f = FixtureBuilder::new();
-        f.set_mountinfo(
-            "1 0 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n",
-        );
+        f.set_mountinfo("1 0 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n");
         f.add_block_device("sda", (8, 0), false, None);
         f.add_block_device("sda1", (8, 1), true, Some("sda"));
 
         let ctx = f.ctx();
         // Non-existent target in real mode must fail closed (DeviceNotFound)
         let real_res = check_boot_disk_protection_ctx("/dev/nonexistent_phantom", false, &ctx);
-        assert!(real_res.is_err(), "Non-existent target must be refused in real mode");
+        assert!(
+            real_res.is_err(),
+            "Non-existent target must be refused in real mode"
+        );
 
         // Non-existent target in dry run mode should be allowed for safe smoke testing
         let dry_res = check_boot_disk_protection_ctx("/dev/nonexistent_phantom", true, &ctx);
-        assert!(dry_res.is_ok(), "Non-existent target is permitted in dry-run mode");
+        assert!(
+            dry_res.is_ok(),
+            "Non-existent target is permitted in dry-run mode"
+        );
     }
 
     #[test]
@@ -3255,20 +4755,24 @@ mod tests {
         let ctx = f.ctx();
         // Mounts under /mnt are allowlisted as unmountable, so target sdb is ALLOWED
         let res = check_boot_disk_protection_ctx("/dev/sdb", false, &ctx);
-        assert!(res.is_ok(), "Partition mounted under /mnt is allowlisted as unmountable: target must be allowed");
+        assert!(
+            res.is_ok(),
+            "Partition mounted under /mnt is allowlisted as unmountable: target must be allowed"
+        );
     }
 
     #[test]
     fn test_fixture_container_overlayfs_root_refuses() {
         let f = FixtureBuilder::new();
-        f.set_mountinfo(
-            "1 0 0:30 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker\n",
-        );
+        f.set_mountinfo("1 0 0:30 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/docker\n");
         f.add_block_device("sda", (8, 0), false, None);
 
         let ctx = f.ctx();
         let res = check_boot_disk_protection_ctx("/dev/sda", false, &ctx);
-        assert!(res.is_err(), "Container or overlayfs root must refuse execution");
+        assert!(
+            res.is_err(),
+            "Container or overlayfs root must refuse execution"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -3288,7 +4792,9 @@ mod tests {
 
         // Live: overlay root + live marker on the cmdline
         let f = FixtureBuilder::new();
-        f.set_mountinfo("1 0 0:30 / / rw,relatime - overlay overlay rw,lowerdir=/run/live/medium\n");
+        f.set_mountinfo(
+            "1 0 0:30 / / rw,relatime - overlay overlay rw,lowerdir=/run/live/medium\n",
+        );
         f.set_cmdline("boot=casper findiso=/isos/live.iso quiet\n");
         assert_eq!(
             detect_boot_environment_ctx(&f.ctx()).unwrap(),
@@ -3360,13 +4866,23 @@ mod tests {
 
         let ctx = f.ctx();
         let internal = check_boot_disk_protection_ctx("/dev/sda", false, &ctx);
-        assert!(internal.is_ok(), "Live mode: unmounted internal disk must be allowed, got {:?}", internal);
+        assert!(
+            internal.is_ok(),
+            "Live mode: unmounted internal disk must be allowed, got {:?}",
+            internal
+        );
 
         let live_whole = check_boot_disk_protection_ctx("/dev/sdb", false, &ctx);
-        assert!(live_whole.is_err(), "Live mode: the live medium's own disk must stay refused");
+        assert!(
+            live_whole.is_err(),
+            "Live mode: the live medium's own disk must stay refused"
+        );
 
         let live_part = check_boot_disk_protection_ctx("/dev/sdb1", false, &ctx);
-        assert!(live_part.is_err(), "Live mode: partitions of the live medium must stay refused");
+        assert!(
+            live_part.is_err(),
+            "Live mode: partitions of the live medium must stay refused"
+        );
     }
 
     #[test]
@@ -3388,7 +4904,10 @@ mod tests {
 
         let ctx = f.ctx();
         let res = check_boot_disk_protection_ctx("/dev/sda", false, &ctx);
-        assert!(res.is_err(), "Live mode: internal disk hosting active swap must stay refused");
+        assert!(
+            res.is_err(),
+            "Live mode: internal disk hosting active swap must stay refused"
+        );
     }
 
     #[test]
@@ -3409,21 +4928,25 @@ mod tests {
         let ctx = f.ctx();
         // A mounted internal partition's disk is in use: whole-disk stays refused.
         let res = check_boot_disk_protection_ctx("/dev/sda", false, &ctx);
-        assert!(res.is_err(), "Live mode: disk with a mounted partition must stay refused");
+        assert!(
+            res.is_err(),
+            "Live mode: disk with a mounted partition must stay refused"
+        );
     }
 
     #[test]
     fn test_fixture_missing_root_refuses() {
         let f = FixtureBuilder::new();
-        f.set_mountinfo(
-            "1 0 8:17 /mnt/data /mnt/data rw,relatime - ext4 /dev/sdb1 rw\n",
-        );
+        f.set_mountinfo("1 0 8:17 /mnt/data /mnt/data rw,relatime - ext4 /dev/sdb1 rw\n");
         f.add_block_device("sdb", (8, 16), false, None);
         f.add_block_device("sdb1", (8, 17), true, Some("sdb"));
 
         let ctx = f.ctx();
         let res = check_boot_disk_protection_ctx("/dev/sdb", false, &ctx);
-        assert!(res.is_err(), "Missing '/' root in mountinfo must refuse execution");
+        assert!(
+            res.is_err(),
+            "Missing '/' root in mountinfo must refuse execution"
+        );
     }
 
     #[test]
@@ -3454,14 +4977,20 @@ mod tests {
 
         let ctx = f.ctx();
         let res = check_boot_disk_protection_ctx("/dev/sdg", false, &ctx);
-        assert!(res.is_ok(), "Unrelated data disk with /media mount must be allowed");
+        assert!(
+            res.is_ok(),
+            "Unrelated data disk with /media mount must be allowed"
+        );
     }
 
     #[test]
     fn test_confirmation_mismatch() {
         let result = verify_confirmation("wrong_token", "CORRECT_SERIAL");
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ExecuteError::ConfirmationMismatch));
+        assert!(matches!(
+            result.unwrap_err(),
+            ExecuteError::ConfirmationMismatch
+        ));
     }
 
     #[test]
@@ -3563,7 +5092,13 @@ mod tests {
     fn test_build_discard_chunks_single_command_when_max_zero() {
         let chunks = build_discard_chunks(0, 1024 * 1024, 512, 0).unwrap();
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0], DiscardChunk { start: 0, len: 1024 * 1024 });
+        assert_eq!(
+            chunks[0],
+            DiscardChunk {
+                start: 0,
+                len: 1024 * 1024
+            }
+        );
     }
 
     #[test]
@@ -3606,7 +5141,10 @@ mod tests {
             .write(true)
             .open(tmp.path())
             .unwrap();
-        let chunk = DiscardChunk { start: 0, len: 4096 };
+        let chunk = DiscardChunk {
+            start: 0,
+            len: 4096,
+        };
         let res = issue_discard_chunk(file.as_raw_fd(), tmp.path().to_str().unwrap(), chunk);
         match res {
             Err(ExecuteError::UnsupportedOperation(msg)) => {
@@ -3690,9 +5228,10 @@ mod tests {
         };
 
         let (tx, _rx) = mpsc::channel(64);
-        let report = discard_erase_partition_ctx("/dev/sdb1", "SER1", "SER1", &params, true, tx, &ctx)
-            .await
-            .expect("dry-run partition discard should succeed");
+        let report =
+            discard_erase_partition_ctx("/dev/sdb1", "SER1", "SER1", &params, true, tx, &ctx)
+                .await
+                .expect("dry-run partition discard should succeed");
 
         assert!(report.success);
         assert!(report.dry_run);
@@ -3709,8 +5248,7 @@ mod tests {
         );
         assert_eq!(log.len(), 2, "dry run logs exactly guard + plan: {:?}", log);
         assert!(
-            log[1].contains("[DRY RUN] BLKDISCARD plan")
-                && log[1].contains("104857600 bytes"),
+            log[1].contains("[DRY RUN] BLKDISCARD plan") && log[1].contains("104857600 bytes"),
             "plan must cover the full 100 MiB partition range: {:?}",
             log[1]
         );
@@ -3733,16 +5271,21 @@ mod tests {
             expected_start_sector: 2048,
             expected_size_sectors: 204800,
             expected_partuuid: None,
-            expected_table_fingerprint: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+            expected_table_fingerprint:
+                "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         };
 
         let (tx, _rx) = mpsc::channel(64);
-        let res = discard_erase_partition_ctx("/dev/sdb1", "SER1", "SER1", &params, true, tx, &ctx).await;
+        let res =
+            discard_erase_partition_ctx("/dev/sdb1", "SER1", "SER1", &params, true, tx, &ctx).await;
         match res {
             Err(ExecuteError::IdentityMismatch(msg)) => {
                 assert!(msg.contains("Partition table changed"), "got: {}", msg);
             }
-            other => panic!("Expected IdentityMismatch on fingerprint mismatch, got {:?}", other),
+            other => panic!(
+                "Expected IdentityMismatch on fingerprint mismatch, got {:?}",
+                other
+            ),
         }
     }
 }

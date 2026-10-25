@@ -138,6 +138,64 @@ class RealVerificationReport {
   }
 }
 
+/// Phase F: parsed `FORMAT_REPORT:` produced by `zt_engine format`.
+class RealFormatReport {
+  final bool success;
+  final String tool;
+  final String fsType;
+  final String label;
+  final String time;
+  final bool sanitizationVerifiedBeforeFormat;
+  final String scope;
+  final bool partitionTableCreated;
+  final String? partitionTableType;
+  final List<String> commandLog;
+  final String stdout;
+  final String stderr;
+  final int exitCode;
+  final int durationMs;
+  final bool dryRun;
+
+  const RealFormatReport({
+    required this.success,
+    required this.tool,
+    required this.fsType,
+    required this.label,
+    required this.time,
+    required this.sanitizationVerifiedBeforeFormat,
+    required this.scope,
+    this.partitionTableCreated = false,
+    this.partitionTableType,
+    this.commandLog = const [],
+    this.stdout = '',
+    this.stderr = '',
+    this.exitCode = 0,
+    this.durationMs = 0,
+    this.dryRun = false,
+  });
+
+  factory RealFormatReport.fromJson(Map<String, dynamic> json) {
+    return RealFormatReport(
+      success: json['success'] as bool? ?? false,
+      tool: json['tool'] as String? ?? '',
+      fsType: json['fs_type'] as String? ?? '',
+      label: json['label'] as String? ?? '',
+      time: json['time'] as String? ?? '',
+      sanitizationVerifiedBeforeFormat:
+          json['sanitization_verified_before_format'] as bool? ?? false,
+      scope: json['scope'] as String? ?? 'full',
+      partitionTableCreated: json['partition_table_created'] as bool? ?? false,
+      partitionTableType: json['partition_table_type'] as String?,
+      commandLog: List<String>.from(json['command_log'] ?? const []),
+      stdout: json['stdout'] as String? ?? '',
+      stderr: json['stderr'] as String? ?? '',
+      exitCode: json['exit_code'] as int? ?? 0,
+      durationMs: (json['duration_ms'] as num? ?? 0).toInt(),
+      dryRun: json['dry_run'] as bool? ?? false,
+    );
+  }
+}
+
 class RealSanitizationService {
   RealSanitizationService({required this.paths});
 
@@ -234,8 +292,8 @@ class RealSanitizationService {
     final String devPath = targetPartition != null
         ? targetPartition.devicePath
         : (device.id.startsWith('real_')
-            ? '/dev/${device.id.substring(5)}'
-            : '/dev/null'); // safe fallback for simulator/dry run
+              ? '/dev/${device.id.substring(5)}'
+              : '/dev/null'); // safe fallback for simulator/dry run
 
     final List<String> args = [
       'sanitize',
@@ -253,7 +311,8 @@ class RealSanitizationService {
       args.add(psid);
     }
 
-    final fingerprint = device.partitionTableFingerprint ??
+    final fingerprint =
+        device.partitionTableFingerprint ??
         PartitionTableService.computeFingerprint(device.partitions);
     final bool hasFingerprint = fingerprint.isNotEmpty;
 
@@ -271,7 +330,8 @@ class RealSanitizationService {
       if (hasFingerprint) {
         args.addAll(['--expected-table-fingerprint', fingerprint]);
       }
-      if (targetPartition.partUuid != null && targetPartition.partUuid!.isNotEmpty) {
+      if (targetPartition.partUuid != null &&
+          targetPartition.partUuid!.isNotEmpty) {
         args.addAll(['--expected-partuuid', targetPartition.partUuid!]);
       }
     } else if (hasFingerprint) {
@@ -365,7 +425,9 @@ class RealSanitizationService {
         methodUsed: mapMethodToCliArg(method, device),
         commandLog: ['$binary ${args.join(' ')}'],
         stdout: '',
-        stderr: rawStderr.isNotEmpty ? rawStderr : 'Process exited with code $exitCode',
+        stderr: rawStderr.isNotEmpty
+            ? rawStderr
+            : 'Process exited with code $exitCode',
         exitCode: exitCode,
         durationMs: 0,
         dryRun: dryRun,
@@ -377,6 +439,147 @@ class RealSanitizationService {
     }
   }
 
+  /// Builds the exact `zt_engine format ...` argument vector (Phase F).
+  ///
+  /// A verified-wipe receipt is always passed so the engine can prove, in a
+  /// separate process, that this exact target was wiped and verified
+  /// immediately before formatting. Partition scope always uses the
+  /// partition node and the guard expectations; whole-device scope requires
+  /// an explicit new table type (`gpt`/`mbr`) with one spanning partition.
+  List<String> buildFormatArgs({
+    required DeviceProfile device,
+    required String fsType,
+    required String label,
+    required String confirmationToken,
+    required String deviceSerial,
+    PartitionInfo? targetPartition,
+    String? tableType,
+    String? verifiedReceiptPath,
+    bool dryRun = false,
+  }) {
+    final String devPath = targetPartition != null
+        ? targetPartition.devicePath
+        : (device.id.startsWith('real_')
+              ? '/dev/${device.id.substring(5)}'
+              : '/dev/null');
+
+    final List<String> args = [
+      'format',
+      devPath,
+      fsType,
+      label,
+      confirmationToken,
+      deviceSerial,
+    ];
+
+    if (targetPartition != null) {
+      final fingerprint =
+          device.partitionTableFingerprint ??
+          PartitionTableService.computeFingerprint(device.partitions);
+      args.addAll([
+        '--mode',
+        'partition',
+        '--expected-part-num',
+        targetPartition.partitionNumber.toString(),
+        '--expected-start-sector',
+        targetPartition.startSector.toString(),
+        '--expected-size-sectors',
+        targetPartition.sizeSectors.toString(),
+        '--expected-table-fingerprint',
+        fingerprint,
+      ]);
+      if (targetPartition.partUuid != null &&
+          targetPartition.partUuid!.isNotEmpty) {
+        args.addAll(['--expected-partuuid', targetPartition.partUuid!]);
+      }
+    } else {
+      if (tableType == null || tableType.isEmpty) {
+        throw ArgumentError(
+          'Whole-device format requires a partition table type (gpt/mbr)',
+        );
+      }
+      args.addAll(['--table', tableType]);
+    }
+
+    if (verifiedReceiptPath != null && verifiedReceiptPath.isNotEmpty) {
+      args.addAll(['--verified-receipt', verifiedReceiptPath]);
+    }
+    if (dryRun) {
+      args.add('--dry-run');
+    }
+    return args;
+  }
+
+  /// Runs the optional post-wipe filesystem recreation step. The wipe result
+  /// is never affected: a format failure is reported, not merged into the
+  /// sanitization verdict.
+  Future<RealFormatReport> executeFormat({
+    required DeviceProfile device,
+    required String fsType,
+    required String label,
+    required String confirmationToken,
+    required String deviceSerial,
+    PartitionInfo? targetPartition,
+    String? tableType,
+    String? verifiedReceiptPath,
+    bool dryRun = false,
+  }) async {
+    final binary = await getBinaryPath();
+    final args = buildFormatArgs(
+      device: device,
+      fsType: fsType,
+      label: label,
+      confirmationToken: confirmationToken,
+      deviceSerial: deviceSerial,
+      targetPartition: targetPartition,
+      tableType: tableType,
+      verifiedReceiptPath: verifiedReceiptPath,
+      dryRun: dryRun,
+    );
+
+    final result = await Process.run(
+      binary,
+      args,
+      environment: {
+        if (verifiedReceiptPath != null && verifiedReceiptPath.isNotEmpty)
+          'ZT_VERIFIED_WIPE_RECEIPT': verifiedReceiptPath,
+        'ZT_CHECKPOINT_DIR': paths.checkpointDir.path,
+      },
+    );
+
+    final stdout = result.stdout as String? ?? '';
+    final stderr = result.stderr as String? ?? '';
+    for (final line in stdout.split('\n')) {
+      if (line.startsWith('FORMAT_REPORT:')) {
+        try {
+          final parsed = jsonDecode(line.substring('FORMAT_REPORT:'.length));
+          if (parsed is Map) {
+            return RealFormatReport.fromJson(Map<String, dynamic>.from(parsed));
+          }
+        } catch (_) {}
+      }
+    }
+
+    return RealFormatReport(
+      success: result.exitCode == 0,
+      tool: '',
+      fsType: fsType,
+      label: label,
+      time: DateTime.now().toIso8601String(),
+      sanitizationVerifiedBeforeFormat: false,
+      scope: targetPartition == null ? 'full' : 'partial',
+      partitionTableCreated: targetPartition == null && tableType != null,
+      partitionTableType: targetPartition == null ? tableType : null,
+      commandLog: ['$binary ${args.join(' ')}'],
+      stdout: stdout,
+      stderr: stderr.isNotEmpty
+          ? stderr
+          : 'format process exited with code ${result.exitCode}',
+      exitCode: result.exitCode,
+      dryRun: dryRun,
+    );
+  }
+
   /// Run post-erase verification LBA sampling on physical device.
   Future<RealVerificationReport> executeVerification({
     required DeviceProfile device,
@@ -385,13 +588,17 @@ class RealSanitizationService {
     PartitionInfo? targetPartition,
     int sampleCount = 50,
     bool expectZeros = true,
+    // Phase F: when set, the engine writes a one-shot "wiped and verified"
+    // receipt for the separate format process. Never set outside the app's
+    // post-wipe flow.
+    String? verifiedReceiptPath,
   }) async {
     final binary = await getBinaryPath();
     final String devPath = targetPartition != null
         ? targetPartition.devicePath
-        : (device.id.startsWith('real_') 
-            ? '/dev/${device.id.substring(5)}' 
-            : '/dev/null');
+        : (device.id.startsWith('real_')
+              ? '/dev/${device.id.substring(5)}'
+              : '/dev/null');
     final String targetSize = targetPartition != null
         ? targetPartition.sizeBytes.toString()
         : device.capacityBytes.toString();
@@ -410,7 +617,15 @@ class RealSanitizationService {
       args.addAll(['--total-device-size', device.capacityBytes.toString()]);
     }
 
-    final result = await Process.run(binary, args);
+    final result = await Process.run(
+      binary,
+      args,
+      environment: {
+        if (verifiedReceiptPath != null && verifiedReceiptPath.isNotEmpty)
+          'ZT_VERIFIED_WIPE_RECEIPT': verifiedReceiptPath,
+        'ZT_CHECKPOINT_DIR': paths.checkpointDir.path,
+      },
+    );
 
     if (result.exitCode == 0 && result.stdout != null) {
       final lines = (result.stdout as String).split('\n');

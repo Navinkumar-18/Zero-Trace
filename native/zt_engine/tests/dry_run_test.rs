@@ -15,20 +15,27 @@ async fn test_nvme_sanitize_dry_run_logs_commands() {
     let (tx, mut rx) = mpsc::channel::<ProgressEvent>(32);
 
     let result = nvme_sanitize(
-        "/dev/nvme99n1",       // non-existent device
+        "/dev/nvme99n1", // non-existent device
         SanitizeAction::BlockErase,
-        "TEST_SERIAL",         // confirmation token
-        "TEST_SERIAL",         // device serial (matches)
-        true,                  // dry_run
+        "TEST_SERIAL", // confirmation token
+        "TEST_SERIAL", // device serial (matches)
+        true,          // dry_run
         tx,
-    ).await;
+    )
+    .await;
 
     let report = result.expect("Dry run should not fail");
     assert!(report.success);
     assert!(report.dry_run);
     assert!(!report.command_log.is_empty());
-    assert!(report.command_log.iter().any(|c| c.contains("nvme sanitize")));
-    assert!(report.command_log.iter().any(|c| c.contains("start-block-erase")));
+    assert!(report
+        .command_log
+        .iter()
+        .any(|c| c.contains("nvme sanitize")));
+    assert!(report
+        .command_log
+        .iter()
+        .any(|c| c.contains("start-block-erase")));
 
     // Verify progress events were sent
     let mut events = Vec::new();
@@ -36,8 +43,12 @@ async fn test_nvme_sanitize_dry_run_logs_commands() {
         events.push(evt);
     }
     assert!(!events.is_empty(), "Should have received progress events");
-    assert!(events.iter().any(|e| e.phase == ExecutionPhase::FirmwareCommand));
-    assert!(events.iter().any(|e| e.phase == ExecutionPhase::Verification));
+    assert!(events
+        .iter()
+        .any(|e| e.phase == ExecutionPhase::FirmwareCommand));
+    assert!(events
+        .iter()
+        .any(|e| e.phase == ExecutionPhase::Verification));
 }
 
 #[tokio::test]
@@ -51,11 +62,15 @@ async fn test_nvme_sanitize_crypto_erase_dry_run() {
         "SERIAL_ABC",
         true,
         tx,
-    ).await;
+    )
+    .await;
 
     let report = result.unwrap();
     assert!(report.success);
-    assert!(report.command_log.iter().any(|c| c.contains("start-crypto-erase")));
+    assert!(report
+        .command_log
+        .iter()
+        .any(|c| c.contains("start-crypto-erase")));
 }
 
 #[tokio::test]
@@ -63,29 +78,37 @@ async fn test_ata_secure_erase_dry_run_logs_hdparm_commands() {
     let (tx, mut rx) = mpsc::channel::<ProgressEvent>(32);
 
     let result = ata_secure_erase(
-        "/dev/sdb",
-        false,                 // not enhanced
-        "SER123",
-        "SER123",
-        true,
-        tx,
-    ).await;
+        "/dev/sdb", false, // not enhanced
+        "SER123", "SER123", true, tx,
+    )
+    .await;
 
     let report = result.unwrap();
     assert!(report.success);
     assert!(report.dry_run);
     // Should log hdparm -I, --security-set-pass, --security-erase
     assert!(report.command_log.iter().any(|c| c.contains("hdparm -I")));
-    assert!(report.command_log.iter().any(|c| c.contains("--security-set-pass")));
-    assert!(report.command_log.iter().any(|c| c.contains("--security-erase")));
+    assert!(report
+        .command_log
+        .iter()
+        .any(|c| c.contains("--security-set-pass")));
+    assert!(report
+        .command_log
+        .iter()
+        .any(|c| c.contains("--security-erase")));
     // Should NOT contain --security-erase-enhanced
-    assert!(!report.command_log.iter().any(|c| c.contains("--security-erase-enhanced")));
+    assert!(!report
+        .command_log
+        .iter()
+        .any(|c| c.contains("--security-erase-enhanced")));
 
     let mut events = Vec::new();
     while let Ok(evt) = rx.try_recv() {
         events.push(evt);
     }
-    assert!(events.iter().any(|e| e.phase == ExecutionPhase::SecurityUnlock));
+    assert!(events
+        .iter()
+        .any(|e| e.phase == ExecutionPhase::SecurityUnlock));
 }
 
 #[tokio::test]
@@ -93,16 +116,16 @@ async fn test_ata_secure_erase_enhanced_dry_run() {
     let (tx, _rx) = mpsc::channel::<ProgressEvent>(32);
 
     let result = ata_secure_erase(
-        "/dev/sdb",
-        true,                  // enhanced
-        "SER456",
-        "SER456",
-        true,
-        tx,
-    ).await;
+        "/dev/sdb", true, // enhanced
+        "SER456", "SER456", true, tx,
+    )
+    .await;
 
     let report = result.unwrap();
-    assert!(report.command_log.iter().any(|c| c.contains("--security-erase-enhanced")));
+    assert!(report
+        .command_log
+        .iter()
+        .any(|c| c.contains("--security-erase-enhanced")));
 }
 
 #[tokio::test]
@@ -116,11 +139,15 @@ async fn test_ata_sanitize_block_erase_dry_run() {
         "SER789",
         true,
         tx,
-    ).await;
+    )
+    .await;
 
     let report = result.unwrap();
     assert!(report.success);
-    assert!(report.command_log.iter().any(|c| c.contains("--sanitize-block-erase")));
+    assert!(report
+        .command_log
+        .iter()
+        .any(|c| c.contains("--sanitize-block-erase")));
 }
 
 #[tokio::test]
@@ -134,10 +161,14 @@ async fn test_ata_sanitize_crypto_scramble_dry_run() {
         "SER789",
         true,
         tx,
-    ).await;
+    )
+    .await;
 
     let report = result.unwrap();
-    assert!(report.command_log.iter().any(|c| c.contains("--sanitize-crypto-scramble")));
+    assert!(report
+        .command_log
+        .iter()
+        .any(|c| c.contains("--sanitize-crypto-scramble")));
 }
 
 #[tokio::test]
@@ -145,18 +176,18 @@ async fn test_opal_revert_dry_run() {
     let (tx, _rx) = mpsc::channel::<ProgressEvent>(32);
 
     let result = opal_revert(
-        "/dev/sdb",
-        None,                  // no PSID
-        "SER_OPAL",
-        "SER_OPAL",
-        true,
-        tx,
-    ).await;
+        "/dev/sdb", None, // no PSID
+        "SER_OPAL", "SER_OPAL", true, tx,
+    )
+    .await;
 
     let report = result.unwrap();
     assert!(report.success);
     assert!(report.command_log.iter().any(|c| c.contains("sedutil-cli")));
-    assert!(report.command_log.iter().any(|c| c.contains("--revertTPer")));
+    assert!(report
+        .command_log
+        .iter()
+        .any(|c| c.contains("--revertTPer")));
 }
 
 #[tokio::test]
@@ -170,7 +201,8 @@ async fn test_opal_revert_with_psid_dry_run() {
         "SER_OPAL2",
         true,
         tx,
-    ).await;
+    )
+    .await;
 
     let report = result.unwrap();
     assert!(report.command_log.iter().any(|c| c.contains("PSID")));
@@ -180,17 +212,14 @@ async fn test_opal_revert_with_psid_dry_run() {
 async fn test_emmc_sanitize_dry_run() {
     let (tx, _rx) = mpsc::channel::<ProgressEvent>(32);
 
-    let result = emmc_sanitize(
-        "/dev/mmcblk99",
-        "EMMC_SER",
-        "EMMC_SER",
-        true,
-        tx,
-    ).await;
+    let result = emmc_sanitize("/dev/mmcblk99", "EMMC_SER", "EMMC_SER", true, tx).await;
 
     let report = result.unwrap();
     assert!(report.success);
-    assert!(report.command_log.iter().any(|c| c.contains("mmc sanitize")));
+    assert!(report
+        .command_log
+        .iter()
+        .any(|c| c.contains("mmc sanitize")));
 }
 
 #[tokio::test]
@@ -205,14 +234,21 @@ async fn test_software_overwrite_zeros_dry_run() {
         "OVER_SER",
         true,
         tx,
-    ).await;
+    )
+    .await;
 
     let report = result.unwrap();
     assert!(report.success);
     assert!(report.dry_run);
-    assert!(report.command_log.iter().any(|c| c.contains("Native block overwrite")));
+    assert!(report
+        .command_log
+        .iter()
+        .any(|c| c.contains("Native block overwrite")));
     // Item 2 test: Prove dry run performs no unmount and never opens the target for writing
-    assert!(!report.command_log.iter().any(|c| c.to_lowercase().contains("umount")));
+    assert!(!report
+        .command_log
+        .iter()
+        .any(|c| c.to_lowercase().contains("umount")));
     assert_eq!(report.bytes_written, 0);
     assert_eq!(report.io_mode, "dry_run");
 
@@ -229,19 +265,23 @@ async fn test_software_overwrite_multi_pass_3_dry_run() {
 
     let result = software_overwrite(
         "/dev/sdb",
-        1,                     // ignored for MultiPass3
+        1, // ignored for MultiPass3
         OverwritePattern::MultiPass3,
         "NIST_SER",
         "NIST_SER",
         true,
         tx,
-    ).await;
+    )
+    .await;
 
     let report = result.unwrap();
     assert!(report.success);
     assert!(report.dry_run);
     assert!(report.command_log.iter().any(|c| c.contains("3 passes")));
-    assert!(!report.command_log.iter().any(|c| c.to_lowercase().contains("umount")));
+    assert!(!report
+        .command_log
+        .iter()
+        .any(|c| c.to_lowercase().contains("umount")));
     assert_eq!(report.bytes_written, 0);
 }
 
@@ -253,7 +293,8 @@ async fn test_software_overwrite_multi_pass_3_dry_run() {
 async fn test_boot_disk_protection_blocks_root_device() {
     // Read /proc/mounts to find the actual root device
     let mounts = std::fs::read_to_string("/proc/mounts").unwrap_or_default();
-    let root_device = mounts.lines()
+    let root_device = mounts
+        .lines()
         .find(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
             parts.len() >= 2 && parts[1] == "/"
@@ -279,11 +320,16 @@ async fn test_boot_disk_protection_blocks_root_device() {
         SanitizeAction::BlockErase,
         "any_token",
         "any_token",
-        true,                  // even in dry-run, boot protection should fire
+        true, // even in dry-run, boot protection should fire
         tx.clone(),
-    ).await;
+    )
+    .await;
 
-    assert!(result.is_err(), "Boot disk protection should block root base disk: {}", base);
+    assert!(
+        result.is_err(),
+        "Boot disk protection should block root base disk: {}",
+        base
+    );
 
     // Also test root partition itself
     let part_result = nvme_sanitize(
@@ -293,9 +339,14 @@ async fn test_boot_disk_protection_blocks_root_device() {
         "any_token",
         true,
         tx,
-    ).await;
+    )
+    .await;
 
-    assert!(part_result.is_err(), "Boot disk protection should block root partition: {}", root_device);
+    assert!(
+        part_result.is_err(),
+        "Boot disk protection should block root partition: {}",
+        root_device
+    );
 }
 
 // =========================================================================
@@ -313,7 +364,8 @@ async fn test_confirmation_mismatch_blocks_execution() {
         "CORRECT_SERIAL",
         true,
         tx,
-    ).await;
+    )
+    .await;
 
     assert!(result.is_err());
 }
@@ -322,14 +374,7 @@ async fn test_confirmation_mismatch_blocks_execution() {
 async fn test_confirmation_mismatch_on_ata_erase() {
     let (tx, _rx) = mpsc::channel::<ProgressEvent>(16);
 
-    let result = ata_secure_erase(
-        "/dev/sdb",
-        false,
-        "MISMATCH",
-        "REAL_SERIAL",
-        true,
-        tx,
-    ).await;
+    let result = ata_secure_erase("/dev/sdb", false, "MISMATCH", "REAL_SERIAL", true, tx).await;
 
     assert!(result.is_err());
 }
@@ -346,7 +391,8 @@ async fn test_confirmation_mismatch_on_software_overwrite() {
         "RIGHT",
         true,
         tx,
-    ).await;
+    )
+    .await;
 
     assert!(result.is_err());
 }
@@ -359,14 +405,7 @@ async fn test_confirmation_mismatch_on_software_overwrite() {
 async fn test_progress_events_cover_all_phases() {
     let (tx, mut rx) = mpsc::channel::<ProgressEvent>(64);
 
-    let _ = ata_secure_erase(
-        "/dev/sdb",
-        false,
-        "PHASE_SER",
-        "PHASE_SER",
-        true,
-        tx,
-    ).await;
+    let _ = ata_secure_erase("/dev/sdb", false, "PHASE_SER", "PHASE_SER", true, tx).await;
 
     let mut events = Vec::new();
     while let Ok(evt) = rx.try_recv() {
@@ -374,11 +413,26 @@ async fn test_progress_events_cover_all_phases() {
     }
 
     let phases: Vec<&ExecutionPhase> = events.iter().map(|e| &e.phase).collect();
-    assert!(phases.contains(&&ExecutionPhase::SecurityUnlock), "Missing SecurityUnlock phase");
-    assert!(phases.contains(&&ExecutionPhase::FirmwareCommand), "Missing FirmwareCommand phase");
-    assert!(phases.contains(&&ExecutionPhase::KeyDestruction), "Missing KeyDestruction phase");
-    assert!(phases.contains(&&ExecutionPhase::CacheFlush), "Missing CacheFlush phase");
-    assert!(phases.contains(&&ExecutionPhase::Verification), "Missing Verification phase");
+    assert!(
+        phases.contains(&&ExecutionPhase::SecurityUnlock),
+        "Missing SecurityUnlock phase"
+    );
+    assert!(
+        phases.contains(&&ExecutionPhase::FirmwareCommand),
+        "Missing FirmwareCommand phase"
+    );
+    assert!(
+        phases.contains(&&ExecutionPhase::KeyDestruction),
+        "Missing KeyDestruction phase"
+    );
+    assert!(
+        phases.contains(&&ExecutionPhase::CacheFlush),
+        "Missing CacheFlush phase"
+    );
+    assert!(
+        phases.contains(&&ExecutionPhase::Verification),
+        "Missing Verification phase"
+    );
 }
 
 #[tokio::test]
@@ -392,7 +446,8 @@ async fn test_progress_percentages_are_monotonically_increasing() {
         "MONO_SER",
         true,
         tx,
-    ).await;
+    )
+    .await;
 
     let mut events = Vec::new();
     while let Ok(evt) = rx.try_recv() {

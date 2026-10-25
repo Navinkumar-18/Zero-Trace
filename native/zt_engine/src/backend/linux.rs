@@ -8,24 +8,29 @@
 
 use std::fs;
 use std::io;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::backend::{
-    BackendCapabilities, BackendError, BlockBackend, DeviceInfo, ExclusiveHandle,
-    HandleReader, MountState, PartitionFacts, Relation, StatFact,
+    BackendCapabilities, BackendError, BlockBackend, DeviceInfo, ExclusiveHandle, HandleReader,
+    MountState, PartitionFacts, Relation, StatFact,
 };
 use crate::execute::{
     canonicalize_device_path, detect_boot_environment_ctx, map_open_excl_error,
     recheck_protection_by_dev_t, FsContext,
 };
 use crate::guard::ValidatedTarget;
-use crate::types::{dev_major, dev_minor, BlockWriter, BootEnvironment, ExecuteError, GuardIdentity};
+use crate::types::{
+    dev_major, dev_minor, BlockWriter, BootEnvironment, ExecuteError, GuardIdentity,
+};
 
 /// BLKDISCARD ioctl number (`_IO(0x12, 119)`).
 const BLKDISCARD: libc::c_ulong = 0x1277;
+
+/// BLKRRPART ioctl number (`_IO(0x12, 95)`) — re-read the partition table.
+const BLKRRPART: libc::c_ulong = 0x125f;
 
 /// Read side of an exclusive handle: a plain read-only fd, `pread`-based.
 struct StdFileReader {
@@ -130,8 +135,9 @@ impl BlockBackend for LinuxBackend {
             let alt = self.ctx.proc_root.join("mountinfo");
             let alt_mounts = self.ctx.proc_root.join("mounts");
             if alt.exists() {
-                fs::read_to_string(&alt)
-                    .map_err(|e| BackendError::Unavailable(format!("Cannot read mountinfo: {}", e)))?
+                fs::read_to_string(&alt).map_err(|e| {
+                    BackendError::Unavailable(format!("Cannot read mountinfo: {}", e))
+                })?
             } else if alt_mounts.exists() {
                 fs::read_to_string(&alt_mounts)
                     .map_err(|e| BackendError::Unavailable(format!("Cannot read mounts: {}", e)))?
@@ -147,14 +153,20 @@ impl BlockBackend for LinuxBackend {
             Ok(s) => s,
             Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
             Err(e) => {
-                return Err(BackendError::Unavailable(format!("Cannot read swaps: {}", e)))
+                return Err(BackendError::Unavailable(format!(
+                    "Cannot read swaps: {}",
+                    e
+                )))
             }
         };
         let mounts = match fs::read_to_string(self.ctx.proc_root.join("mounts")) {
             Ok(s) => s,
             Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
             Err(e) => {
-                return Err(BackendError::Unavailable(format!("Cannot read mounts: {}", e)))
+                return Err(BackendError::Unavailable(format!(
+                    "Cannot read mounts: {}",
+                    e
+                )))
             }
         };
         Ok(MountState {
@@ -222,7 +234,11 @@ impl BlockBackend for LinuxBackend {
         Some(parent)
     }
 
-    fn sysfs_related_names(&self, name: &str, relation: Relation) -> Result<Vec<String>, BackendError> {
+    fn sysfs_related_names(
+        &self,
+        name: &str,
+        relation: Relation,
+    ) -> Result<Vec<String>, BackendError> {
         let rel = match relation {
             Relation::Holders => "holders",
             Relation::Slaves => "slaves",
@@ -405,8 +421,8 @@ impl BlockBackend for LinuxBackend {
         // C2a: the historic typed error is carried verbatim through
         // BackendError::OpenFailed so execution flows see exactly the same
         // ExecuteError they saw when opening the writer directly.
-        let writer =
-            DirectBlockWriter::open(&path, target.guard_identity()).map_err(BackendError::OpenFailed)?;
+        let writer = DirectBlockWriter::open(&path, target.guard_identity())
+            .map_err(BackendError::OpenFailed)?;
         let io_mode = writer.io_mode();
         let logical_block_size = writer.logical_block_size();
         let raw_fd = writer.raw_fd();
@@ -434,8 +450,12 @@ impl BlockBackend for LinuxBackend {
         let path = handle.path();
         let c_path = std::ffi::CString::new(path)
             .map_err(|e| BackendError::Io(format!("Invalid path: {}", e)))?;
-        let fd =
-            unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_EXCL | libc::O_CLOEXEC) };
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDONLY | libc::O_EXCL | libc::O_CLOEXEC,
+            )
+        };
         if fd < 0 {
             return Err(BackendError::Io(
                 std::io::Error::last_os_error().to_string(),
@@ -447,6 +467,48 @@ impl BlockBackend for LinuxBackend {
         unsafe { libc::close(fd) };
         if res < 0 {
             return Err(BackendError::Io(ioctl_err.to_string()));
+        }
+        Ok(())
+    }
+
+    fn reread_partition_table(&self, target: &ValidatedTarget) -> Result<(), BackendError> {
+        // Partition scope: re-read the PARENT disk (the partition node cannot
+        // be re-read). Whole-disk scope: re-read the device itself.
+        let (device, canonical) = match target.scope() {
+            crate::guard::TargetScope::Partition { parent_name, .. } => {
+                let path = format!("/dev/{}", parent_name);
+                (path.clone(), path)
+            }
+            crate::guard::TargetScope::WholeDisk => (
+                target.canonical_path().to_string(),
+                target.canonical_path().to_string(),
+            ),
+        };
+        let read_path = self.device_file_path(&device, &canonical);
+        // Fixture/temp-file targets have no kernel partition table to re-read.
+        if fs::metadata(&read_path)
+            .map(|m| !m.file_type().is_block_device())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        let c_path = std::ffi::CString::new(read_path.to_string_lossy().as_bytes())
+            .map_err(|e| BackendError::Io(format!("Invalid path: {}", e)))?;
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(BackendError::Io(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        let res = unsafe { libc::ioctl(fd, BLKRRPART, 0) };
+        let ioctl_err = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        if res < 0 {
+            return Err(BackendError::Io(format!(
+                "BLKRRPART failed for {}: {}",
+                read_path.display(),
+                ioctl_err
+            )));
         }
         Ok(())
     }
@@ -489,23 +551,14 @@ impl DirectBlockWriter {
         if fd < 0 {
             // Fallback 1: O_DSYNC
             mode = "dsync";
-            fd = unsafe {
-                libc::open(
-                    c_path.as_ptr(),
-                    libc::O_RDWR | libc::O_EXCL | libc::O_DSYNC,
-                )
-            };
+            fd =
+                unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_EXCL | libc::O_DSYNC) };
         }
 
         if fd < 0 {
             // Fallback 2: buffered + periodic fdatasync
             mode = "buffered_sync_16mb";
-            fd = unsafe {
-                libc::open(
-                    c_path.as_ptr(),
-                    libc::O_RDWR | libc::O_EXCL,
-                )
-            };
+            fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_EXCL) };
         }
 
         if fd < 0 {

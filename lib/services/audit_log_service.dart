@@ -27,22 +27,21 @@ class PartitionAuditOutcome {
   factory PartitionAuditOutcome.forPartition(
     PartitionInfo partition, {
     required bool success,
-  }) =>
-      PartitionAuditOutcome(
-        partitionNumber: partition.partitionNumber,
-        startSector: partition.startSector,
-        sizeSectors: partition.sizeSectors,
-        status: success ? 'COMPLETED' : 'FAILED',
-        bytesWiped: success ? partition.sizeBytes : 0,
-      );
+  }) => PartitionAuditOutcome(
+    partitionNumber: partition.partitionNumber,
+    startSector: partition.startSector,
+    sizeSectors: partition.sizeSectors,
+    status: success ? 'COMPLETED' : 'FAILED',
+    bytesWiped: success ? partition.sizeBytes : 0,
+  );
 
   Map<String, dynamic> toJson() => {
-        'bytesWiped': bytesWiped,
-        'partitionNumber': partitionNumber,
-        'sizeSectors': sizeSectors,
-        'startSector': startSector,
-        'status': status,
-      };
+    'bytesWiped': bytesWiped,
+    'partitionNumber': partitionNumber,
+    'sizeSectors': sizeSectors,
+    'startSector': startSector,
+    'status': status,
+  };
 
   factory PartitionAuditOutcome.fromJson(Map<String, dynamic> json) =>
       PartitionAuditOutcome(
@@ -71,13 +70,18 @@ class AuditLogEntry {
   // Enriched schema fields
   final String? deviceName;
   final String scope; // "full" or "partial" (defaults to "full")
-  final String? outcome; // completed|wipe_failed|verify_failed|interrupted|cancelled; null in legacy
+  final String?
+  outcome; // completed|wipe_failed|verify_failed|interrupted|cancelled; null in legacy
   final String? methodClass; // null in legacy
   final String? certificateId; // null in legacy
   final String? certificateSha256; // SHA-256 of certificate/report file
   final bool isSimulated;
   final bool? verificationPassed; // null in legacy
   final List<PartitionAuditOutcome>? partitions;
+
+  /// Phase F: optional separate format-step record. Absent for wipe-only
+  /// entries, so existing log entries keep their exact canonical bytes.
+  final FilesystemRecreationRecord? filesystemRecreation;
 
   // Derived (never serialized / never hashed): true when the source JSON had no
   // isSimulated field, i.e. an older unchained entry whose provenance is unknown.
@@ -109,6 +113,7 @@ class AuditLogEntry {
     this.isSimulated = false,
     this.verificationPassed,
     this.partitions,
+    this.filesystemRecreation,
     this.isLegacy = false,
     this.previousHash,
     this.entryHash,
@@ -138,9 +143,14 @@ class AuditLogEntry {
     if (methodClass != null) map['methodClass'] = methodClass;
     if (certificateId != null) map['certificateId'] = certificateId;
     if (certificateSha256 != null) map['certificateSha256'] = certificateSha256;
-    if (verificationPassed != null) map['verificationPassed'] = verificationPassed;
+    if (verificationPassed != null) {
+      map['verificationPassed'] = verificationPassed;
+    }
     if (partitions != null) {
       map['partitions'] = partitions!.map((p) => p.toJson()).toList();
+    }
+    if (filesystemRecreation != null) {
+      map['filesystemRecreation'] = filesystemRecreation!.toJson();
     }
 
     return jsonEncode(map);
@@ -169,9 +179,14 @@ class AuditLogEntry {
     if (methodClass != null) map['methodClass'] = methodClass;
     if (certificateId != null) map['certificateId'] = certificateId;
     if (certificateSha256 != null) map['certificateSha256'] = certificateSha256;
-    if (verificationPassed != null) map['verificationPassed'] = verificationPassed;
+    if (verificationPassed != null) {
+      map['verificationPassed'] = verificationPassed;
+    }
     if (partitions != null) {
       map['partitions'] = partitions!.map((p) => p.toJson()).toList();
+    }
+    if (filesystemRecreation != null) {
+      map['filesystemRecreation'] = filesystemRecreation!.toJson();
     }
     if (previousHash != null) map['previousHash'] = previousHash;
     if (entryHash != null) map['entryHash'] = entryHash;
@@ -182,8 +197,18 @@ class AuditLogEntry {
   factory AuditLogEntry.fromJson(Map<String, dynamic> json) {
     final rawParts = json['partitions'] as List<dynamic>?;
     final partitions = rawParts
-        ?.map((p) => PartitionAuditOutcome.fromJson(Map<String, dynamic>.from(p as Map)))
+        ?.map(
+          (p) => PartitionAuditOutcome.fromJson(
+            Map<String, dynamic>.from(p as Map),
+          ),
+        )
         .toList();
+    final rawFormat = json['filesystemRecreation'];
+    final filesystemRecreation = rawFormat is Map
+        ? FilesystemRecreationRecord.fromJson(
+            Map<String, dynamic>.from(rawFormat),
+          )
+        : null;
 
     return AuditLogEntry(
       timestamp: json['timestamp'] as String? ?? '',
@@ -201,12 +226,16 @@ class AuditLogEntry {
       deviceName: json['deviceName'] as String?,
       scope: json['scope'] as String? ?? 'full', // defaults to full for legacy
       outcome: json['outcome'] as String?, // null in legacy -> renders "—"
-      methodClass: json['methodClass'] as String?, // null in legacy -> renders "—"
-      certificateId: json['certificateId'] as String?, // null in legacy -> renders "—"
+      methodClass:
+          json['methodClass'] as String?, // null in legacy -> renders "—"
+      certificateId:
+          json['certificateId'] as String?, // null in legacy -> renders "—"
       certificateSha256: json['certificateSha256'] as String?,
       isSimulated: json['isSimulated'] as bool? ?? false,
-      verificationPassed: json['verificationPassed'] as bool?, // null in legacy -> renders "—"
+      verificationPassed:
+          json['verificationPassed'] as bool?, // null in legacy -> renders "—"
       partitions: partitions,
+      filesystemRecreation: filesystemRecreation,
       isLegacy: !json.containsKey('isSimulated'),
       previousHash: json['previousHash'] as String?,
       entryHash: json['entryHash'] as String?,
@@ -239,6 +268,7 @@ class AuditLogEntry {
       isSimulated: isSimulated,
       verificationPassed: verificationPassed,
       partitions: partitions,
+      filesystemRecreation: filesystemRecreation,
       isLegacy: isLegacy,
       previousHash: previousHash,
       entryHash: entryHash,
@@ -246,11 +276,7 @@ class AuditLogEntry {
   }
 }
 
-enum ChainIntegrityStatus {
-  valid,
-  validWithLegacy,
-  broken,
-}
+enum ChainIntegrityStatus { valid, validWithLegacy, broken }
 
 class ChainIntegrityResult {
   final ChainIntegrityStatus status;
@@ -337,7 +363,9 @@ class AuditLogService {
   }
 
   /// Persists failure report to reports/ directory with mode 0600 and returns (File, SHA-256).
-  Future<(File, String)> saveFailureReport(SanitizationCertificate report) async {
+  Future<(File, String)> saveFailureReport(
+    SanitizationCertificate report,
+  ) async {
     final targetPath = '${_reportsDir.path}/${report.certificateId}.json';
     final content = jsonEncode(report.toJson());
     final file = await _writeAtomic(targetPath, content);
@@ -346,17 +374,23 @@ class AuditLogService {
   }
 
   /// Loads certificate or failure report by ID from disk.
-  Future<SanitizationCertificate?> getCertificateById(String certificateId) async {
+  Future<SanitizationCertificate?> getCertificateById(
+    String certificateId,
+  ) async {
     try {
       final certFile = File('${_certificatesDir.path}/$certificateId.json');
       if (certFile.existsSync()) {
         final json = jsonDecode(certFile.readAsStringSync());
-        return SanitizationCertificate.fromJson(Map<String, dynamic>.from(json));
+        return SanitizationCertificate.fromJson(
+          Map<String, dynamic>.from(json),
+        );
       }
       final reportFile = File('${_reportsDir.path}/$certificateId.json');
       if (reportFile.existsSync()) {
         final json = jsonDecode(reportFile.readAsStringSync());
-        return SanitizationCertificate.fromJson(Map<String, dynamic>.from(json));
+        return SanitizationCertificate.fromJson(
+          Map<String, dynamic>.from(json),
+        );
       }
     } catch (_) {}
     return null;
@@ -451,7 +485,8 @@ class AuditLogService {
   /// Writes the head-anchor (last entry hash + chained entry count) atomically.
   void _writeAnchor(String entryHash, int count) {
     try {
-      final tmpPath = '${_anchorFile.path}.tmp.${DateTime.now().microsecondsSinceEpoch}';
+      final tmpPath =
+          '${_anchorFile.path}.tmp.${DateTime.now().microsecondsSinceEpoch}';
       final tmpFile = File(tmpPath);
       tmpFile.createSync();
       _chmod(tmpPath, '600');
@@ -479,15 +514,16 @@ class AuditLogService {
 
   /// Verifies integrity of the audit log hash chain in a background Isolate.
   Future<ChainIntegrityResult> verifyChainIntegrity() {
-    return Isolate.run(
-      () => _verifyChainSync(_logFile.path, _anchorFile.path),
-    );
+    return Isolate.run(() => _verifyChainSync(_logFile.path, _anchorFile.path));
   }
 
   /// Synchronous chain verification (runs inside [verifyChainIntegrity]'s Isolate).
   /// Tolerates legacy unchained lines at the head and a torn last line, and uses
   /// the head-anchor to detect tail truncation.
-  static ChainIntegrityResult _verifyChainSync(String logPath, String anchorPath) {
+  static ChainIntegrityResult _verifyChainSync(
+    String logPath,
+    String anchorPath,
+  ) {
     final file = File(logPath);
     if (!file.existsSync()) {
       return const ChainIntegrityResult(
@@ -560,7 +596,10 @@ class AuditLogService {
       }
 
       final entry = AuditLogEntry.fromJson(json);
-      final computed = calculateEntryHash(previousHash, entry.toCanonicalJson());
+      final computed = calculateEntryHash(
+        previousHash,
+        entry.toCanonicalJson(),
+      );
       if (computed != entryHash) {
         return ChainIntegrityResult(
           status: ChainIntegrityStatus.broken,
@@ -631,7 +670,9 @@ class AuditLogService {
         try {
           final parsed = jsonDecode(line);
           if (parsed is Map) {
-            final entry = AuditLogEntry.fromJson(Map<String, dynamic>.from(parsed));
+            final entry = AuditLogEntry.fromJson(
+              Map<String, dynamic>.from(parsed),
+            );
             if (!includeSimulated && entry.isSimulated) {
               continue;
             }

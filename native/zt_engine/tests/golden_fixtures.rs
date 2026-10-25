@@ -64,10 +64,20 @@ fn build_windows_gpt_image() -> Vec<u8> {
     img[592..596].copy_from_slice(&128u32.to_le_bytes());
     img[596..600].copy_from_slice(&128u32.to_le_bytes());
     let entries: [(&str, u64, u64, &str); 5] = [
-        ("c12a7328-f81f-11d2-ba4b-00a0c93ec93b", 2048, 6143, "EFI system partition"),
+        (
+            "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+            2048,
+            6143,
+            "EFI system partition",
+        ),
         ("e3c9e316-0b5c-4db8-817d-f92df00215ae", 6144, 8191, ""),
         ("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7", 8192, 10239, "Data"),
-        ("de94bba4-06d1-4d40-a16a-bfd50179d6ac", 10240, 12287, "Recovery"),
+        (
+            "de94bba4-06d1-4d40-a16a-bfd50179d6ac",
+            10240,
+            12287,
+            "Recovery",
+        ),
         ("ca7d7ccb-63ed-4c53-861c-1742536059cc", 12288, 14335, ""),
     ];
     for (i, (guid, first, last, name)) in entries.iter().enumerate() {
@@ -109,11 +119,11 @@ fn build_golden_fixture() -> GoldenFixture {
     write(&sys.join("class/block/sda/removable"), "0\n");
     write(&sys.join("class/block/sda/dev"), "8:0\n");
     let parts: [(u32, u64, u64); 5] = [
-        (1, 2048, 4096),   // EFI System
-        (2, 6144, 2048),   // MSR
-        (3, 8192, 2048),   // Basic Data (NTFS)
-        (4, 10240, 2048),  // Windows Recovery
-        (5, 12288, 2048),  // LUKS
+        (1, 2048, 4096),  // EFI System
+        (2, 6144, 2048),  // MSR
+        (3, 8192, 2048),  // Basic Data (NTFS)
+        (4, 10240, 2048), // Windows Recovery
+        (5, 12288, 2048), // LUKS
     ];
     for (n, start, size) in parts {
         let base = sys.join(format!("class/block/sda/sda{}", n));
@@ -143,7 +153,11 @@ fn build_golden_fixture() -> GoldenFixture {
     );
     GoldenFixture {
         _tmp: tmp,
-        ctx: FsContext { proc_root: proc, sys_root: sys, dev_root: dev },
+        ctx: FsContext {
+            proc_root: proc,
+            sys_root: sys,
+            dev_root: dev,
+        },
     }
 }
 
@@ -166,8 +180,12 @@ fn assert_matches_golden(name: &str, actual: &str) {
         fs::write(&path, actual).unwrap();
         return;
     }
-    let expected = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("missing golden {}: {} (run ZT_UPDATE_GOLDEN=1 once)", name, e));
+    let expected = fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "missing golden {}: {} (run ZT_UPDATE_GOLDEN=1 once)",
+            name, e
+        )
+    });
     assert_eq!(
         expected, actual,
         "protocol output changed — this is a behavior change unless explicitly intended and reviewed"
@@ -207,10 +225,17 @@ async fn golden_dry_run_execution_report_json() {
         expected_table_fingerprint: fp,
     };
     let (tx, _rx) = mpsc::channel(64);
-    let report =
-        discard_erase_partition_ctx("/dev/sda3", "GOLDEN-SERIAL", "GOLDEN-SERIAL", &params, true, tx, &f.ctx)
-            .await
-            .expect("dry-run partition discard should succeed");
+    let report = discard_erase_partition_ctx(
+        "/dev/sda3",
+        "GOLDEN-SERIAL",
+        "GOLDEN-SERIAL",
+        &params,
+        true,
+        tx,
+        &f.ctx,
+    )
+    .await
+    .expect("dry-run partition discard should succeed");
     let json = serde_json::to_string_pretty(&report).unwrap() + "\n";
     assert_matches_golden("dry_run_execution_report.json", &normalize(&json, &f));
 }

@@ -82,7 +82,10 @@ pub fn refuses_confirmation_mismatch(
 ) -> Result<(), String> {
     match guard::validate_whole_disk_target(backend, target, "NOT-THE-SERIAL", serial, false) {
         Err(ExecuteError::ConfirmationMismatch) => Ok(()),
-        other => Err(format!("expected ConfirmationMismatch, got {:?}", other.map(|_| ()))),
+        other => Err(format!(
+            "expected ConfirmationMismatch, got {:?}",
+            other.map(|_| ())
+        )),
     }
 }
 
@@ -121,10 +124,7 @@ pub fn refuses_container_environment(
 
 /// Live-boot overlay root must NOT trip the anonymous-device fail-closed
 /// rule for `/` itself (A3b live rule) — the target disk stays usable.
-pub fn live_root_stays_usable(
-    backend: &dyn BlockBackend,
-    target: &str,
-) -> Result<(), String> {
+pub fn live_root_stays_usable(backend: &dyn BlockBackend, target: &str) -> Result<(), String> {
     guard::check_boot_disk_protection(backend, target, false)
         .map(|_| ())
         .map_err(|e| format!("live root should not block target: {}", e))
@@ -146,7 +146,10 @@ pub fn fingerprint_mismatch_aborts(
 ) -> Result<(), String> {
     match guard::validate_partition_target(backend, device, params, false, SERIAL) {
         Err(ExecuteError::IdentityMismatch(msg)) if msg.contains("fingerprint") => Ok(()),
-        other => Err(format!("expected fingerprint mismatch, got {:?}", other.map(|_| ()))),
+        other => Err(format!(
+            "expected fingerprint mismatch, got {:?}",
+            other.map(|_| ())
+        )),
     }
 }
 
@@ -159,7 +162,10 @@ pub fn geometry_change_aborts(
 ) -> Result<(), String> {
     match guard::validate_partition_target(backend, device, params, false, SERIAL) {
         Err(ExecuteError::IdentityMismatch(_)) => Ok(()),
-        other => Err(format!("expected identity mismatch, got {:?}", other.map(|_| ()))),
+        other => Err(format!(
+            "expected identity mismatch, got {:?}",
+            other.map(|_| ())
+        )),
     }
 }
 
@@ -188,13 +194,23 @@ pub fn out_of_range_write_refused(
     // Crossing the end.
     match handle.write_at(hi - 4, &[0u8; 8]) {
         Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
-        other => return Err(format!("expected InvalidInput crossing end, got {:?}", other)),
+        other => {
+            return Err(format!(
+                "expected InvalidInput crossing end, got {:?}",
+                other
+            ))
+        }
     }
     // Before the start (partition table area).
     if lo >= 512 {
         match handle.write_at(lo - 512, &[0u8; 512]) {
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
-            other => return Err(format!("expected InvalidInput before start, got {:?}", other)),
+            other => {
+                return Err(format!(
+                    "expected InvalidInput before start, got {:?}",
+                    other
+                ))
+            }
         }
     }
     Ok(())
@@ -247,10 +263,7 @@ pub fn short_write_reported(
 /// A mounted holder that cannot be unmounted aborts (exec fact → shared
 /// policy). Fixture: holder registered + holder mount in mounts + exec
 /// result scripted to exit non-zero.
-pub fn busy_unmount_refused(
-    backend: &dyn BlockBackend,
-    partition_dev: &str,
-) -> Result<(), String> {
+pub fn busy_unmount_refused(backend: &dyn BlockBackend, partition_dev: &str) -> Result<(), String> {
     let mut log = Vec::new();
     match guard::unmount_target_partition_and_holders(backend, partition_dev, false, &mut log) {
         Err(ExecuteError::CommandFailed(msg)) if msg.contains("cannot be unmounted") => Ok(()),
@@ -310,7 +323,10 @@ pub fn stubs_refuse_everything(backend: &dyn BlockBackend) -> Result<(), String>
             .sysfs_related_names("sda", crate::backend::Relation::Holders)
             .unwrap_or_default()
             .is_empty()
-        || !backend.btrfs_member_devices().unwrap_or_default().is_empty()
+        || !backend
+            .btrfs_member_devices()
+            .unwrap_or_default()
+            .is_empty()
     {
         return Err("stub leaked sysfs facts".to_string());
     }
@@ -399,7 +415,11 @@ mod tests {
         let b = fixture().with_unreadable_relation("sdb", crate::backend::Relation::Holders);
         match guard::check_boot_disk_protection(&b, "/dev/sdb", false) {
             Err(ExecuteError::BootDiskProtection(msg)) => {
-                assert!(msg.contains("holders"), "message must name the unreadable dir: {}", msg)
+                assert!(
+                    msg.contains("holders"),
+                    "message must name the unreadable dir: {}",
+                    msg
+                )
             }
             other => panic!("expected BootDiskProtection, got {:?}", other.map(|_| ())),
         }
@@ -410,7 +430,11 @@ mod tests {
         let b = fixture().with_unreadable_relation("sdb", crate::backend::Relation::Slaves);
         match guard::check_boot_disk_protection(&b, "/dev/sdb", false) {
             Err(ExecuteError::BootDiskProtection(msg)) => {
-                assert!(msg.contains("slaves"), "message must name the unreadable dir: {}", msg)
+                assert!(
+                    msg.contains("slaves"),
+                    "message must name the unreadable dir: {}",
+                    msg
+                )
             }
             other => panic!("expected BootDiskProtection, got {:?}", other.map(|_| ())),
         }
@@ -423,7 +447,11 @@ mod tests {
         let b = fixture().with_unreadable_mountinfo();
         match guard::check_boot_disk_protection(&b, "/dev/sdb", false) {
             Err(ExecuteError::BootDiskProtection(msg)) => {
-                assert!(msg.contains("mountinfo"), "message must name the unreadable file: {}", msg)
+                assert!(
+                    msg.contains("mountinfo"),
+                    "message must name the unreadable file: {}",
+                    msg
+                )
             }
             other => panic!("expected BootDiskProtection, got {:?}", other.map(|_| ())),
         }
@@ -436,7 +464,11 @@ mod tests {
         let b = fixture().with_unreadable_attr("sda", "dev");
         match guard::check_boot_disk_protection(&b, "/dev/sdb", false) {
             Err(ExecuteError::BootDiskProtection(msg)) => {
-                assert!(msg.contains("unreadable"), "message must name the read failure: {}", msg)
+                assert!(
+                    msg.contains("unreadable"),
+                    "message must name the read failure: {}",
+                    msg
+                )
             }
             other => panic!("expected BootDiskProtection, got {:?}", other.map(|_| ())),
         }
@@ -447,7 +479,8 @@ mod tests {
         let b = fixture();
         let mut params = partition_params(&b, "/dev/sdb1", 1, 2048, 4096).expect("params");
         params.expected_table_fingerprint = "stale-fingerprint".to_string();
-        fingerprint_mismatch_aborts(&b, "/dev/sdb1", &params).expect("stale fingerprint must abort");
+        fingerprint_mismatch_aborts(&b, "/dev/sdb1", &params)
+            .expect("stale fingerprint must abort");
     }
 
     #[test]
@@ -465,7 +498,10 @@ mod tests {
         let params = partition_params(&b, "/dev/sdb1", 1, 2048, 4096).expect("params");
         out_of_range_write_refused(&b, "/dev/sdb1", &params).expect("bounds must hold");
         // Nothing was written: image is still all zeros.
-        assert!(b.data().iter().all(|&x| x == 0), "no bytes may reach the device");
+        assert!(
+            b.data().iter().all(|&x| x == 0),
+            "no bytes may reach the device"
+        );
     }
 
     #[test]
@@ -473,7 +509,10 @@ mod tests {
         let b = fixture().with_write_fault(WriteFault::Error);
         let params = partition_params(&b, "/dev/sdb1", 1, 2048, 4096).expect("params");
         write_fault_propagates(&b, "/dev/sdb1", &params).expect("write error must surface");
-        assert!(b.data().iter().all(|&x| x == 0), "failed write must not persist");
+        assert!(
+            b.data().iter().all(|&x| x == 0),
+            "failed write must not persist"
+        );
     }
 
     #[test]
@@ -622,7 +661,11 @@ mod linux_fixture {
         });
         match guard::check_boot_disk_protection(&backend, "/dev/sdb", false) {
             Err(ExecuteError::BootDiskProtection(msg)) => {
-                assert!(msg.contains("swaps"), "message must name the unreadable file: {}", msg)
+                assert!(
+                    msg.contains("swaps"),
+                    "message must name the unreadable file: {}",
+                    msg
+                )
             }
             other => panic!("expected BootDiskProtection, got {:?}", other.map(|_| ())),
         }
@@ -706,7 +749,11 @@ mod linux_fixture {
 
         match err {
             ExecuteError::IdentityMismatch(msg) => {
-                assert!(msg.contains("serial"), "message must name the drift: {}", msg)
+                assert!(
+                    msg.contains("serial"),
+                    "message must name the drift: {}",
+                    msg
+                )
             }
             other => panic!("expected IdentityMismatch, got {:?}", other),
         }
@@ -770,7 +817,10 @@ mod linux_fixture {
             "hdparm -F /dev/sdb".to_string(),
         ];
         assert!(report.success);
-        assert_eq!(report.command_log, expected, "exact executed steps, in order");
+        assert_eq!(
+            report.command_log, expected,
+            "exact executed steps, in order"
+        );
         assert_eq!(
             backend.executed_commands(),
             expected,

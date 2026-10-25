@@ -66,6 +66,9 @@ pub struct MockBackend {
     exec_calls: Arc<Mutex<Vec<String>>>,
     /// O_EXCL probe failure injection (busy device).
     exclusive_busy: bool,
+    /// F2: number of kernel partition-table re-read requests (BLKRRPART
+    /// equivalent). Tests assert this happened after wipe/format.
+    reread_calls: Mutex<usize>,
 
     /// Shared device image backing handles opened by this backend.
     data: Arc<Mutex<Vec<u8>>>,
@@ -108,6 +111,7 @@ impl MockBackend {
             exec_results: HashMap::new(),
             exec_calls: Arc::new(Mutex::new(Vec::new())),
             exclusive_busy: false,
+            reread_calls: Mutex::new(0),
             data: Arc::new(Mutex::new(Vec::new())),
             write_fault: WriteFault::None,
             logical_block_size: 512,
@@ -224,7 +228,8 @@ impl MockBackend {
     /// C2c: mark a holders/slaves dir as existing-but-unreadable — the guard
     /// must fail closed (block the wipe), never skip the relation.
     pub fn with_unreadable_relation(mut self, block: &str, relation: Relation) -> Self {
-        self.unreadable_relations.push((block.to_string(), relation));
+        self.unreadable_relations
+            .push((block.to_string(), relation));
         self
     }
 
@@ -236,8 +241,7 @@ impl MockBackend {
 
     /// File-backed swap: `(major, minor)` returned for `stat_backing_device`.
     pub fn with_file_backing(mut self, path: &str, major: u32, minor: u32) -> Self {
-        self.file_backing
-            .insert(path.to_string(), (major, minor));
+        self.file_backing.insert(path.to_string(), (major, minor));
         self
     }
 
@@ -256,13 +260,7 @@ impl MockBackend {
     }
 
     /// Scripted exec result for `"program arg1 arg2"`; default exit 0.
-    pub fn with_exec_result(
-        mut self,
-        cmd: &str,
-        stdout: &str,
-        stderr: &str,
-        code: i32,
-    ) -> Self {
+    pub fn with_exec_result(mut self, cmd: &str, stdout: &str, stderr: &str, code: i32) -> Self {
         self.exec_results.insert(
             cmd.to_string(),
             (stdout.to_string(), stderr.to_string(), code),
@@ -309,6 +307,11 @@ impl MockBackend {
     /// order (refused steps never appear here).
     pub fn executed_commands(&self) -> Vec<String> {
         self.exec_calls.lock().unwrap().clone()
+    }
+
+    /// F2: how many times the kernel was asked to re-read the table.
+    pub fn partition_table_reread_count(&self) -> usize {
+        *self.reread_calls.lock().unwrap()
     }
 
     /// Truncate the shared device image (device-shrink fault).
@@ -462,14 +465,8 @@ impl BlockBackend for MockBackend {
                 .get("partition")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
-            let start_sector: u64 = attrs
-                .get("start")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            let size_sectors: u64 = attrs
-                .get("size")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let start_sector: u64 = attrs.get("start").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let size_sectors: u64 = attrs.get("size").and_then(|s| s.parse().ok()).unwrap_or(0);
             out.push(PartitionFacts {
                 name: name.clone(),
                 partition_number: number,
@@ -490,12 +487,9 @@ impl BlockBackend for MockBackend {
                 "mock: mountinfo exists but cannot be read".to_string(),
             ));
         }
-        let mountinfo = self
-            .mountinfo
-            .clone()
-            .ok_or_else(|| {
-                BackendError::Unavailable("No mountinfo or mounts file found: fail closed".to_string())
-            })?;
+        let mountinfo = self.mountinfo.clone().ok_or_else(|| {
+            BackendError::Unavailable("No mountinfo or mounts file found: fail closed".to_string())
+        })?;
         Ok(MountState {
             mountinfo,
             mounts: self.mounts.clone(),
@@ -535,7 +529,9 @@ impl BlockBackend for MockBackend {
     ) -> Result<Option<String>, BackendError> {
         let key = format!("{}/{}", block_name, attr_rel);
         if self.unreadable.contains(&key) {
-            return Err(BackendError::Io("mock: attribute exists but is unreadable".into()));
+            return Err(BackendError::Io(
+                "mock: attribute exists but is unreadable".into(),
+            ));
         }
         Ok(self
             .attrs
@@ -556,7 +552,11 @@ impl BlockBackend for MockBackend {
         self.parents.get(name).cloned()
     }
 
-    fn sysfs_related_names(&self, name: &str, relation: Relation) -> Result<Vec<String>, BackendError> {
+    fn sysfs_related_names(
+        &self,
+        name: &str,
+        relation: Relation,
+    ) -> Result<Vec<String>, BackendError> {
         // C2c: injected unreadable dirs fail closed instead of skipping.
         if self
             .unreadable_relations
@@ -597,13 +597,14 @@ impl BlockBackend for MockBackend {
     }
 
     fn read_raw(&self, path: &str, offset: u64, len: u64) -> Result<Vec<u8>, BackendError> {
-        let file = self.raw_files.get(path).ok_or_else(|| {
-            BackendError::Io(format!("mock: no such file {}", path))
-        })?;
+        let file = self
+            .raw_files
+            .get(path)
+            .ok_or_else(|| BackendError::Io(format!("mock: no such file {}", path)))?;
         let start = offset as usize;
-        let end = start.checked_add(len as usize).ok_or_else(|| {
-            BackendError::Io("mock: read overflow".to_string())
-        })?;
+        let end = start
+            .checked_add(len as usize)
+            .ok_or_else(|| BackendError::Io("mock: read overflow".to_string()))?;
         if end > file.len() {
             return Err(BackendError::Io(
                 "mock: failed to fill whole buffer".to_string(),
@@ -613,9 +614,10 @@ impl BlockBackend for MockBackend {
     }
 
     fn stat_path(&self, path: &str) -> Result<StatFact, BackendError> {
-        self.stats.get(path).copied().ok_or_else(|| {
-            BackendError::Io(format!("mock: cannot stat {}", path))
-        })
+        self.stats
+            .get(path)
+            .copied()
+            .ok_or_else(|| BackendError::Io(format!("mock: cannot stat {}", path)))
     }
 
     fn probe_exclusive_open(
@@ -680,6 +682,11 @@ impl BlockBackend for MockBackend {
         if !self.capabilities.discard {
             return Err(BackendError::Unsupported("mock: discard disabled"));
         }
+        Ok(())
+    }
+
+    fn reread_partition_table(&self, _target: &ValidatedTarget) -> Result<(), BackendError> {
+        *self.reread_calls.lock().unwrap() += 1;
         Ok(())
     }
 }

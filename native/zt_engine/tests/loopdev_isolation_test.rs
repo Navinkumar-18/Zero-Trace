@@ -83,7 +83,11 @@ impl LoopDisk {
             );
         }
 
-        LoopDisk { loop_path, image, _tmp: tmp }
+        LoopDisk {
+            loop_path,
+            image,
+            _tmp: tmp,
+        }
     }
 
     fn part(&self, n: u32) -> String {
@@ -127,8 +131,7 @@ fn build_image(image: &Path) {
         mbr[entry + 6] = 0xFF;
         mbr[entry + 7] = 0xFF;
         mbr[entry + 8..entry + 12].copy_from_slice(&(*start as u32).to_le_bytes());
-        mbr[entry + 12..entry + 16]
-            .copy_from_slice(&(PART_SECTORS as u32).to_le_bytes());
+        mbr[entry + 12..entry + 16].copy_from_slice(&(PART_SECTORS as u32).to_le_bytes());
 
         let fill = vec![*pattern; (PART_SECTORS * SECTOR) as usize];
         f.seek(SeekFrom::Start(start * SECTOR)).unwrap();

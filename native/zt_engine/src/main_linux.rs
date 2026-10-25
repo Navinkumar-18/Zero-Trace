@@ -1,16 +1,19 @@
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process;
 use tokio::sync::mpsc;
+use zt_engine::backend::linux::LinuxBackend;
+use zt_engine::detect::probe_device;
 use zt_engine::execute::{
-    ata_sanitize_validated, ata_secure_erase_validated, discard_erase, discard_erase_partition,
-    emmc_sanitize_validated, nvme_sanitize_validated, opal_revert_validated, software_overwrite,
-    software_overwrite_partition, validate_whole_disk_flow_target_ctx, AtaSanitizeAction,
-    EngineMethod, FsContext, OverwritePattern, PartitionTargetParams, ProgressEvent,
-    SanitizeAction,
+    adopt_verified_wipe_receipt, ata_sanitize_validated, ata_secure_erase_validated, discard_erase,
+    discard_erase_partition, emmc_sanitize_validated, nvme_sanitize_validated,
+    opal_revert_validated, read_verified_wipe_receipt, recreate_filesystem_with,
+    recreate_whole_device_with, software_overwrite, software_overwrite_partition,
+    validate_whole_disk_flow_target_ctx, verified_wipe_stamp_for_path, write_verified_wipe_receipt,
+    AtaSanitizeAction, EngineMethod, FsContext, OverwritePattern, PartitionTargetParams,
+    ProgressEvent, SanitizeAction,
 };
 use zt_engine::verify::{verify_device, verify_device_scoped};
-use zt_engine::detect::probe_device;
 
 fn is_partition_device(device: &str) -> bool {
     let name = device.strip_prefix("/dev/").unwrap_or(device);
@@ -37,7 +40,7 @@ pub async fn run() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: zt_engine <subcommand> [args]");
-        eprintln!("Subcommands: sanitize, verify, detect, partitions, probe-windows");
+        eprintln!("Subcommands: sanitize, verify, format, detect, partitions, probe-windows");
         process::exit(1);
     }
 
@@ -60,11 +63,13 @@ pub async fn run() {
             });
 
             let dry_run = args.iter().any(|arg| arg == "--dry-run");
-            let psid = args.iter()
+            let psid = args
+                .iter()
                 .position(|arg| arg == "--psid")
                 .and_then(|pos| args.get(pos + 1).map(|s| s.as_str()));
 
-            let mode = args.iter()
+            let mode = args
+                .iter()
                 .position(|arg| arg == "--mode")
                 .and_then(|pos| args.get(pos + 1).map(|s| s.as_str()));
 
@@ -106,23 +111,32 @@ pub async fn run() {
                 }
 
                 // Fail-closed: partition mode requires all expected flags
-                let part_num = args.iter()
+                let part_num = args
+                    .iter()
                     .position(|arg| arg == "--expected-part-num")
                     .and_then(|pos| args.get(pos + 1).and_then(|s| s.parse::<u32>().ok()));
-                let start_sector = args.iter()
+                let start_sector = args
+                    .iter()
                     .position(|arg| arg == "--expected-start-sector")
                     .and_then(|pos| args.get(pos + 1).and_then(|s| s.parse::<u64>().ok()));
-                let size_sectors = args.iter()
+                let size_sectors = args
+                    .iter()
                     .position(|arg| arg == "--expected-size-sectors")
                     .and_then(|pos| args.get(pos + 1).and_then(|s| s.parse::<u64>().ok()));
-                let table_fingerprint = args.iter()
+                let table_fingerprint = args
+                    .iter()
                     .position(|arg| arg == "--expected-table-fingerprint")
                     .and_then(|pos| args.get(pos + 1).cloned());
-                let partuuid = args.iter()
+                let partuuid = args
+                    .iter()
                     .position(|arg| arg == "--expected-partuuid")
                     .and_then(|pos| args.get(pos + 1).cloned());
 
-                if part_num.is_none() || start_sector.is_none() || size_sectors.is_none() || table_fingerprint.is_none() {
+                if part_num.is_none()
+                    || start_sector.is_none()
+                    || size_sectors.is_none()
+                    || table_fingerprint.is_none()
+                {
                     eprintln!(
                         "Partition mode requires --expected-part-num, --expected-start-sector, --expected-size-sectors, and --expected-table-fingerprint"
                     );
@@ -150,7 +164,10 @@ pub async fn run() {
                             _ => unreachable!(),
                         };
 
-                        software_overwrite_partition(device, passes, pattern, token, serial, &params, dry_run, tx).await
+                        software_overwrite_partition(
+                            device, passes, pattern, token, serial, &params, dry_run, tx,
+                        )
+                        .await
                     }
                 }
             } else {
@@ -182,16 +199,40 @@ pub async fn run() {
                             ata_secure_erase_validated(&target, true, dry_run, tx).await
                         }
                         EngineMethod::AtaSanitizeBlock => {
-                            ata_sanitize_validated(&target, AtaSanitizeAction::BlockErase, dry_run, tx).await
+                            ata_sanitize_validated(
+                                &target,
+                                AtaSanitizeAction::BlockErase,
+                                dry_run,
+                                tx,
+                            )
+                            .await
                         }
                         EngineMethod::AtaSanitizeCrypto => {
-                            ata_sanitize_validated(&target, AtaSanitizeAction::CryptoScramble, dry_run, tx).await
+                            ata_sanitize_validated(
+                                &target,
+                                AtaSanitizeAction::CryptoScramble,
+                                dry_run,
+                                tx,
+                            )
+                            .await
                         }
                         EngineMethod::NvmeSanitizeBlock => {
-                            nvme_sanitize_validated(&target, SanitizeAction::BlockErase, dry_run, tx).await
+                            nvme_sanitize_validated(
+                                &target,
+                                SanitizeAction::BlockErase,
+                                dry_run,
+                                tx,
+                            )
+                            .await
                         }
                         EngineMethod::NvmeSanitizeCrypto => {
-                            nvme_sanitize_validated(&target, SanitizeAction::CryptoErase, dry_run, tx).await
+                            nvme_sanitize_validated(
+                                &target,
+                                SanitizeAction::CryptoErase,
+                                dry_run,
+                                tx,
+                            )
+                            .await
                         }
                         EngineMethod::OpalRevert => {
                             opal_revert_validated(&target, psid, dry_run, tx).await
@@ -208,13 +249,40 @@ pub async fn run() {
                             discard_erase(device, token, serial, dry_run, tx).await
                         }
                         EngineMethod::OverwriteZero => {
-                            software_overwrite(device, 1, OverwritePattern::Zeros, token, serial, dry_run, tx).await
+                            software_overwrite(
+                                device,
+                                1,
+                                OverwritePattern::Zeros,
+                                token,
+                                serial,
+                                dry_run,
+                                tx,
+                            )
+                            .await
                         }
                         EngineMethod::OverwriteRandom => {
-                            software_overwrite(device, 1, OverwritePattern::Random, token, serial, dry_run, tx).await
+                            software_overwrite(
+                                device,
+                                1,
+                                OverwritePattern::Random,
+                                token,
+                                serial,
+                                dry_run,
+                                tx,
+                            )
+                            .await
                         }
                         EngineMethod::Overwrite3Pass => {
-                            software_overwrite(device, 3, OverwritePattern::MultiPass3, token, serial, dry_run, tx).await
+                            software_overwrite(
+                                device,
+                                3,
+                                OverwritePattern::MultiPass3,
+                                token,
+                                serial,
+                                dry_run,
+                                tx,
+                            )
+                            .await
                         }
                         _ => unreachable!("firmware methods handled above"),
                     }
@@ -264,14 +332,31 @@ pub async fn run() {
                 eprintln!("Invalid expect_zeros (must be true/false)");
                 process::exit(1);
             });
-            let total_device_size = args.iter()
+            let total_device_size = args
+                .iter()
                 .position(|arg| arg == "--device-size" || arg == "--total-device-size")
                 .and_then(|pos| args.get(pos + 1).and_then(|s| s.parse::<u64>().ok()));
 
             let res = if let Some(total_size) = total_device_size {
-                verify_device_scoped(device, size, total_size, serial, engine_method.as_str(), Some(sample_count), expect_zeros, None)
+                verify_device_scoped(
+                    device,
+                    size,
+                    total_size,
+                    serial,
+                    engine_method.as_str(),
+                    Some(sample_count),
+                    expect_zeros,
+                    None,
+                )
             } else {
-                verify_device(device, size, serial, engine_method.as_str(), Some(sample_count), expect_zeros)
+                verify_device(
+                    device,
+                    size,
+                    serial,
+                    engine_method.as_str(),
+                    Some(sample_count),
+                    expect_zeros,
+                )
             };
 
             match res {
@@ -282,9 +367,171 @@ pub async fn run() {
                     if !report.pass {
                         process::exit(2);
                     }
+                    // Phase F: only when the caller asks for a receipt (the
+                    // app sets this to its per-job state file) — never write
+                    // into a user's home during ordinary verify runs.
+                    if let Ok(receipt_path) = env::var("ZT_VERIFIED_WIPE_RECEIPT") {
+                        let backend = LinuxBackend::system();
+                        match verified_wipe_stamp_for_path(&backend, device, serial) {
+                            Ok(stamp) => {
+                                if let Err(e) =
+                                    write_verified_wipe_receipt(Path::new(&receipt_path), &stamp)
+                                {
+                                    eprintln!(
+                                        "Warning: could not write verification receipt: {}",
+                                        e
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: could not build verification receipt: {:?}", e);
+                            }
+                        }
+                    }
                 }
                 Err(err) => {
                     eprintln!("Error executing verify: {:?}", err);
+                    process::exit(3);
+                }
+            }
+        }
+        "format" => {
+            // Usage: zt_engine format <device> <fs> <label> <token> <serial>
+            //        [--mode partition] [--expected-* ...] [--table gpt|mbr]
+            //        [--verified-receipt <path>] [--dry-run]
+            if args.len() < 7 {
+                eprintln!(
+                    "Usage: zt_engine format <device> <fs> <label> <confirmation_token> <device_serial> \
+                     [--mode partition] [--expected-part-num N --expected-start-sector N \
+                     --expected-size-sectors N --expected-table-fingerprint HEX] \
+                     [--table gpt|mbr] [--verified-receipt PATH] [--dry-run]"
+                );
+                process::exit(1);
+            }
+            let device = &args[2];
+            let fs_type = &args[3];
+            let label = &args[4];
+            let token = &args[5];
+            let serial = &args[6];
+            let dry_run = args.iter().any(|arg| arg == "--dry-run");
+            let mode = args
+                .iter()
+                .position(|arg| arg == "--mode")
+                .and_then(|pos| args.get(pos + 1).map(|s| s.as_str()));
+            let is_part_mode = mode == Some("partition") || is_partition_device(device);
+            let table_type = args
+                .iter()
+                .position(|arg| arg == "--table")
+                .and_then(|pos| args.get(pos + 1).cloned());
+            let receipt_path: Option<PathBuf> = args
+                .iter()
+                .position(|arg| arg == "--verified-receipt")
+                .and_then(|pos| args.get(pos + 1).map(PathBuf::from))
+                .or_else(|| env::var("ZT_VERIFIED_WIPE_RECEIPT").ok().map(PathBuf::from));
+
+            if is_part_mode && table_type.is_some() {
+                eprintln!("Refusing: partition scope cannot create a partition table");
+                process::exit(1);
+            }
+            if !is_part_mode && table_type.is_none() {
+                eprintln!(
+                    "Refusing: whole-device format requires --table gpt|mbr \
+                     (create a new table with one partition) or --mode partition"
+                );
+                process::exit(1);
+            }
+
+            let backend = LinuxBackend::new(FsContext::default());
+            let target = if is_part_mode {
+                let part_num = args
+                    .iter()
+                    .position(|arg| arg == "--expected-part-num")
+                    .and_then(|pos| args.get(pos + 1).and_then(|s| s.parse::<u32>().ok()));
+                let start_sector = args
+                    .iter()
+                    .position(|arg| arg == "--expected-start-sector")
+                    .and_then(|pos| args.get(pos + 1).and_then(|s| s.parse::<u64>().ok()));
+                let size_sectors = args
+                    .iter()
+                    .position(|arg| arg == "--expected-size-sectors")
+                    .and_then(|pos| args.get(pos + 1).and_then(|s| s.parse::<u64>().ok()));
+                let fingerprint = args
+                    .iter()
+                    .position(|arg| arg == "--expected-table-fingerprint")
+                    .and_then(|pos| args.get(pos + 1).cloned());
+                let partuuid = args
+                    .iter()
+                    .position(|arg| arg == "--expected-partuuid")
+                    .and_then(|pos| args.get(pos + 1).cloned());
+                let (Some(part_num), Some(start_sector), Some(size_sectors), Some(fingerprint)) =
+                    (part_num, start_sector, size_sectors, fingerprint)
+                else {
+                    eprintln!(
+                        "Partition format requires --expected-part-num, --expected-start-sector, \
+                         --expected-size-sectors and --expected-table-fingerprint"
+                    );
+                    process::exit(1);
+                };
+                let params = PartitionTargetParams {
+                    expected_partition_num: part_num,
+                    expected_start_sector: start_sector,
+                    expected_size_sectors: size_sectors,
+                    expected_partuuid: partuuid,
+                    expected_table_fingerprint: fingerprint,
+                };
+                match zt_engine::guard::validate_partition_target(
+                    &backend, device, &params, dry_run, serial,
+                ) {
+                    Ok(target) => target,
+                    Err(err) => {
+                        eprintln!("Error preparing format: {:?}", err);
+                        process::exit(3);
+                    }
+                }
+            } else {
+                match zt_engine::guard::validate_whole_disk_target(
+                    &backend, device, token, serial, dry_run,
+                ) {
+                    Ok(target) => target,
+                    Err(err) => {
+                        eprintln!("Error preparing format: {:?}", err);
+                        process::exit(3);
+                    }
+                }
+            };
+
+            if let Some(path) = receipt_path.as_deref() {
+                match read_verified_wipe_receipt(path) {
+                    Ok(stamp) => {
+                        if let Err(err) = adopt_verified_wipe_receipt(&backend, &target, &stamp) {
+                            eprintln!("Refusing format: {:?}", err);
+                            process::exit(3);
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("Refusing format: {:?}", err);
+                        process::exit(3);
+                    }
+                }
+            }
+
+            let result = if let Some(table) = table_type.as_deref() {
+                recreate_whole_device_with(&backend, &target, table, fs_type, label, token, dry_run)
+            } else {
+                recreate_filesystem_with(&backend, &target, fs_type, label, dry_run)
+            };
+
+            match result {
+                Ok(report) => {
+                    if let Ok(json) = serde_json::to_string(&report) {
+                        println!("FORMAT_REPORT:{}", json);
+                    }
+                    if !report.success {
+                        process::exit(2);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("Error recreating filesystem: {:?}", err);
                     process::exit(3);
                 }
             }
@@ -321,7 +568,10 @@ pub async fn run() {
                 process::exit(1);
             }
             let disk = &args[2];
-            match zt_engine::partitions::enumerate_partitions_ctx(disk, &zt_engine::execute::FsContext::default()) {
+            match zt_engine::partitions::enumerate_partitions_ctx(
+                disk,
+                &zt_engine::execute::FsContext::default(),
+            ) {
                 Ok(report) => {
                     if let Ok(json) = serde_json::to_string(&report) {
                         println!("PARTITIONS_REPORT:{}", json);

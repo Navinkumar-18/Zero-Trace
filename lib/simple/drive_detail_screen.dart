@@ -13,6 +13,7 @@ import '../widgets/theme.dart';
 import 'certificate_dialog.dart';
 import 'confirm_wipe_dialog.dart';
 import 'error_messages.dart';
+import 'filesystem_recreation_dialog.dart';
 
 class DriveDetailScreen extends StatelessWidget {
   final String deviceId;
@@ -26,9 +27,9 @@ class DriveDetailScreen extends StatelessWidget {
 
     // Find device by stableId or id
     final device = controller.devices.cast<DeviceProfile?>().firstWhere(
-          (d) => d!.stableId == deviceId || d.id == deviceId,
-          orElse: () => null,
-        );
+      (d) => d!.stableId == deviceId || d.id == deviceId,
+      orElse: () => null,
+    );
 
     if (device == null) {
       return Center(
@@ -39,11 +40,15 @@ class DriveDetailScreen extends StatelessWidget {
             children: [
               const Icon(Icons.usb_off, size: 48, color: AppTheme.textMuted),
               const SizedBox(height: 12),
-              const Text('Drive not found',
-                  style: TextStyle(color: AppTheme.textMuted, fontSize: 16)),
+              const Text(
+                'Drive not found',
+                style: TextStyle(color: AppTheme.textMuted, fontSize: 16),
+              ),
               const SizedBox(height: 4),
-              const Text('It may have been unplugged.',
-                  style: TextStyle(color: AppTheme.textMuted, fontSize: 13)),
+              const Text(
+                'It may have been unplugged.',
+                style: TextStyle(color: AppTheme.textMuted, fontSize: 13),
+              ),
               const SizedBox(height: 16),
               ElevatedButton.icon(
                 onPressed: () => context.go('/'),
@@ -78,7 +83,10 @@ class DriveDetailScreen extends StatelessWidget {
               Text(
                 '${device.name} (${device.id}) is a protected system drive containing active operating system partitions. Direct wiping is refused.',
                 textAlign: TextAlign.center,
-                style: const TextStyle(color: AppTheme.textSecondary, fontSize: 13),
+                style: const TextStyle(
+                  color: AppTheme.textSecondary,
+                  fontSize: 13,
+                ),
               ),
               const SizedBox(height: 20),
               ElevatedButton.icon(
@@ -114,7 +122,10 @@ class DriveDetailScreen extends StatelessWidget {
               Text(
                 '${device.name}: ${device.simpleDisabledReason}',
                 textAlign: TextAlign.center,
-                style: const TextStyle(color: AppTheme.textSecondary, fontSize: 13),
+                style: const TextStyle(
+                  color: AppTheme.textSecondary,
+                  fontSize: 13,
+                ),
               ),
               const SizedBox(height: 20),
               ElevatedButton.icon(
@@ -133,10 +144,10 @@ class DriveDetailScreen extends StatelessWidget {
         job != null && job.device.stableId == device.stableId;
     final isRunning = controller.isJobRunning && isJobForThisDevice;
     final isVerifying = isJobForThisDevice && job.status == JobStatus.verifying;
-    final isFinished = isJobForThisDevice &&
+    final isFinished =
+        isJobForThisDevice &&
         (job.status == JobStatus.completed || job.status == JobStatus.failed);
-    final isCompleted =
-        isJobForThisDevice && job.status == JobStatus.completed;
+    final isCompleted = isJobForThisDevice && job.status == JobStatus.completed;
     final isFailed = isJobForThisDevice && job.status == JobStatus.failed;
     final wipeCompleted = job?.wipeCompleted ?? false;
     final isWipeFailed = isFailed && !wipeCompleted;
@@ -157,8 +168,9 @@ class DriveDetailScreen extends StatelessWidget {
         isFlashMedia: isFlash,
         verificationPassed: verifyPassed,
       );
-      badgeColor =
-          verifyPassed ? AppTheme.simpleSuccess : AppTheme.simpleDestructive;
+      badgeColor = verifyPassed
+          ? AppTheme.simpleSuccess
+          : AppTheme.simpleDestructive;
     } else if (isFailed) {
       badgeText = isWipeFailed ? 'Wipe failed' : 'Verification failed';
       badgeColor = AppTheme.simpleDestructive;
@@ -218,7 +230,10 @@ class DriveDetailScreen extends StatelessWidget {
                   TextButton.icon(
                     onPressed: isRunning ? null : () => context.go('/'),
                     icon: const Icon(Icons.arrow_back, size: 16),
-                    label: const Text('All drives', style: TextStyle(fontSize: 13)),
+                    label: const Text(
+                      'All drives',
+                      style: TextStyle(fontSize: 13),
+                    ),
                   ),
                   const SizedBox(height: 8),
 
@@ -238,7 +253,9 @@ class DriveDetailScreen extends StatelessWidget {
                             Container(
                               padding: const EdgeInsets.all(10),
                               decoration: BoxDecoration(
-                                color: AppTheme.simplePrimary.withValues(alpha: 0.1),
+                                color: AppTheme.simplePrimary.withValues(
+                                  alpha: 0.1,
+                                ),
                                 borderRadius: BorderRadius.circular(10),
                               ),
                               child: Icon(
@@ -252,14 +269,20 @@ class DriveDetailScreen extends StatelessWidget {
                               child: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
-                                  Text(device.name,
-                                      style: const TextStyle(
-                                          fontWeight: FontWeight.bold, fontSize: 16)),
+                                  Text(
+                                    device.name,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 16,
+                                    ),
+                                  ),
                                   const SizedBox(height: 2),
                                   Text(
                                     '${device.formattedCapacity} • ${device.busType} • S/N: ${device.serialNumber}',
                                     style: const TextStyle(
-                                        color: AppTheme.textSecondary, fontSize: 12),
+                                      color: AppTheme.textSecondary,
+                                      fontSize: 12,
+                                    ),
                                   ),
                                 ],
                               ),
@@ -270,32 +293,44 @@ class DriveDetailScreen extends StatelessWidget {
                               children: [
                                 Container(
                                   padding: const EdgeInsets.symmetric(
-                                      horizontal: 8, vertical: 3),
+                                    horizontal: 8,
+                                    vertical: 3,
+                                  ),
                                   decoration: BoxDecoration(
-                                    color:
-                                        AppTheme.simplePrimary.withValues(alpha: 0.1),
+                                    color: AppTheme.simplePrimary.withValues(
+                                      alpha: 0.1,
+                                    ),
                                     borderRadius: BorderRadius.circular(6),
                                   ),
-                                  child: Text(device.driveType.label,
-                                      style: const TextStyle(
-                                          color: AppTheme.simplePrimary,
-                                          fontSize: 10,
-                                          fontWeight: FontWeight.bold)),
+                                  child: Text(
+                                    device.driveType.label,
+                                    style: const TextStyle(
+                                      color: AppTheme.simplePrimary,
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
                                 ),
                                 const SizedBox(height: 4),
                                 Container(
                                   padding: const EdgeInsets.symmetric(
-                                      horizontal: 8, vertical: 3),
+                                    horizontal: 8,
+                                    vertical: 3,
+                                  ),
                                   decoration: BoxDecoration(
-                                    color: supportLevel.badgeColor
-                                        .withValues(alpha: 0.1),
+                                    color: supportLevel.badgeColor.withValues(
+                                      alpha: 0.1,
+                                    ),
                                     borderRadius: BorderRadius.circular(6),
                                   ),
-                                  child: Text(supportLevel.badgeLabel,
-                                      style: TextStyle(
-                                          color: supportLevel.badgeColor,
-                                          fontSize: 10,
-                                          fontWeight: FontWeight.bold)),
+                                  child: Text(
+                                    supportLevel.badgeLabel,
+                                    style: TextStyle(
+                                      color: supportLevel.badgeColor,
+                                      fontSize: 10,
+                                      fontWeight: FontWeight.bold,
+                                    ),
+                                  ),
                                 ),
                               ],
                             ),
@@ -304,32 +339,43 @@ class DriveDetailScreen extends StatelessWidget {
                         const SizedBox(height: 12),
 
                         // Method + path
-                        _metaRow('Path:', device.id.startsWith('real_')
-                            ? '/dev/${device.id.substring(5)}'
-                            : '/dev/sdb (Simulated)'),
+                        _metaRow(
+                          'Path:',
+                          device.id.startsWith('real_')
+                              ? '/dev/${device.id.substring(5)}'
+                              : '/dev/sdb (Simulated)',
+                        ),
                         const SizedBox(height: 4),
                         _metaRow('Method:', 'Decided at confirmation'),
 
                         // Clear-only caveat (Flash vs Unknown)
-                        if (supportLevel == SanitizationSupportLevel.clearOnly) ...[
+                        if (supportLevel ==
+                            SanitizationSupportLevel.clearOnly) ...[
                           if (isFlash) ...[
                             const SizedBox(height: 8),
                             Container(
                               padding: const EdgeInsets.all(8),
                               decoration: BoxDecoration(
-                                color: AppTheme.accentGold.withValues(alpha: 0.08),
+                                color: AppTheme.accentGold.withValues(
+                                  alpha: 0.08,
+                                ),
                                 borderRadius: BorderRadius.circular(8),
                               ),
                               child: const Row(
                                 children: [
-                                  Icon(Icons.info_outline,
-                                      color: AppTheme.accentGold, size: 14),
+                                  Icon(
+                                    Icons.info_outline,
+                                    color: AppTheme.accentGold,
+                                    size: 14,
+                                  ),
                                   SizedBox(width: 6),
                                   Expanded(
                                     child: Text(
                                       'Flash media: Clear level only. Overwrite cannot reach remapped blocks.',
                                       style: TextStyle(
-                                          color: AppTheme.accentGold, fontSize: 11),
+                                        color: AppTheme.accentGold,
+                                        fontSize: 11,
+                                      ),
                                     ),
                                   ),
                                 ],
@@ -340,19 +386,26 @@ class DriveDetailScreen extends StatelessWidget {
                             Container(
                               padding: const EdgeInsets.all(8),
                               decoration: BoxDecoration(
-                                color: AppTheme.accentGold.withValues(alpha: 0.08),
+                                color: AppTheme.accentGold.withValues(
+                                  alpha: 0.08,
+                                ),
                                 borderRadius: BorderRadius.circular(8),
                               ),
                               child: const Row(
                                 children: [
-                                  Icon(Icons.info_outline,
-                                      color: AppTheme.accentGold, size: 14),
+                                  Icon(
+                                    Icons.info_outline,
+                                    color: AppTheme.accentGold,
+                                    size: 14,
+                                  ),
                                   SizedBox(width: 6),
                                   Expanded(
                                     child: Text(
                                       'Clear level only. Logical overwrite cannot guarantee firmware-level purge.',
                                       style: TextStyle(
-                                          color: AppTheme.accentGold, fontSize: 11),
+                                        color: AppTheme.accentGold,
+                                        fontSize: 11,
+                                      ),
                                     ),
                                   ),
                                 ],
@@ -366,7 +419,9 @@ class DriveDetailScreen extends StatelessWidget {
                           const SizedBox(height: 12),
                           Container(
                             padding: const EdgeInsets.symmetric(
-                                horizontal: 14, vertical: 8),
+                              horizontal: 14,
+                              vertical: 8,
+                            ),
                             decoration: BoxDecoration(
                               color: badgeColor!.withValues(alpha: 0.12),
                               borderRadius: BorderRadius.circular(20),
@@ -383,11 +438,14 @@ class DriveDetailScreen extends StatelessWidget {
                                   size: 18,
                                 ),
                                 const SizedBox(width: 6),
-                                Text(badgeText,
-                                    style: TextStyle(
-                                        color: badgeColor,
-                                        fontWeight: FontWeight.bold,
-                                        fontSize: 13)),
+                                Text(
+                                  badgeText,
+                                  style: TextStyle(
+                                    color: badgeColor,
+                                    fontWeight: FontWeight.bold,
+                                    fontSize: 13,
+                                  ),
+                                ),
                               ],
                             ),
                           ),
@@ -399,14 +457,23 @@ class DriveDetailScreen extends StatelessWidget {
 
                   // A4: partition chooser (only when the drive has partitions
                   // and no job is running for it)
-                  if (device.hasPartitions && !(isRunning && isJobForThisDevice)) ...[
-                    _PartitionChooserSection(device: device, isSimulated: isSimulated),
+                  if (device.hasPartitions &&
+                      !(isRunning && isJobForThisDevice)) ...[
+                    _PartitionChooserSection(
+                      device: device,
+                      isSimulated: isSimulated,
+                    ),
                     const SizedBox(height: 20),
                   ],
 
                   // Progress area (inline, not separate screen)
                   if (isRunning && isJobForThisDevice) ...[
-                    _buildProgressSection(context, controller, job, isSimulated),
+                    _buildProgressSection(
+                      context,
+                      controller,
+                      job,
+                      isSimulated,
+                    ),
                     const SizedBox(height: 20),
                   ],
 
@@ -418,19 +485,26 @@ class DriveDetailScreen extends StatelessWidget {
                         color: AppTheme.accentRose.withValues(alpha: 0.1),
                         borderRadius: BorderRadius.circular(12),
                         border: Border.all(
-                            color: AppTheme.accentRose.withValues(alpha: 0.3)),
+                          color: AppTheme.accentRose.withValues(alpha: 0.3),
+                        ),
                       ),
                       child: Row(
                         children: [
-                          const Icon(Icons.error_outline,
-                              color: AppTheme.accentRose, size: 20),
+                          const Icon(
+                            Icons.error_outline,
+                            color: AppTheme.accentRose,
+                            size: 20,
+                          ),
                           const SizedBox(width: 10),
                           Expanded(
                             child: Text(
                               SimpleErrorMessages.fromError(
-                                  job.currentStageDescription),
+                                job.currentStageDescription,
+                              ),
                               style: const TextStyle(
-                                  color: AppTheme.accentRose, fontSize: 13),
+                                color: AppTheme.accentRose,
+                                fontSize: 13,
+                              ),
                             ),
                           ),
                         ],
@@ -453,7 +527,20 @@ class DriveDetailScreen extends StatelessWidget {
                     hasCert: hasCert,
                     verifyPassed: verifyPassed,
                   ),
-                  const SizedBox(height: 24),
+                  const SizedBox(height: 20),
+
+                  // Phase F: optional post-wipe filesystem recreation. Shown
+                  // only after this job's wipe AND verification succeeded.
+                  if (isJobForThisDevice &&
+                      controller.filesystemRecreation != null) ...[
+                    _buildFilesystemRecreationRecord(controller),
+                    const SizedBox(height: 20),
+                  ] else if (isJobForThisDevice &&
+                      controller.showFilesystemRecreationPrompt) ...[
+                    _buildFilesystemRecreationPrompt(context, controller),
+                    const SizedBox(height: 20),
+                  ],
+                  const SizedBox(height: 4),
 
                   // Read-only Drive Details & Hardware Capability Matrix
                   _buildDriveDetailsSection(device),
@@ -488,7 +575,9 @@ class DriveDetailScreen extends StatelessWidget {
               decoration: BoxDecoration(
                 color: AppTheme.accentGold.withValues(alpha: 0.15),
                 borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: AppTheme.accentGold.withValues(alpha: 0.4)),
+                border: Border.all(
+                  color: AppTheme.accentGold.withValues(alpha: 0.4),
+                ),
               ),
               child: const Row(
                 mainAxisSize: MainAxisSize.min,
@@ -521,7 +610,8 @@ class DriveDetailScreen extends StatelessWidget {
                   strokeWidth: 10,
                   backgroundColor: AppTheme.surfaceBorder,
                   valueColor: const AlwaysStoppedAnimation<Color>(
-                      AppTheme.simplePrimary),
+                    AppTheme.simplePrimary,
+                  ),
                 ),
                 Text(
                   job.progress != null
@@ -560,11 +650,17 @@ class DriveDetailScreen extends StatelessWidget {
               decoration: BoxDecoration(
                 color: AppTheme.accentGold.withValues(alpha: 0.12),
                 borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: AppTheme.accentGold.withValues(alpha: 0.4)),
+                border: Border.all(
+                  color: AppTheme.accentGold.withValues(alpha: 0.4),
+                ),
               ),
               child: const Text(
                 'waiting for the drive to finish its current write',
-                style: TextStyle(color: AppTheme.accentGold, fontSize: 12, fontWeight: FontWeight.w500),
+                style: TextStyle(
+                  color: AppTheme.accentGold,
+                  fontSize: 12,
+                  fontWeight: FontWeight.w500,
+                ),
                 textAlign: TextAlign.center,
               ),
             ),
@@ -574,7 +670,10 @@ class DriveDetailScreen extends StatelessWidget {
               label: const Text('Force stop', style: TextStyle(fontSize: 12)),
               style: ElevatedButton.styleFrom(
                 backgroundColor: AppTheme.accentRose,
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 8,
+                ),
               ),
               onPressed: () => _handleForceStop(context, controller),
             ),
@@ -585,7 +684,10 @@ class DriveDetailScreen extends StatelessWidget {
                 SizedBox(
                   width: 14,
                   height: 14,
-                  child: CircularProgressIndicator(strokeWidth: 2, color: AppTheme.accentRose),
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                    color: AppTheme.accentRose,
+                  ),
                 ),
                 SizedBox(width: 8),
                 Text(
@@ -600,8 +702,13 @@ class DriveDetailScreen extends StatelessWidget {
               label: const Text('Cancel Wipe', style: TextStyle(fontSize: 12)),
               style: OutlinedButton.styleFrom(
                 foregroundColor: AppTheme.accentRose,
-                side: BorderSide(color: AppTheme.accentRose.withValues(alpha: 0.5)),
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                side: BorderSide(
+                  color: AppTheme.accentRose.withValues(alpha: 0.5),
+                ),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 8,
+                ),
               ),
               onPressed: () => _handleCancel(context, controller),
             )
@@ -615,7 +722,10 @@ class DriveDetailScreen extends StatelessWidget {
     );
   }
 
-  Future<void> _handleForceStop(BuildContext context, SanitizationController controller) async {
+  Future<void> _handleForceStop(
+    BuildContext context,
+    SanitizationController controller,
+  ) async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -639,7 +749,9 @@ class DriveDetailScreen extends StatelessWidget {
             child: const Text('Wait for Drive'),
           ),
           ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: AppTheme.accentRose),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppTheme.accentRose,
+            ),
             onPressed: () => Navigator.of(ctx).pop(true),
             child: const Text('Force Stop Now'),
           ),
@@ -651,7 +763,10 @@ class DriveDetailScreen extends StatelessWidget {
     }
   }
 
-  Future<void> _handleCancel(BuildContext context, SanitizationController controller) async {
+  Future<void> _handleCancel(
+    BuildContext context,
+    SanitizationController controller,
+  ) async {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -675,7 +790,9 @@ class DriveDetailScreen extends StatelessWidget {
             child: const Text('Continue Wipe'),
           ),
           ElevatedButton(
-            style: ElevatedButton.styleFrom(backgroundColor: AppTheme.accentRose),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppTheme.accentRose,
+            ),
             onPressed: () => Navigator.of(ctx).pop(true),
             child: const Text('Stop & Mark Partially Wiped'),
           ),
@@ -685,6 +802,142 @@ class DriveDetailScreen extends StatelessWidget {
     if (confirmed == true) {
       await controller.cancelCurrentJob();
     }
+  }
+
+  /// Phase F: persistent prompt card. The format action itself is OFF by
+  /// default inside the dialog; this card never enables it implicitly.
+  Widget _buildFilesystemRecreationPrompt(
+    BuildContext context,
+    SanitizationController controller,
+  ) {
+    final defaults = controller.filesystemRecreationDefaults;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppTheme.surfaceCard,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppTheme.surfaceBorder),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(
+                Icons.storage_rounded,
+                color: AppTheme.simplePrimary,
+                size: 20,
+              ),
+              SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Recreate filesystem?',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 15,
+                    color: AppTheme.textPrimary,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            'Optional. The wipe result is already verified and is not affected '
+            'by formatting — this only makes the drive usable again.',
+            style: TextStyle(color: AppTheme.textSecondary, fontSize: 12),
+          ),
+          if (defaults != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              'Defaults from the original volume: '
+              '${defaults.fsType.toUpperCase()} • label ${defaults.label}',
+              style: const TextStyle(color: AppTheme.textMuted, fontSize: 11),
+            ),
+          ],
+          if (controller.filesystemRecreationError != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Format failed: ${controller.filesystemRecreationError}',
+              key: const Key('filesystem-recreate-card-error'),
+              style: const TextStyle(color: AppTheme.accentRose, fontSize: 12),
+            ),
+          ],
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              ElevatedButton.icon(
+                key: const Key('filesystem-recreate-open'),
+                onPressed: () =>
+                    FilesystemRecreationDialog.show(context, controller),
+                icon: const Icon(Icons.build_circle_outlined, size: 16),
+                label: const Text(
+                  'Choose filesystem...',
+                  style: TextStyle(fontSize: 12),
+                ),
+              ),
+              const SizedBox(width: 8),
+              TextButton(
+                onPressed: controller.dismissFilesystemRecreationPrompt,
+                child: const Text('Not now', style: TextStyle(fontSize: 12)),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFilesystemRecreationRecord(SanitizationController controller) {
+    final record = controller.filesystemRecreation!;
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppTheme.simpleSuccess.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(
+          color: AppTheme.simpleSuccess.withValues(alpha: 0.35),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(
+                Icons.check_circle_outline,
+                color: AppTheme.simpleSuccess,
+                size: 18,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Filesystem recreated: ${record.fsType.toUpperCase()} '
+                  '(${record.tool})',
+                  style: const TextStyle(
+                    color: AppTheme.simpleSuccess,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 13,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Label: ${record.label.isEmpty ? '(none)' : record.label}'
+            '${record.partitionTableCreated ? ' • new ${record.partitionTableType?.toUpperCase() ?? 'partition table'}' : ''}',
+            style: const TextStyle(color: AppTheme.textSecondary, fontSize: 12),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            'Format time: ${record.time} • sanitization verified before format: '
+            '${record.sanitizationVerifiedBeforeFormat ? 'yes' : 'no'}',
+            style: const TextStyle(color: AppTheme.textMuted, fontSize: 11),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _buildActionButtons({
@@ -707,10 +960,13 @@ class DriveDetailScreen extends StatelessWidget {
     final platformSupported = platform.isSupported;
 
     // State machine for button enable/disable
-    final canWipe = platformSupported && !isRunning && (!isFinished || isFailed);
+    final canWipe =
+        platformSupported && !isRunning && (!isFinished || isFailed);
     // Verify is enabled ONLY when the wipe itself completed
     final canVerify =
-        platformSupported && !isRunning && (isCompleted || (isFailed && wipeCompleted));
+        platformSupported &&
+        !isRunning &&
+        (isCompleted || (isFailed && wipeCompleted));
     final canCert = hasCert;
 
     return Column(
@@ -727,18 +983,17 @@ class DriveDetailScreen extends StatelessWidget {
               isRunning
                   ? (isVerifying ? 'Verifying...' : 'Wiping...')
                   : (isFailed ? 'Retry Wipe' : 'Secure Wipe'),
-              style: const TextStyle(
-                  fontWeight: FontWeight.bold, fontSize: 15),
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
             ),
             style: ElevatedButton.styleFrom(
               backgroundColor: canWipe
                   ? AppTheme.simpleDestructive
                   : AppTheme.surfaceBorder,
-              foregroundColor:
-                  canWipe ? Colors.white : AppTheme.textMuted,
+              foregroundColor: canWipe ? Colors.white : AppTheme.textMuted,
               padding: const EdgeInsets.symmetric(vertical: 16),
               shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(12)),
+                borderRadius: BorderRadius.circular(12),
+              ),
             ),
             onPressed: canWipe
                 ? () => _handleWipe(context, controller, device)
@@ -773,7 +1028,8 @@ class DriveDetailScreen extends StatelessWidget {
                   ),
                   padding: const EdgeInsets.symmetric(vertical: 14),
                   shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12)),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
                 ),
                 onPressed: canVerify
                     ? () => context.go('/advanced/verification')
@@ -788,32 +1044,31 @@ class DriveDetailScreen extends StatelessWidget {
                 icon: Icon(
                   canCert
                       ? (verifyPassed
-                          ? Icons.description
-                          : Icons.report_problem)
+                            ? Icons.description
+                            : Icons.report_problem)
                       : Icons.description_outlined,
                   size: 18,
                 ),
                 label: Text(
-                  canCert && !verifyPassed
-                      ? 'Failure Report'
-                      : 'Certificate',
+                  canCert && !verifyPassed ? 'Failure Report' : 'Certificate',
                 ),
                 style: OutlinedButton.styleFrom(
                   foregroundColor: canCert
                       ? (verifyPassed
-                          ? AppTheme.simpleSuccess
-                          : AppTheme.accentGold)
+                            ? AppTheme.simpleSuccess
+                            : AppTheme.accentGold)
                       : AppTheme.textMuted,
                   side: BorderSide(
                     color: canCert
                         ? (verifyPassed
-                            ? AppTheme.simpleSuccess
-                            : AppTheme.accentGold)
+                              ? AppTheme.simpleSuccess
+                              : AppTheme.accentGold)
                         : AppTheme.surfaceBorder,
                   ),
                   padding: const EdgeInsets.symmetric(vertical: 14),
                   shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12)),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
                 ),
                 onPressed: canCert
                     ? () => SimpleCertificateDialog.show(context)
@@ -832,7 +1087,9 @@ class DriveDetailScreen extends StatelessWidget {
     DeviceProfile device,
   ) async {
     // Re-check device still present
-    final stillPresent = controller.devices.any((d) => d.stableId == device.stableId);
+    final stillPresent = controller.devices.any(
+      (d) => d.stableId == device.stableId,
+    );
     if (!stillPresent) {
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -855,7 +1112,8 @@ class DriveDetailScreen extends StatelessWidget {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text(
-                'Drive identity changed. A different device may have been connected.'),
+              'Drive identity changed. A different device may have been connected.',
+            ),
             backgroundColor: AppTheme.accentRose,
           ),
         );
@@ -905,15 +1163,24 @@ class DriveDetailScreen extends StatelessWidget {
           const SizedBox(height: 12),
           const Divider(color: AppTheme.surfaceBorder, height: 1),
           const SizedBox(height: 12),
-          _metaRow('Bus Interface:', device.busType.isNotEmpty ? device.busType : 'Unknown'),
+          _metaRow(
+            'Bus Interface:',
+            device.busType.isNotEmpty ? device.busType : 'Unknown',
+          ),
           const SizedBox(height: 6),
-          _metaRow('Rotational:', device.isRotational ? 'Yes (HDD)' : 'No (Solid State / Flash)'),
+          _metaRow(
+            'Rotational:',
+            device.isRotational ? 'Yes (HDD)' : 'No (Solid State / Flash)',
+          ),
           const SizedBox(height: 6),
           if (device.rotationalRpm != null && device.rotationalRpm! > 0) ...[
             _metaRow('RPM:', '${device.rotationalRpm}'),
             const SizedBox(height: 6),
           ],
-          _metaRow('HPA / DCO:', device.hpaDcoPresent ? 'Detected (Hidden Areas)' : 'None'),
+          _metaRow(
+            'HPA / DCO:',
+            device.hpaDcoPresent ? 'Detected (Hidden Areas)' : 'None',
+          ),
           const SizedBox(height: 14),
           const Text(
             'HARDWARE SANITIZATION MATRIX',
@@ -948,7 +1215,10 @@ class DriveDetailScreen extends StatelessWidget {
               padding: const EdgeInsets.symmetric(vertical: 4),
               child: Row(
                 children: [
-                  Text(cap.status.icon, style: TextStyle(color: statusColor, fontSize: 14)),
+                  Text(
+                    cap.status.icon,
+                    style: TextStyle(color: statusColor, fontSize: 14),
+                  ),
                   const SizedBox(width: 10),
                   Expanded(
                     child: Column(
@@ -964,13 +1234,19 @@ class DriveDetailScreen extends StatelessWidget {
                         ),
                         Text(
                           cap.description,
-                          style: const TextStyle(fontSize: 10, color: AppTheme.textMuted),
+                          style: const TextStyle(
+                            fontSize: 10,
+                            color: AppTheme.textMuted,
+                          ),
                         ),
                       ],
                     ),
                   ),
                   Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 2,
+                    ),
                     decoration: BoxDecoration(
                       color: statusColor.withValues(alpha: 0.12),
                       borderRadius: BorderRadius.circular(6),
@@ -998,16 +1274,20 @@ class DriveDetailScreen extends StatelessWidget {
       children: [
         SizedBox(
           width: 80,
-          child: Text(label,
-              style: const TextStyle(
-                  fontSize: 12,
-                  color: AppTheme.textMuted,
-                  fontWeight: FontWeight.w600)),
+          child: Text(
+            label,
+            style: const TextStyle(
+              fontSize: 12,
+              color: AppTheme.textMuted,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
         ),
         Expanded(
-          child: Text(value,
-              style: const TextStyle(
-                  fontSize: 12, color: AppTheme.textSecondary)),
+          child: Text(
+            value,
+            style: const TextStyle(fontSize: 12, color: AppTheme.textSecondary),
+          ),
         ),
       ],
     );
@@ -1068,9 +1348,12 @@ class _PartitionChooserSection extends StatelessWidget {
     final selected = controller.selectedPartitions;
     final selectedNames = selected.map((p) => p.name).toSet();
 
-    final selectable = device.partitions.where((p) => _unsafeReason(p) == null).toList();
+    final selectable = device.partitions
+        .where((p) => _unsafeReason(p) == null)
+        .toList();
     final allSelected =
-        selectable.isNotEmpty && selectable.every((p) => selectedNames.contains(p.name));
+        selectable.isNotEmpty &&
+        selectable.every((p) => selectedNames.contains(p.name));
     final allPartitionsSelected =
         selectable.length == device.partitions.length && allSelected;
 
@@ -1080,14 +1363,20 @@ class _PartitionChooserSection extends StatelessWidget {
       decoration: BoxDecoration(
         color: AppTheme.simplePrimary.withValues(alpha: 0.05),
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: AppTheme.simplePrimary.withValues(alpha: 0.2)),
+        border: Border.all(
+          color: AppTheme.simplePrimary.withValues(alpha: 0.2),
+        ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              const Icon(Icons.view_list, color: AppTheme.simplePrimary, size: 18),
+              const Icon(
+                Icons.view_list,
+                color: AppTheme.simplePrimary,
+                size: 18,
+              ),
               const SizedBox(width: 8),
               const Expanded(
                 child: Text(
@@ -1133,7 +1422,9 @@ class _PartitionChooserSection extends StatelessWidget {
               child: Row(
                 children: [
                   Icon(
-                    allSelected ? Icons.check_box : Icons.check_box_outline_blank,
+                    allSelected
+                        ? Icons.check_box
+                        : Icons.check_box_outline_blank,
                     color: allSelected
                         ? AppTheme.simplePrimary
                         : AppTheme.textMuted,
@@ -1144,7 +1435,9 @@ class _PartitionChooserSection extends StatelessWidget {
                     child: Text(
                       'Select all partitions',
                       style: TextStyle(
-                          fontWeight: FontWeight.w600, fontSize: 13),
+                        fontWeight: FontWeight.w600,
+                        fontSize: 13,
+                      ),
                     ),
                   ),
                 ],
@@ -1176,8 +1469,11 @@ class _PartitionChooserSection extends StatelessWidget {
               ),
               child: Row(
                 children: [
-                  const Icon(Icons.warning_amber_rounded,
-                      color: AppTheme.accentGold, size: 16),
+                  const Icon(
+                    Icons.warning_amber_rounded,
+                    color: AppTheme.accentGold,
+                    size: 16,
+                  ),
                   const SizedBox(width: 8),
                   const Expanded(
                     child: Text(
@@ -1185,8 +1481,10 @@ class _PartitionChooserSection extends StatelessWidget {
                       'ranges — the partition table stays intact. Choose '
                       '"Wipe entire disk" to destroy every partition and the '
                       'table as well.',
-                      style:
-                          TextStyle(color: AppTheme.accentGold, fontSize: 11),
+                      style: TextStyle(
+                        color: AppTheme.accentGold,
+                        fontSize: 11,
+                      ),
                     ),
                   ),
                   TextButton(
@@ -1212,7 +1510,9 @@ class _PartitionChooserSection extends StatelessWidget {
               '${selected.length} partition(s) selected for wipe: '
               '${selected.map((p) => p.name).join(', ')}',
               style: const TextStyle(
-                  color: AppTheme.textSecondary, fontSize: 11),
+                color: AppTheme.textSecondary,
+                fontSize: 11,
+              ),
             ),
           ],
         ],
@@ -1237,13 +1537,16 @@ class _PartitionChooserSection extends StatelessWidget {
     // stay visible in the detail line.
     final likelyWindows = controller.windowsProbeResults[p.devicePath];
     final probeError = controller.windowsProbeErrors[p.devicePath];
-    final displayName = p.displayName(windowsInstallDetected: likelyWindows == true);
+    final displayName = p.displayName(
+      windowsInstallDetected: likelyWindows == true,
+    );
     final title = likelyWindows == true
         ? '$displayName — likely C: (Windows installed)'
         : displayName;
     // B1 optional: offer the read-only Windows-install probe for Windows-ish,
     // not-disabled partitions in real mode only.
-    final bool offerProbe = !isSimulated &&
+    final bool offerProbe =
+        !isSimulated &&
         !disabled &&
         (p.role == 'windows_data' ||
             const {
@@ -1274,14 +1577,14 @@ class _PartitionChooserSection extends StatelessWidget {
                 disabled
                     ? Icons.lock_outline
                     : (isSelected
-                        ? Icons.check_box
-                        : Icons.check_box_outline_blank),
+                          ? Icons.check_box
+                          : Icons.check_box_outline_blank),
                 size: 18,
                 color: disabled
                     ? AppTheme.textMuted
                     : (isSelected
-                        ? AppTheme.simplePrimary
-                        : AppTheme.textMuted),
+                          ? AppTheme.simplePrimary
+                          : AppTheme.textMuted),
               ),
               const SizedBox(width: 10),
               Expanded(
@@ -1291,27 +1594,32 @@ class _PartitionChooserSection extends StatelessWidget {
                     Text(
                       title,
                       style: TextStyle(
-                        fontWeight: isSelected ? FontWeight.bold : FontWeight.w500,
+                        fontWeight: isSelected
+                            ? FontWeight.bold
+                            : FontWeight.w500,
                         fontSize: 13,
-                        decoration: disabled ? TextDecoration.lineThrough : null,
+                        decoration: disabled
+                            ? TextDecoration.lineThrough
+                            : null,
                       ),
                     ),
                     Text(
                       disabled
                           ? reason
                           : (probeError != null
-                              ? '${p.detailLine} • $probeError'
-                              : p.detailLine),
+                                ? '${p.detailLine} • $probeError'
+                                : p.detailLine),
                       style: const TextStyle(
-                          color: AppTheme.textMuted, fontSize: 11),
+                        color: AppTheme.textMuted,
+                        fontSize: 11,
+                      ),
                     ),
                   ],
                 ),
               ),
               Text(
                 p.name,
-                style:
-                    const TextStyle(color: AppTheme.textMuted, fontSize: 11),
+                style: const TextStyle(color: AppTheme.textMuted, fontSize: 11),
               ),
               if (offerProbe)
                 IconButton(
@@ -1320,20 +1628,27 @@ class _PartitionChooserSection extends StatelessWidget {
                   iconSize: 18,
                   padding: EdgeInsets.zero,
                   constraints: const BoxConstraints(
-                      minWidth: 32, minHeight: 32),
-                  icon: const Icon(Icons.travel_explore,
-                      size: 18, color: AppTheme.textMuted),
+                    minWidth: 32,
+                    minHeight: 32,
+                  ),
+                  icon: const Icon(
+                    Icons.travel_explore,
+                    size: 18,
+                    color: AppTheme.textMuted,
+                  ),
                   onPressed: () async {
                     final err = await controller.probeWindowsInstall(p);
                     if (!context.mounted) return;
                     final messenger = ScaffoldMessenger.maybeOf(context);
                     messenger?.showSnackBar(
                       SnackBar(
-                        content: Text(err ??
-                            (controller.windowsProbeResults[p.devicePath] ==
-                                    true
-                                ? '${p.devicePath}: likely C: (Windows installed)'
-                                : '${p.devicePath}: no Windows installation found')),
+                        content: Text(
+                          err ??
+                              (controller.windowsProbeResults[p.devicePath] ==
+                                      true
+                                  ? '${p.devicePath}: likely C: (Windows installed)'
+                                  : '${p.devicePath}: no Windows installation found'),
+                        ),
                         duration: const Duration(seconds: 4),
                       ),
                     );

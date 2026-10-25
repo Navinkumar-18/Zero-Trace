@@ -31,37 +31,85 @@ pub mod verify;
 
 // Cross-platform core types (guard chain + backends; moved out of `execute`
 // so Windows/Android stub targets compile).
-pub use types::{
-    BlockWriter, BootEnvironment, ValidatedPartitionTarget, PartitionTargetParams,
-};
+pub use types::{BlockWriter, BootEnvironment, PartitionTargetParams, ValidatedPartitionTarget};
 
 /// Re-export primary types for FFI consumers
 #[cfg(target_os = "linux")]
-pub use detect::{DeviceCapabilities, BusType, SmartHealth, DurationClass};
+pub use detect::{BusType, DeviceCapabilities, DurationClass, SmartHealth};
 #[cfg(target_os = "linux")]
 pub use execute::{
-    ExecutionReport, ProgressEvent, ExecutionPhase, SanitizeAction, AtaSanitizeAction,
-    OverwritePattern, FsContext, check_boot_disk_protection, check_boot_disk_protection_ctx,
-    PartitionRangeWriter, compute_partition_table_fingerprint,
-    software_overwrite_partition, software_overwrite_partition_ctx, ALLOWED_PARTITION_METHODS,
-    is_mbr_extended_partition, unmount_target_partition_and_holders,
-    EngineMethod, validate_partition_method, FileBlockWriter, execute_writer_overwrite,
-    resolve_parent_disk, resolve_parent_serial, map_open_excl_error,
+    adopt_verified_wipe_receipt,
+    build_discard_chunks,
+    check_boot_disk_protection,
+    check_boot_disk_protection_ctx,
+    compute_partition_table_fingerprint,
     detect_boot_environment_ctx,
-    // A6: discard execution path
-    DiscardChunk, build_discard_chunks, read_discard_geometry,
-    discard_erase, discard_erase_ctx, discard_erase_partition, discard_erase_partition_ctx,
+    discard_erase,
+    discard_erase_ctx,
+    discard_erase_partition,
+    discard_erase_partition_ctx,
+    execute_writer_overwrite,
+    is_mbr_extended_partition,
+    map_open_excl_error,
+    mark_wiped_and_verified,
+    read_discard_geometry,
+    read_verified_wipe_receipt,
+    record_verified_wipe,
+    recreate_filesystem,
+    recreate_filesystem_with,
+    recreate_whole_device,
+    recreate_whole_device_with,
+    resolve_parent_disk,
+    resolve_parent_serial,
+    software_overwrite_partition,
+    software_overwrite_partition_ctx,
+    unmount_target_partition_and_holders,
+    validate_partition_method,
     validate_partition_target,
+    verified_wipe_stamp_for_path,
+    write_verified_wipe_receipt,
+    AtaSanitizeAction,
+    // A6: discard execution path
+    DiscardChunk,
+    EngineMethod,
+    ExecutionPhase,
+    ExecutionReport,
+    FileBlockWriter,
+    // Phase F: optional post-wipe filesystem recreation
+    FilesystemRecreationReport,
+    FsContext,
+    OverwritePattern,
+    PartitionRangeWriter,
+    ProgressEvent,
+    SanitizeAction,
+    VerifiedWipeStamp,
+    ALLOWED_PARTITION_METHODS,
 };
-#[cfg(target_os = "linux")]
-pub use verify::{VerificationReport, SampleResult};
 #[cfg(target_os = "linux")]
 pub use partitions::{
-    detect_table_type, enumerate_partitions_ctx, DiskEnumerationReport, PartitionEntry,
     // B1: Windows-friendly partition-type classification + volume probing
-    classify_gpt_guid, classify_mbr_type, classify_mbr_partition, format_guid_mixed_endian,
-    parse_gpt_header, parse_gpt_entry, parse_mbr_entries, probe_volume_header,
-    GptHeader, GptPartitionEntry, MbrPartitionEntry, VolumeProbe,
+    classify_gpt_guid,
+    classify_mbr_partition,
+    classify_mbr_type,
     // B1 optional: read-only Windows-install probe
-    classify_windows_root, probe_windows_volume, WindowsProbe,
+    classify_windows_root,
+    detect_table_type,
+    enumerate_partitions_ctx,
+    format_guid_mixed_endian,
+    parse_gpt_entry,
+    parse_gpt_header,
+    parse_mbr_entries,
+    probe_volume_header,
+    probe_windows_volume,
+    DiskEnumerationReport,
+    GptHeader,
+    GptPartitionEntry,
+    MbrPartitionEntry,
+    PartitionEntry,
+    VolumeProbe,
+    WindowsProbe,
 };
+#[cfg(target_os = "linux")]
+pub use types::{FilesystemRecreationRecord, FilesystemType, PartitionTableType};
+#[cfg(target_os = "linux")]
+pub use verify::{SampleResult, VerificationReport};

@@ -33,8 +33,8 @@ class AppPaths {
     final checkpointOverride = env['ZT_CHECKPOINT_DIR'];
     final checkpointDir =
         (checkpointOverride != null && checkpointOverride.trim().isNotEmpty)
-            ? Directory(checkpointOverride)
-            : Directory('${baseDir.path}/checkpoints');
+        ? Directory(checkpointOverride)
+        : Directory('${baseDir.path}/checkpoints');
 
     return AppPaths(baseDir: baseDir, checkpointDir: checkpointDir);
   }
@@ -46,6 +46,20 @@ class AppPaths {
   Directory get certificatesDir => Directory('${baseDir.path}/certificates');
 
   Directory get reportsDir => Directory('${baseDir.path}/reports');
+
+  /// Phase F: one-shot receipt proving the target was just wiped and verified,
+  /// written by `zt_engine verify` for the separate `format` process. Kept in
+  /// the engine checkpoint directory so it shares the same restricted state
+  /// root and disappears with the job.
+  File verifiedWipeReceiptFile(String jobId, {int? partitionNumber}) => File(
+    '${checkpointDir.path}/verified_wipe_$jobId'
+    '${partitionNumber == null ? '' : '_p$partitionNumber'}.json',
+  );
+
+  /// Phase F: remembered filesystem-recreation choices (last fs/label the
+  /// operator confirmed). The "recreate" action itself always defaults to OFF.
+  File get filesystemRecreationPreferenceFile =>
+      File('${baseDir.path}/filesystem_recreation_preference.json');
 
   /// Creates the base, certificates and reports directories if missing.
   void ensureDirectories() {

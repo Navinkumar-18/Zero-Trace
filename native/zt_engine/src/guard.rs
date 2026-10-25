@@ -109,7 +109,12 @@ impl ValidatedTarget {
         scope: TargetScope,
         pinned_size_bytes: u64,
     ) -> Self {
-        Self { canonical_path, guard_identity, scope, pinned_size_bytes }
+        Self {
+            canonical_path,
+            guard_identity,
+            scope,
+            pinned_size_bytes,
+        }
     }
 
     pub fn canonical_path(&self) -> &str {
@@ -188,11 +193,33 @@ fn scan_mount_and_swap_protection(
 
     // Exempt virtual in-memory pseudo-filesystems from anonymous device check
     let exempt_pseudo_fs: HashSet<&str> = [
-        "tmpfs", "devtmpfs", "proc", "sysfs", "cgroup", "cgroup2",
-        "ramfs", "devpts", "pstore", "securityfs", "tracefs", "debugfs",
-        "mqueue", "hugetlbfs", "autofs", "fusectl", "configfs", "efivarfs",
-        "bpf", "squashfs", "nsfs", "pipefs", "sockfs", "rpc_pipefs",
-    ].into_iter().collect();
+        "tmpfs",
+        "devtmpfs",
+        "proc",
+        "sysfs",
+        "cgroup",
+        "cgroup2",
+        "ramfs",
+        "devpts",
+        "pstore",
+        "securityfs",
+        "tracefs",
+        "debugfs",
+        "mqueue",
+        "hugetlbfs",
+        "autofs",
+        "fusectl",
+        "configfs",
+        "efivarfs",
+        "bpf",
+        "squashfs",
+        "nsfs",
+        "pipefs",
+        "sockfs",
+        "rpc_pipefs",
+    ]
+    .into_iter()
+    .collect();
 
     // Resolve a /dev mount/swap source: canonicalize → name (recorded even
     // when the sysfs dev number is absent — historic inline order), with the
@@ -204,7 +231,9 @@ fn scan_mount_and_swap_protection(
             return Ok(None);
         };
         let name = canon.rsplit('/').next().unwrap_or(&canon).to_string();
-        let dev_attr = backend.sysfs_class_attr(&name, "dev").map_err(scan_read_err)?;
+        let dev_attr = backend
+            .sysfs_class_attr(&name, "dev")
+            .map_err(scan_read_err)?;
         let mm = dev_attr.and_then(|c| parse_major_minor(&c));
         Ok(Some((name, mm)))
     };
@@ -217,7 +246,10 @@ fn scan_mount_and_swap_protection(
 
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
         if parts.len() < 5 {
-            return Err(ExecuteError::BootDiskProtection(format!("Corrupt mountinfo line: {}", line)));
+            return Err(ExecuteError::BootDiskProtection(format!(
+                "Corrupt mountinfo line: {}",
+                line
+            )));
         }
 
         let mm_str = parts[2];
@@ -259,7 +291,10 @@ fn scan_mount_and_swap_protection(
                         if let Some(dev_mm) = dev_attr.and_then(|c| parse_major_minor(&c)) {
                             protected_devs.insert(
                                 dev_mm,
-                                format!("btrfs device '{}' for protected mount '{}'", d_name, mount_point),
+                                format!(
+                                    "btrfs device '{}' for protected mount '{}'",
+                                    d_name, mount_point
+                                ),
                             );
                             btrfs_resolved = true;
                         }
@@ -273,7 +308,10 @@ fn scan_mount_and_swap_protection(
                         if let Some(dev_mm) = src_attr.and_then(|c| parse_major_minor(&c)) {
                             protected_devs.insert(
                                 dev_mm,
-                                format!("btrfs source '{}' for protected mount '{}'", src_name, mount_point),
+                                format!(
+                                    "btrfs source '{}' for protected mount '{}'",
+                                    src_name, mount_point
+                                ),
                             );
                             btrfs_resolved = true;
                         }
@@ -291,7 +329,10 @@ fn scan_mount_and_swap_protection(
                         if let Some(mm) = src_mm {
                             protected_devs.insert(
                                 mm,
-                                format!("mount source '{}' for protected mount '{}'", mount_source, mount_point),
+                                format!(
+                                    "mount source '{}' for protected mount '{}'",
+                                    mount_source, mount_point
+                                ),
                             );
                         }
                     }
@@ -313,7 +354,10 @@ fn scan_mount_and_swap_protection(
                     if let Some(mm) = src_mm {
                         protected_devs.insert(
                             mm,
-                            format!("mount source '{}' for protected mount '{}'", mount_source, mount_point),
+                            format!(
+                                "mount source '{}' for protected mount '{}'",
+                                mount_source, mount_point
+                            ),
                         );
                     }
                 }
@@ -345,7 +389,10 @@ fn scan_mount_and_swap_protection(
             let mut swap_resolved = false;
             if let Some(dev) = backend.stat_backing_device(swap_target) {
                 let mm = dev;
-                protected_devs.insert(mm, format!("backing device for active swap file '{}'", swap_target));
+                protected_devs.insert(
+                    mm,
+                    format!("backing device for active swap file '{}'", swap_target),
+                );
                 swap_resolved = true;
             }
             if !swap_resolved {
@@ -358,7 +405,13 @@ fn scan_mount_and_swap_protection(
                     }
                 }
                 if let Some(mm) = best_mm {
-                    protected_devs.insert(mm, format!("backing mount '{}' for active swap file '{}'", best_prefix, swap_target));
+                    protected_devs.insert(
+                        mm,
+                        format!(
+                            "backing mount '{}' for active swap file '{}'",
+                            best_prefix, swap_target
+                        ),
+                    );
                     swap_resolved = true;
                 }
             }
@@ -471,7 +524,10 @@ pub fn check_boot_disk_protection(
                 if backend.sysfs_is_partition(&dev)
                     && dev.starts_with(&parent_disk)
                     && (dev[parent_disk.len()..].starts_with('p')
-                        || dev[parent_disk.len()..].chars().next().is_some_and(|c| c.is_ascii_digit()))
+                        || dev[parent_disk.len()..]
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_digit()))
                 {
                     family_devices.insert(dev);
                 }
@@ -482,7 +538,10 @@ pub fn check_boot_disk_protection(
             if backend.sysfs_is_partition(&dev)
                 && dev.starts_with(&target_name)
                 && (dev[target_name.len()..].starts_with('p')
-                    || dev[target_name.len()..].chars().next().is_some_and(|c| c.is_ascii_digit()))
+                    || dev[target_name.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit()))
             {
                 family_devices.insert(dev);
             }
@@ -525,20 +584,25 @@ pub fn check_boot_disk_protection(
                 "Refusing operation: target '{}' (associated with member '{}') matches a protected device/mount",
                 device, dev
             )));
-
         }
 
         // Fail closed when the sysfs dev file exists but cannot be read —
         // same refusal as the historic inline read (exact message).
         let dev_attr = backend.sysfs_class_attr(dev, "dev").map_err(|e| match e {
             BackendError::Io(msg) => ExecuteError::BootDiskProtection(format!(
-                "Cannot read sysfs dev file for {}: {}", dev, msg
+                "Cannot read sysfs dev file for {}: {}",
+                dev, msg
             )),
             other => ExecuteError::BootDiskProtection(other.to_string()),
         })?;
         if let Some(content) = dev_attr {
-            let mm = parse_major_minor(&content)
-                .ok_or_else(|| ExecuteError::BootDiskProtection(format!("Corrupt dev file for device {}: '{}'", dev, content.trim())))?;
+            let mm = parse_major_minor(&content).ok_or_else(|| {
+                ExecuteError::BootDiskProtection(format!(
+                    "Corrupt dev file for device {}: '{}'",
+                    dev,
+                    content.trim()
+                ))
+            })?;
 
             if let Some(reason) = protected_devs.get(&mm) {
                 return Err(ExecuteError::BootDiskProtection(format!(
@@ -627,13 +691,16 @@ pub fn recheck_protection_by_dev_t(
     let Some(content) = backend.mountinfo_self().map_err(|e| match e {
         BackendError::Unavailable(msg) => ExecuteError::BootDiskProtection(msg),
         other => ExecuteError::BootDiskProtection(other.to_string()),
-    })? else {
+    })?
+    else {
         return Ok(());
     };
 
     for line in content.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 5 { continue; }
+        if parts.len() < 5 {
+            continue;
+        }
         let mm_str = parts[2];
         let mount_point = parts[4];
         if is_mount_unmountable_allowlisted(mount_point) {
@@ -677,7 +744,10 @@ pub fn compute_partition_table_fingerprint(
     for name in backend.sysfs_block_names() {
         if name.starts_with(parent_name)
             && (name[parent_name.len()..].starts_with('p')
-                || name[parent_name.len()..].chars().next().is_some_and(|c| c.is_ascii_digit()))
+                || name[parent_name.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit()))
         {
             // `partition` present (Ok(Some)|Err) gates on existence like the
             // historic `part_file.exists()`; read failures degrade to ""
@@ -721,11 +791,16 @@ pub fn is_mbr_extended_partition(
 ) -> Result<bool, ExecuteError> {
     let part_name = device.strip_prefix("/dev/").unwrap_or(device);
 
-    if !matches!(backend.sysfs_class_attr(part_name, "subpartition"), Ok(None)) {
+    if !matches!(
+        backend.sysfs_class_attr(part_name, "subpartition"),
+        Ok(None)
+    ) {
         return Ok(true);
     }
 
-    let parent_canonical = backend.canonicalize_path(parent_disk, false).unwrap_or_else(|_| parent_disk.to_string());
+    let parent_canonical = backend
+        .canonicalize_path(parent_disk, false)
+        .unwrap_or_else(|_| parent_disk.to_string());
     let parent_path = backend.device_file_path(parent_disk, &parent_canonical);
 
     if let Ok(mbr) = backend.read_raw(&parent_path.to_string_lossy(), 0, 512) {
@@ -774,11 +849,16 @@ pub fn unmount_target_partition_and_holders(
     let mut stderr_accum = String::new();
 
     if dry_run {
-        command_log.push(format!("[DRY RUN] Would check mounts and unmount partition {} and its holders", target_partition));
+        command_log.push(format!(
+            "[DRY RUN] Would check mounts and unmount partition {} and its holders",
+            target_partition
+        ));
         return Ok((stdout_accum, stderr_accum));
     }
 
-    let target_name = target_partition.strip_prefix("/dev/").unwrap_or(target_partition);
+    let target_name = target_partition
+        .strip_prefix("/dev/")
+        .unwrap_or(target_partition);
     let target_canonical = backend.canonicalize_path(target_partition, dry_run)?;
 
     // 1. Resolve holders
@@ -802,8 +882,12 @@ pub fn unmount_target_partition_and_holders(
             }
         }
         if is_mounted {
-            command_log.push(format!("[UNMOUNT] Unmounting active holder: {}", holder_dev));
-            let (stdout, stderr, code) = run_logged_cmd(backend, "umount", &["-f", &holder_dev], command_log)?;
+            command_log.push(format!(
+                "[UNMOUNT] Unmounting active holder: {}",
+                holder_dev
+            ));
+            let (stdout, stderr, code) =
+                run_logged_cmd(backend, "umount", &["-f", &holder_dev], command_log)?;
             stdout_accum.push_str(&stdout);
             stderr_accum.push_str(&stderr);
             if code != 0 {
@@ -825,13 +909,18 @@ pub fn unmount_target_partition_and_holders(
     }
 
     if is_target_mounted {
-        command_log.push(format!("[UNMOUNT] Unmounting active partition: {}", target_partition));
-        let (stdout, stderr, code) = run_logged_cmd(backend, "umount", &["-f", target_partition], command_log)?;
+        command_log.push(format!(
+            "[UNMOUNT] Unmounting active partition: {}",
+            target_partition
+        ));
+        let (stdout, stderr, code) =
+            run_logged_cmd(backend, "umount", &["-f", target_partition], command_log)?;
         stdout_accum.push_str(&stdout);
         stderr_accum.push_str(&stderr);
         if code != 0 {
             return Err(ExecuteError::CommandFailed(format!(
-                "Failed to unmount partition {}: {}", target_partition, stderr
+                "Failed to unmount partition {}: {}",
+                target_partition, stderr
             )));
         }
     }
@@ -911,9 +1000,11 @@ pub fn resolve_parent_serial(
     for attr in &["device/uevent", "uevent"] {
         if let Ok(Some(uevent)) = backend.sysfs_class_attr(&parent_name, attr) {
             for line in uevent.lines() {
-                if let Some(s) = line.strip_prefix("ID_SERIAL_SHORT=")
+                if let Some(s) = line
+                    .strip_prefix("ID_SERIAL_SHORT=")
                     .or_else(|| line.strip_prefix("ID_SERIAL="))
-                    .or_else(|| line.strip_prefix("SERIAL=")) {
+                    .or_else(|| line.strip_prefix("SERIAL="))
+                {
                     let trimmed = s.trim();
                     if !trimmed.is_empty() {
                         return Ok(trimmed.to_string());
@@ -1239,6 +1330,139 @@ pub fn revalidate_target_identity(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Phase F: post-wipe filesystem recreation guards
+// ---------------------------------------------------------------------------
+
+/// `(source, optional major:minor)` pair from the mount/swap state.
+type MountedSourceFact = (String, Option<(u32, u32)>);
+
+/// Source/dev pairs currently mounted or active as swap. Mountinfo fields:
+/// `... major:minor ... - fstype source superopts`.
+fn mounted_source_facts(
+    backend: &dyn BlockBackend,
+) -> Result<Vec<MountedSourceFact>, ExecuteError> {
+    let state = backend.read_mount_state().map_err(scan_read_err)?;
+    let mut out: Vec<MountedSourceFact> = Vec::new();
+
+    for line in state.mountinfo.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        let dev = parse_major_minor(parts[2]);
+        if let Some(sep) = parts.iter().position(|p| *p == "-") {
+            if let Some(source) = parts.get(sep + 2) {
+                out.push(((*source).to_string(), dev));
+            }
+        }
+    }
+    for line in state.mounts.lines() {
+        if let Some(source) = line.split_whitespace().next() {
+            out.push((source.to_string(), None));
+        }
+    }
+    for line in state.swaps.lines().skip(1) {
+        if let Some(source) = line.split_whitespace().next() {
+            out.push((source.to_string(), None));
+        }
+    }
+    Ok(out)
+}
+
+/// Every block device covered by `target`: the target node itself, plus all
+/// child partitions when the scope is a whole disk. Used to refuse formatting
+/// a disk/partition that still has an active mount (including a sibling
+/// partition for whole-disk scope).
+fn target_block_names(backend: &dyn BlockBackend, target: &ValidatedTarget) -> Vec<String> {
+    let canonical = target.canonical_path();
+    let name = canonical
+        .strip_prefix("/dev/")
+        .unwrap_or(canonical)
+        .to_string();
+    let mut names = vec![name.clone()];
+    if matches!(target.scope(), TargetScope::WholeDisk) {
+        for candidate in backend.sysfs_block_names() {
+            if candidate != name
+                && candidate.starts_with(&name)
+                && !matches!(backend.sysfs_class_attr(&candidate, "partition"), Ok(None))
+            {
+                names.push(candidate);
+            }
+        }
+    }
+    names
+}
+
+/// Refuse if the validated target (or, for whole-disk scope, any of its
+/// partitions) is mounted, held by an active mount, or active as swap.
+///
+/// This is intentionally stricter than boot-disk protection: boot protection
+/// allows mounts under `/mnt`/`/media` to be unmounted, but formatting a
+/// mounted filesystem in place is never safe.
+pub fn assert_target_not_mounted(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+) -> Result<(), ExecuteError> {
+    let sources = mounted_source_facts(backend)?;
+    let names = target_block_names(backend, target);
+    let id = target.guard_identity();
+    let target_dev = (id.major, id.minor);
+
+    for (source, dev) in sources {
+        let source_name = source.rsplit('/').next().unwrap_or(&source);
+        let by_name = names
+            .iter()
+            .any(|n| n == source_name || source == format!("/dev/{}", n));
+        let by_dev = dev == Some(target_dev);
+        if by_name || by_dev {
+            return Err(ExecuteError::TargetMounted(format!(
+                "{} is mounted/active as '{}'",
+                target.canonical_path(),
+                source
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a target that belongs to the running system / live medium. The
+/// shared boot-disk protection chain owns the policy (normal/live/container,
+/// swaps, holders); this wrapper only re-types its refusal for the format
+/// step so callers get a precise error.
+pub fn assert_target_not_system_partition(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+) -> Result<(), ExecuteError> {
+    match check_boot_disk_protection(backend, target.canonical_path(), false) {
+        Ok(()) => Ok(()),
+        Err(ExecuteError::BootDiskProtection(msg)) => Err(ExecuteError::SystemPartition(msg)),
+        Err(other) => Err(other),
+    }
+}
+
+/// F2: after a partition-scope wipe, the table fingerprint captured at
+/// validation time must still be identical. Any drift is a hard failure.
+pub fn assert_partition_table_unchanged(
+    backend: &dyn BlockBackend,
+    scope: &TargetScope,
+    expected_fingerprint: &str,
+) -> Result<String, ExecuteError> {
+    let TargetScope::Partition { parent_name, .. } = scope else {
+        return Err(ExecuteError::FilesystemScopeMismatch(
+            "partition-table assertion requires partition scope".to_string(),
+        ));
+    };
+    let current = compute_partition_table_fingerprint(backend, parent_name)?;
+    if current != expected_fingerprint {
+        return Err(ExecuteError::IdentityMismatch(format!(
+            "Partition table changed during the wipe: expected fingerprint {}, got {}",
+            expected_fingerprint, current
+        )));
+    }
+    Ok(current)
 }
 
 // ---------------------------------------------------------------------------

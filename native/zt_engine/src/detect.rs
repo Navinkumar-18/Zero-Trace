@@ -216,9 +216,8 @@ impl DeviceCapabilities {
     /// supports a hardware command that reaches beyond the user-addressable
     /// area (per NIST SP 800-88 Rev. 1). Everything else is "Clear".
     pub fn sanitization_level(&self, whole_device: bool) -> &'static str {
-        let hw_supported = self.supports_secure_erase()
-            || self.supports_sanitize()
-            || self.supports_nvme_format;
+        let hw_supported =
+            self.supports_secure_erase() || self.supports_sanitize() || self.supports_nvme_format;
         if whole_device && hw_supported {
             "Purge"
         } else {
@@ -301,7 +300,11 @@ pub fn parse_smartctl_json(stdout: &str) -> SmartctlData {
     if let Some(rot) = parsed.get("rotation_rate").and_then(|v| v.as_u64()) {
         data.rotation_rate = Some(rot as u32);
     }
-    if let Some(dt) = parsed.get("device").and_then(|d| d.get("type")).and_then(|v| v.as_str()) {
+    if let Some(dt) = parsed
+        .get("device")
+        .and_then(|d| d.get("type"))
+        .and_then(|v| v.as_str())
+    {
         data.device_type = Some(dt.to_string());
     }
 
@@ -320,7 +323,8 @@ pub fn parse_smartctl_json(stdout: &str) -> SmartctlData {
     }
 
     // ATA SMART attributes (id 5 = Reallocated Sectors, id 177/233 = Wear Leveling)
-    if let Some(attrs) = parsed.get("ata_smart_attributes")
+    if let Some(attrs) = parsed
+        .get("ata_smart_attributes")
         .and_then(|a| a.get("table"))
         .and_then(|t| t.as_array())
     {
@@ -561,7 +565,10 @@ pub fn parse_mmc_extcsd(stdout: &str) -> MmcData {
         if trimmed.contains("sec_feature_support") {
             // Parse the hex value
             if let Some(val_str) = trimmed.split("0x").nth(1) {
-                let val_str = val_str.split(|c: char| !c.is_ascii_hexdigit()).next().unwrap_or("");
+                let val_str = val_str
+                    .split(|c: char| !c.is_ascii_hexdigit())
+                    .next()
+                    .unwrap_or("");
                 if let Ok(val) = u32::from_str_radix(val_str, 16) {
                     data.sanitize_supported = (val & (1 << 6)) != 0;
                 }
@@ -640,10 +647,8 @@ pub fn probe_device(device_path: &str) -> DeviceCapabilities {
     }
 
     // Determine which additional probes to run based on bus type
-    let is_nvme = caps.bus_type == BusType::NVMe
-        || device_path.contains("nvme");
-    let is_emmc = caps.bus_type == BusType::EMMC
-        || device_path.contains("mmcblk");
+    let is_nvme = caps.bus_type == BusType::NVMe || device_path.contains("nvme");
+    let is_emmc = caps.bus_type == BusType::EMMC || device_path.contains("mmcblk");
 
     // 2. hdparm -I (for ATA/SATA devices)
     if !is_nvme && !is_emmc {
@@ -782,7 +787,10 @@ pub fn detect_discard_support(device_path: &str, sys_root: &str) -> bool {
 }
 
 /// A1: sysfs rotatation + removability flags (None when sysfs is unavailable).
-pub fn detect_rotation_and_removable(device_path: &str, sys_root: &str) -> (Option<bool>, Option<bool>) {
+pub fn detect_rotation_and_removable(
+    device_path: &str,
+    sys_root: &str,
+) -> (Option<bool>, Option<bool>) {
     let rotational = read_sysfs_attr(device_path, sys_root, "queue/rotational")
         .and_then(|v| v.parse::<u8>().ok())
         .map(|v| v == 1);
@@ -898,11 +906,17 @@ mod tests {
         // Text output: ONCS bit 1 set (Format NVM); 0x46 = bits 1, 2, 6
         let data = parse_nvme_id_ctrl("sanicap : 0x3\noncs   : 0x46\n");
         assert!(data.sanitize_supported);
-        assert!(data.format_supported, "ONCS bit 1 must enable format support");
+        assert!(
+            data.format_supported,
+            "ONCS bit 1 must enable format support"
+        );
 
         // Text output: ONCS bit 1 clear; 0x44 = bits 2, 6 only
         let data = parse_nvme_id_ctrl("sanicap : 0x3\noncs   : 0x44\n");
-        assert!(!data.format_supported, "ONCS bit 1 clear must not report format support");
+        assert!(
+            !data.format_supported,
+            "ONCS bit 1 clear must not report format support"
+        );
 
         // JSON output
         let data = parse_nvme_id_ctrl(r#"{"sanicap": 3, "oncs": 4}"#);
@@ -913,15 +927,42 @@ mod tests {
     #[test]
     fn test_classify_device_class_matrix() {
         use BusType::*;
-        assert_eq!(classify_device_class("/dev/nvme0n1", &NVMe, None, None), DeviceClass::NvMe);
-        assert_eq!(classify_device_class("/dev/mmcblk0", &EMMC, None, Some(true)), DeviceClass::Sd);
-        assert_eq!(classify_device_class("/dev/mmcblk0", &EMMC, None, Some(false)), DeviceClass::Emmc);
-        assert_eq!(classify_device_class("/dev/sdb", &USB, None, None), DeviceClass::UsbFlash);
-        assert_eq!(classify_device_class("/dev/sda", &SATA, Some(true), Some(false)), DeviceClass::Hdd);
-        assert_eq!(classify_device_class("/dev/sda", &SATA, Some(false), Some(false)), DeviceClass::SataSsd);
-        assert_eq!(classify_device_class("/dev/sda", &SATA, None, Some(false)), DeviceClass::SataSsd);
-        assert_eq!(classify_device_class("/dev/sda", &Unknown, None, None), DeviceClass::Unknown);
-        assert_eq!(classify_device_class("/dev/mapper/foo", &Unknown, None, None), DeviceClass::Unknown);
+        assert_eq!(
+            classify_device_class("/dev/nvme0n1", &NVMe, None, None),
+            DeviceClass::NvMe
+        );
+        assert_eq!(
+            classify_device_class("/dev/mmcblk0", &EMMC, None, Some(true)),
+            DeviceClass::Sd
+        );
+        assert_eq!(
+            classify_device_class("/dev/mmcblk0", &EMMC, None, Some(false)),
+            DeviceClass::Emmc
+        );
+        assert_eq!(
+            classify_device_class("/dev/sdb", &USB, None, None),
+            DeviceClass::UsbFlash
+        );
+        assert_eq!(
+            classify_device_class("/dev/sda", &SATA, Some(true), Some(false)),
+            DeviceClass::Hdd
+        );
+        assert_eq!(
+            classify_device_class("/dev/sda", &SATA, Some(false), Some(false)),
+            DeviceClass::SataSsd
+        );
+        assert_eq!(
+            classify_device_class("/dev/sda", &SATA, None, Some(false)),
+            DeviceClass::SataSsd
+        );
+        assert_eq!(
+            classify_device_class("/dev/sda", &Unknown, None, None),
+            DeviceClass::Unknown
+        );
+        assert_eq!(
+            classify_device_class("/dev/mapper/foo", &Unknown, None, None),
+            DeviceClass::Unknown
+        );
     }
 
     #[test]
@@ -956,13 +997,22 @@ mod tests {
         std::fs::create_dir_all(&block).unwrap();
 
         // No discard_max_bytes yet -> false
-        assert!(!detect_discard_support("/dev/sdb", tmp.path().to_str().unwrap()));
+        assert!(!detect_discard_support(
+            "/dev/sdb",
+            tmp.path().to_str().unwrap()
+        ));
 
         std::fs::write(block.join("discard_max_bytes"), "33554432\n").unwrap();
-        assert!(detect_discard_support("/dev/sdb", tmp.path().to_str().unwrap()));
+        assert!(detect_discard_support(
+            "/dev/sdb",
+            tmp.path().to_str().unwrap()
+        ));
 
         std::fs::write(block.join("discard_max_bytes"), "0\n").unwrap();
-        assert!(!detect_discard_support("/dev/sdb", tmp.path().to_str().unwrap()));
+        assert!(!detect_discard_support(
+            "/dev/sdb",
+            tmp.path().to_str().unwrap()
+        ));
     }
 
     #[test]
@@ -973,7 +1023,8 @@ mod tests {
         std::fs::write(block.join("queue/rotational"), "0\n").unwrap();
         std::fs::write(block.join("removable"), "1\n").unwrap();
 
-        let (rot, rem) = detect_rotation_and_removable("/dev/mmcblk0", tmp.path().to_str().unwrap());
+        let (rot, rem) =
+            detect_rotation_and_removable("/dev/mmcblk0", tmp.path().to_str().unwrap());
         assert_eq!(rot, Some(false));
         assert_eq!(rem, Some(true));
     }

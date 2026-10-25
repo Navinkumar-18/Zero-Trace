@@ -34,17 +34,23 @@ fn test_fd_identity_mismatch_aborts() {
         st_rdev: 999999, // Mismatched st_rdev
         major: 99,
         minor: 99,
-        is_block: true,  // Expecting a block device, but tmp is a regular file
+        is_block: true, // Expecting a block device, but tmp is a regular file
         device_serial: "FAKE_SERIAL_123".to_string(),
         st_ino: 0,
     };
 
     let result = DirectBlockWriter::open(path_str, &fake_identity);
-    assert!(result.is_err(), "Opening device with mismatched identity must abort");
+    assert!(
+        result.is_err(),
+        "Opening device with mismatched identity must abort"
+    );
     match result.unwrap_err() {
         ExecuteError::BootDiskProtection(msg) => {
-            assert!(msg.contains("st_rdev") || msg.contains("not a block device"),
-                "Expected st_rdev or block device mismatch message, got: {}", msg);
+            assert!(
+                msg.contains("st_rdev") || msg.contains("not a block device"),
+                "Expected st_rdev or block device mismatch message, got: {}",
+                msg
+            );
         }
         other => panic!("Expected BootDiskProtection error, got {:?}", other),
     }
@@ -73,8 +79,11 @@ fn test_path_resolving_to_different_device_aborts() {
     assert!(result.is_err());
     match result.unwrap_err() {
         ExecuteError::BootDiskProtection(msg) => {
-            assert!(msg.contains("inode mismatch") || msg.contains("different file"),
-                "Expected inode mismatch message, got: {}", msg);
+            assert!(
+                msg.contains("inode mismatch") || msg.contains("different file"),
+                "Expected inode mismatch message, got: {}",
+                msg
+            );
         }
         other => panic!("Expected BootDiskProtection error, got {:?}", other),
     }
@@ -98,7 +107,9 @@ async fn test_dry_run_never_unmounts_and_never_opens_for_writing() {
         "DRY_SER",
         true, // dry_run = true
         tx,
-    ).await.expect("Dry run should succeed without touching hardware");
+    )
+    .await
+    .expect("Dry run should succeed without touching hardware");
 
     assert!(report.success);
     assert!(report.dry_run);
@@ -106,10 +117,16 @@ async fn test_dry_run_never_unmounts_and_never_opens_for_writing() {
     assert_eq!(report.io_mode, "dry_run");
 
     // Must not have unmount commands
-    let unmount_calls: Vec<&String> = report.command_log.iter()
+    let unmount_calls: Vec<&String> = report
+        .command_log
+        .iter()
         .filter(|c| c.to_lowercase().contains("umount"))
         .collect();
-    assert!(unmount_calls.is_empty(), "Dry run must NOT call unmount: {:?}", unmount_calls);
+    assert!(
+        unmount_calls.is_empty(),
+        "Dry run must NOT call unmount: {:?}",
+        unmount_calls
+    );
 }
 
 // =========================================================================
@@ -134,7 +151,10 @@ fn test_method_to_pattern_mapping_pinned() {
         if pass == 1 {
             assert!(is_random, "MultiPass3 pass 2 must be random");
         } else {
-            assert!(!is_random, "MultiPass3 pass 1 and 3 must be non-random (zeros)");
+            assert!(
+                !is_random,
+                "MultiPass3 pass 1 and 3 must be non-random (zeros)"
+            );
         }
     }
 
@@ -170,13 +190,24 @@ fn test_random_pass_verification_aggregated_entropy_with_chacha() {
         "random-pass",
         None, // Exact default verify sample size (DEFAULT_SAMPLE_COUNT = 50 samples * 512 bytes = 25,600 bytes)
         false, // expect_zeros = false (random pass)
-    ).expect("Verification execution should succeed");
+    )
+    .expect("Verification execution should succeed");
 
-    assert!(report.pass, "Real ChaCha20 data must pass aggregated random verification");
-    assert_eq!(report.sample_count, 50, "Must match exact default verify sample size of 50");
+    assert!(
+        report.pass,
+        "Real ChaCha20 data must pass aggregated random verification"
+    );
+    assert_eq!(
+        report.sample_count, 50,
+        "Must match exact default verify sample size of 50"
+    );
     assert_eq!(report.samples.len(), 50);
     let entropy = report.entropy_score;
-    assert!(entropy > 0.95, "Aggregated entropy must be > 0.95, got {}", entropy);
+    assert!(
+        entropy > 0.95,
+        "Aggregated entropy must be > 0.95, got {}",
+        entropy
+    );
 
     // If we test an all-zeros file with expect_zeros: false, it MUST fail
     let mut zero_tmp = NamedTempFile::new().unwrap();
@@ -195,9 +226,13 @@ fn test_random_pass_verification_aggregated_entropy_with_chacha() {
         "random-pass",
         Some(50),
         false, // expect_zeros = false
-    ).expect("Verification should execute");
+    )
+    .expect("Verification should execute");
 
-    assert!(!fail_report.pass, "Zero-filled file must NOT pass random-pass verification");
+    assert!(
+        !fail_report.pass,
+        "Zero-filled file must NOT pass random-pass verification"
+    );
 }
 
 // =========================================================================
@@ -213,7 +248,11 @@ async fn test_non_multiple_of_chunk_size_tail_written_correctly() {
     tmp.as_file().set_len(target_size).unwrap();
 
     let writer = FileBlockWriter::new(
-        OpenOptions::new().read(true).write(true).open(tmp.path()).unwrap(),
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp.path())
+            .unwrap(),
         target_size,
     );
 
@@ -228,7 +267,9 @@ async fn test_non_multiple_of_chunk_size_tail_written_correctly() {
         "Test Non-Multiple Tail",
         start,
         tx,
-    ).await.expect("Overwrite should succeed");
+    )
+    .await
+    .expect("Overwrite should succeed");
 
     assert!(report.success);
     assert_eq!(report.bytes_written, target_size);
@@ -236,7 +277,10 @@ async fn test_non_multiple_of_chunk_size_tail_written_correctly() {
     // Read back and verify file length and that all bytes are zeros
     let data = std::fs::read(tmp.path()).unwrap();
     assert_eq!(data.len() as u64, target_size);
-    assert!(data.iter().all(|&b| b == 0), "All 5.3 MiB including tail must be overwritten with 0");
+    assert!(
+        data.iter().all(|&b| b == 0),
+        "All 5.3 MiB including tail must be overwritten with 0"
+    );
 }
 
 #[tokio::test]
@@ -251,7 +295,11 @@ async fn test_sub_chunk_size_single_write() {
     std::fs::write(tmp.path(), &initial).unwrap();
 
     let writer = FileBlockWriter::new(
-        OpenOptions::new().read(true).write(true).open(tmp.path()).unwrap(),
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp.path())
+            .unwrap(),
         target_size,
     );
 
@@ -266,7 +314,9 @@ async fn test_sub_chunk_size_single_write() {
         "Test Sub-Chunk",
         start,
         tx,
-    ).await.expect("Overwrite should succeed");
+    )
+    .await
+    .expect("Overwrite should succeed");
 
     assert!(report.success);
     assert_eq!(report.bytes_written, target_size);
@@ -295,9 +345,13 @@ async fn test_write_error_midway_eio_aborts_without_success_report() {
         "Test EIO",
         start,
         tx,
-    ).await;
+    )
+    .await;
 
-    assert!(result.is_err(), "Midway I/O error must fail execute_writer_overwrite");
+    assert!(
+        result.is_err(),
+        "Midway I/O error must fail execute_writer_overwrite"
+    );
     match result.unwrap_err() {
         ExecuteError::HardwareIo(msg) => {
             assert!(msg.contains("EIO") || msg.contains("Input/output error"));
@@ -325,7 +379,8 @@ async fn test_write_error_midway_enospc_aborts() {
         "Test ENOSPC",
         start,
         tx,
-    ).await;
+    )
+    .await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -353,7 +408,8 @@ async fn test_sync_failure_aborts() {
         "Test Sync Fail",
         start,
         tx,
-    ).await;
+    )
+    .await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -383,7 +439,8 @@ async fn test_heartbeat_and_monotonic_progress() {
             "Test Monotonic",
             start,
             tx,
-        ).await
+        )
+        .await
     });
 
     let mut events = Vec::new();
@@ -425,7 +482,8 @@ async fn test_write_error_enodev_aborts() {
         "Test ENODEV",
         start,
         tx,
-    ).await;
+    )
+    .await;
 
     assert!(result.is_err(), "ENODEV must cause overwrite failure");
     match result.unwrap_err() {
@@ -453,7 +511,8 @@ async fn test_short_write_returning_zero_aborts() {
         "Test Short Write Zero",
         start,
         tx,
-    ).await;
+    )
+    .await;
 
     assert!(result.is_err(), "Write returning 0 bytes must abort");
     match result.unwrap_err() {
@@ -469,7 +528,13 @@ fn test_o_excl_exclusive_open_blocks_concurrent_open() {
     let tmp = NamedTempFile::new().unwrap();
     let c_path = std::ffi::CString::new(tmp.path().to_str().unwrap()).unwrap();
     // Opening with O_CREAT | O_EXCL on an existing file fails with EEXIST / EBUSY
-    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_CREAT | libc::O_EXCL | libc::O_RDWR, 0o600) };
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            0o600,
+        )
+    };
     assert_eq!(fd, -1);
     let err = std::io::Error::last_os_error();
     assert_eq!(err.raw_os_error(), Some(libc::EEXIST));
@@ -486,7 +551,8 @@ async fn test_serial_mismatch_aborts_before_first_write() {
         "REAL_DEVICE_SERIAL_XYZ",
         true,
         tx,
-    ).await;
+    )
+    .await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
@@ -519,11 +585,20 @@ async fn test_cancel_signal_syncs_and_reports_exact_bytes_done() {
         start,
         tx,
         Some(cancel_flag),
-    ).await.expect("Cancelled run should return report with success=false");
+    )
+    .await
+    .expect("Cancelled run should return report with success=false");
 
-    assert!(!report.success, "Cancelled overwrite must have success=false");
+    assert!(
+        !report.success,
+        "Cancelled overwrite must have success=false"
+    );
     assert_eq!(report.exit_code, 130, "Cancelled exit code must be 130");
-    assert_eq!(report.bytes_written, 2 * 1024 * 1024, "Bytes written must match exactly 1 chunk written before cancel");
+    assert_eq!(
+        report.bytes_written,
+        2 * 1024 * 1024,
+        "Bytes written must match exactly 1 chunk written before cancel"
+    );
     assert!(report.stderr.contains("cancelled by user"));
 
     // Verify progress events were received
@@ -531,7 +606,10 @@ async fn test_cancel_signal_syncs_and_reports_exact_bytes_done() {
     while let Ok(evt) = rx.try_recv() {
         events.push(evt);
     }
-    assert!(!events.is_empty(), "Should stream progress up to cancellation");
+    assert!(
+        !events.is_empty(),
+        "Should stream progress up to cancellation"
+    );
 }
 
 #[test]
@@ -560,8 +638,8 @@ fn test_heartbeat_line_integrity_schema2_json() {
 
 #[test]
 fn test_usb_speed_parser_detects_usb2_vs_usb3() {
-    use zt_engine::detect::detect_usb_speed;
     use tempfile::tempdir;
+    use zt_engine::detect::detect_usb_speed;
 
     let dir = tempdir().unwrap();
     let sys_root = dir.path().to_str().unwrap();
@@ -587,7 +665,6 @@ fn test_usb_speed_parser_detects_usb2_vs_usb3() {
     assert_eq!(speed3, Some(5000));
     assert!(!is_u2_3, "5000 Mbps must NOT be USB 2 (it is USB 3)");
 }
-
 
 #[test]
 fn test_verify_fails_on_truncated_or_partial_wipe() {
@@ -618,9 +695,13 @@ fn test_verify_fails_on_truncated_or_partial_wipe() {
         "overwrite-zero",
         Some(50),
         true, // expect_zeros = true
-    ).expect("Verification should execute");
+    )
+    .expect("Verification should execute");
 
-    assert!(!report.pass, "Verification must fail on truncated/partial wipe");
+    assert!(
+        !report.pass,
+        "Verification must fail on truncated/partial wipe"
+    );
     assert!(
         report.samples.iter().any(|s| !s.is_zero),
         "Must detect non-zero sectors in partial wipe"
@@ -642,9 +723,13 @@ fn test_random_pass_verify_fails_on_all_zeros_image() {
         "random-pass",
         None,
         false, // expect_zeros = false (verifying random pass)
-    ).expect("Verification should execute");
+    )
+    .expect("Verification should execute");
 
-    assert!(!report.pass, "Random pass verification must fail on an all-zeros image");
+    assert!(
+        !report.pass,
+        "Random pass verification must fail on an all-zeros image"
+    );
     assert!(
         report.entropy_score < 0.1,
         "Entropy of all-zeros image must be near 0, got {}",
@@ -670,7 +755,9 @@ async fn test_buffered_fallback_advances_bytes_done_only_after_sync() {
         "Test Buffered",
         start,
         tx,
-    ).await.expect("Overwrite should succeed");
+    )
+    .await
+    .expect("Overwrite should succeed");
 
     assert!(report.success);
     assert_eq!(report.bytes_written, total_size);
@@ -710,7 +797,8 @@ async fn test_slow_writer_progress_never_exceeds_acknowledged_bytes() {
             "Test Slow Ack",
             start,
             tx,
-        ).await
+        )
+        .await
     });
 
     while let Some(evt) = rx.recv().await {
@@ -733,7 +821,11 @@ fn test_o_direct_alignment_requirements() {
     let ret = unsafe { libc::posix_memalign(&mut aligned_ptr, 4096, 4096) };
     assert_eq!(ret, 0, "posix_memalign must succeed");
     assert!(!aligned_ptr.is_null());
-    assert_eq!((aligned_ptr as usize) % 4096, 0, "Buffer pointer must be 4096-byte aligned");
+    assert_eq!(
+        (aligned_ptr as usize) % 4096,
+        0,
+        "Buffer pointer must be 4096-byte aligned"
+    );
     unsafe { libc::free(aligned_ptr) };
 
     // AlignedBuffer test
@@ -761,7 +853,9 @@ async fn test_cancel_via_real_sigterm_signal() {
             "Child Cancel",
             start,
             tx,
-        ).await.expect("Execution should return report");
+        )
+        .await
+        .expect("Execution should return report");
         std::process::exit(report.exit_code);
     }
 
@@ -905,7 +999,9 @@ async fn test_checkpoint_handles_stale_tmp_file() {
 
     // Pre-create stale tmp files
     let stale_tmp = tmp_dir.path().join("active_checkpoint.tmp");
-    let stale_pid_tmp = tmp_dir.path().join(format!("active_checkpoint.{}.tmp", std::process::id()));
+    let stale_pid_tmp = tmp_dir
+        .path()
+        .join(format!("active_checkpoint.{}.tmp", std::process::id()));
     std::fs::write(&stale_tmp, "STALE CONTENT").unwrap();
     std::fs::write(&stale_pid_tmp, "STALE PID CONTENT").unwrap();
 
@@ -918,10 +1014,14 @@ async fn test_checkpoint_handles_stale_tmp_file() {
     write_checkpoint_file_in_dir(tmp_dir.path(), job_id, serial, device_size, bytes_done);
 
     let final_json_path = tmp_dir.path().join("active_checkpoint.json");
-    assert!(final_json_path.exists(), "active_checkpoint.json must exist even if stale tmp existed");
+    assert!(
+        final_json_path.exists(),
+        "active_checkpoint.json must exist even if stale tmp existed"
+    );
 
     let content = std::fs::read_to_string(&final_json_path).unwrap();
-    let checkpoint: CheckpointData = serde_json::from_str(&content).expect("Must parse CheckpointData");
+    let checkpoint: CheckpointData =
+        serde_json::from_str(&content).expect("Must parse CheckpointData");
 
     assert_eq!(checkpoint.job_id, job_id);
     assert_eq!(checkpoint.device_size, device_size);
@@ -945,7 +1045,10 @@ async fn test_checkpoint_json_content_and_cleanup_on_success() {
     // Simulate in-flight periodic checkpoint
     write_checkpoint_file_in_dir(tmp_dir.path(), job_id, serial, device_size, bytes_done);
     let final_json_path = tmp_dir.path().join("active_checkpoint.json");
-    assert!(final_json_path.exists(), "active_checkpoint.json exists during wipe");
+    assert!(
+        final_json_path.exists(),
+        "active_checkpoint.json exists during wipe"
+    );
 
     // Clean up on successful finish
     remove_checkpoint_file_in_dir(tmp_dir.path());
@@ -974,7 +1077,8 @@ async fn test_checkpoint_kept_on_cancel() {
     );
 
     let content = std::fs::read_to_string(&final_json_path).unwrap();
-    let checkpoint: CheckpointData = serde_json::from_str(&content).expect("Must parse CheckpointData");
+    let checkpoint: CheckpointData =
+        serde_json::from_str(&content).expect("Must parse CheckpointData");
 
     assert_eq!(checkpoint.job_id, job_id);
     assert_eq!(checkpoint.bytes_done, bytes_done);
@@ -993,7 +1097,10 @@ async fn test_checkpoint_kept_on_force_stop_and_crash() {
     write_checkpoint_file_in_dir(tmp_dir.path(), job_id, serial, device_size, bytes_done);
 
     let final_json_path = tmp_dir.path().join("active_checkpoint.json");
-    assert!(final_json_path.exists(), "active_checkpoint.json must exist after periodic write");
+    assert!(
+        final_json_path.exists(),
+        "active_checkpoint.json must exist after periodic write"
+    );
 
     // Simulating sudden force-stop (SIGKILL) or crash: process ceases execution immediately
     // without calling remove_checkpoint_file_in_dir().
@@ -1034,7 +1141,9 @@ async fn test_cancel_during_flushing_phase_exits_promptly() {
         start,
         tx,
         Some(cancel_flag),
-    ).await.expect("Execution should return report");
+    )
+    .await
+    .expect("Execution should return report");
 
     if !report.success {
         assert_eq!(report.exit_code, 130);
@@ -1073,5 +1182,3 @@ fn test_cancel_during_verifying_phase_exits_promptly() {
         other => panic!("Expected Err(VerifyError::Cancelled), got {:?}", other),
     }
 }
-
-

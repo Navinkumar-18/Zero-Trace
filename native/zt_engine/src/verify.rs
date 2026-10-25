@@ -4,11 +4,11 @@
 //! performs N-point pseudo-random LBA sampling, computes SHA-256
 //! evidence fingerprints, and measures Shannon entropy.
 
-use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
-use rand::SeedableRng;
 use rand::Rng;
+use rand::SeedableRng;
 use rand_chacha::ChaCha20Rng;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -119,7 +119,11 @@ fn generate_sample_offsets(device_size: u64, sample_count: u32, seed: u64) -> Ve
 
     for i in 0..sample_count {
         let base = i as u64 * step;
-        let jitter = if step > 1 { rng.gen_range(0..step.min(1024)) } else { 0 };
+        let jitter = if step > 1 {
+            rng.gen_range(0..step.min(1024))
+        } else {
+            0
+        };
         let sector = (base + jitter).min(max_sector - 1);
         let offset = sector * SECTOR_SIZE as u64;
         offsets.push(offset);
@@ -154,9 +158,8 @@ fn read_sector_at(path: &str, offset: u64) -> Result<Vec<u8>, VerifyError> {
             // O_DIRECT requires aligned buffers
             // Allocate aligned buffer using posix_memalign
             let mut aligned_ptr: *mut libc::c_void = std::ptr::null_mut();
-            let align_result = unsafe {
-                libc::posix_memalign(&mut aligned_ptr, SECTOR_SIZE, SECTOR_SIZE)
-            };
+            let align_result =
+                unsafe { libc::posix_memalign(&mut aligned_ptr, SECTOR_SIZE, SECTOR_SIZE) };
 
             if align_result != 0 || aligned_ptr.is_null() {
                 return Err(VerifyError::ReadFailed {
@@ -166,19 +169,20 @@ fn read_sector_at(path: &str, offset: u64) -> Result<Vec<u8>, VerifyError> {
             }
 
             let result = (|| -> Result<Vec<u8>, VerifyError> {
-                file.seek(SeekFrom::Start(offset)).map_err(|e| VerifyError::ReadFailed {
-                    offset,
-                    message: format!("Seek failed: {}", e),
-                })?;
+                file.seek(SeekFrom::Start(offset))
+                    .map_err(|e| VerifyError::ReadFailed {
+                        offset,
+                        message: format!("Seek failed: {}", e),
+                    })?;
 
-                let buf_slice = unsafe {
-                    std::slice::from_raw_parts_mut(aligned_ptr as *mut u8, SECTOR_SIZE)
-                };
+                let buf_slice =
+                    unsafe { std::slice::from_raw_parts_mut(aligned_ptr as *mut u8, SECTOR_SIZE) };
 
-                file.read_exact(buf_slice).map_err(|e| VerifyError::ReadFailed {
-                    offset,
-                    message: format!("Read failed: {}", e),
-                })?;
+                file.read_exact(buf_slice)
+                    .map_err(|e| VerifyError::ReadFailed {
+                        offset,
+                        message: format!("Read failed: {}", e),
+                    })?;
 
                 Ok(buf_slice.to_vec())
             })();
@@ -194,15 +198,17 @@ fn read_sector_at(path: &str, offset: u64) -> Result<Vec<u8>, VerifyError> {
             use std::os::unix::io::AsRawFd;
             crate::backend::linux::drop_cache_for_read(file.as_raw_fd());
         }
-        file.seek(SeekFrom::Start(offset)).map_err(|e| VerifyError::ReadFailed {
-            offset,
-            message: format!("Seek failed: {}", e),
-        })?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| VerifyError::ReadFailed {
+                offset,
+                message: format!("Seek failed: {}", e),
+            })?;
         let mut buf = vec![0u8; SECTOR_SIZE];
-        file.read_exact(&mut buf).map_err(|e| VerifyError::ReadFailed {
-            offset,
-            message: format!("Read failed: {}", e),
-        })?;
+        file.read_exact(&mut buf)
+            .map_err(|e| VerifyError::ReadFailed {
+                offset,
+                message: format!("Read failed: {}", e),
+            })?;
         Ok(buf)
     }
 }
@@ -383,7 +389,11 @@ mod tests {
     fn test_shannon_entropy_all_zeros() {
         let data = vec![0u8; 512];
         let ent = shannon_entropy(&data);
-        assert!(ent < 0.01, "All zeros should have near-zero entropy: {}", ent);
+        assert!(
+            ent < 0.01,
+            "All zeros should have near-zero entropy: {}",
+            ent
+        );
     }
 
     #[test]
@@ -396,7 +406,11 @@ mod tests {
             }
         }
         let ent = shannon_entropy(&data);
-        assert!(ent > 0.99, "Uniform distribution should have max entropy: {}", ent);
+        assert!(
+            ent > 0.99,
+            "Uniform distribution should have max entropy: {}",
+            ent
+        );
     }
 
     #[test]
@@ -428,7 +442,12 @@ mod tests {
     fn test_generate_sample_offsets_aligned_to_sector() {
         let offsets = generate_sample_offsets(1_000_000_000, 50, 100);
         for offset in &offsets {
-            assert_eq!(offset % SECTOR_SIZE as u64, 0, "Offset {} not aligned to sector size", offset);
+            assert_eq!(
+                offset % SECTOR_SIZE as u64,
+                0,
+                "Offset {} not aligned to sector size",
+                offset
+            );
         }
     }
 
@@ -437,15 +456,22 @@ mod tests {
         let device_size = 1_000_000_000u64;
         let offsets = generate_sample_offsets(device_size, 50, 200);
         for offset in &offsets {
-            assert!(*offset + SECTOR_SIZE as u64 <= device_size,
-                "Offset {} + sector size exceeds device size {}", offset, device_size);
+            assert!(
+                *offset + SECTOR_SIZE as u64 <= device_size,
+                "Offset {} + sector size exceeds device size {}",
+                offset,
+                device_size
+            );
         }
     }
 
     #[test]
     fn test_generate_sample_offsets_tiny_device() {
         let offsets = generate_sample_offsets(256, 50, 300);
-        assert!(offsets.is_empty(), "Device smaller than sector should produce no offsets");
+        assert!(
+            offsets.is_empty(),
+            "Device smaller than sector should produce no offsets"
+        );
     }
 
     #[test]
@@ -470,19 +496,26 @@ mod tests {
             "Zero Fill",
             Some(10),
             true, // expect zeros
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert!(report.pass, "Zero-filled file should pass zero verification");
+        assert!(
+            report.pass,
+            "Zero-filled file should pass zero verification"
+        );
         assert_eq!(report.sample_count, 10);
-        assert!(report.entropy_score < 0.01, "Zero data should have near-zero entropy");
+        assert!(
+            report.entropy_score < 0.01,
+            "Zero data should have near-zero entropy"
+        );
         assert!(!report.fingerprint_hash.is_empty());
         assert!(report.samples.iter().all(|s| s.is_zero));
     }
 
     #[test]
     fn test_verify_device_on_random_filled_file() {
-        use std::io::Write;
         use rand::RngCore;
+        use std::io::Write;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("random_test.img");
@@ -503,16 +536,23 @@ mod tests {
             "Random Fill",
             Some(10),
             true, // expect zeros — should FAIL
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert!(!report.pass, "Random-filled file should fail zero verification");
-        assert!(report.entropy_score > 0.5, "Random data should have high entropy");
+        assert!(
+            !report.pass,
+            "Random-filled file should fail zero verification"
+        );
+        assert!(
+            report.entropy_score > 0.5,
+            "Random data should have high entropy"
+        );
     }
 
     #[test]
     fn test_verify_device_crypto_erase_mode_accepts_random() {
-        use std::io::Write;
         use rand::RngCore;
+        use std::io::Write;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("crypto_test.img");
@@ -533,9 +573,13 @@ mod tests {
             "Crypto Erase",
             Some(10),
             false, // crypto mode: accept high-entropy data
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert!(report.pass, "Crypto erase mode should accept high-entropy data");
+        assert!(
+            report.pass,
+            "Crypto erase mode should accept high-entropy data"
+        );
     }
 
     #[test]
@@ -572,10 +616,15 @@ mod tests {
         file.flush().unwrap();
         drop(file);
 
-        let r1 = verify_device(path.to_str().unwrap(), size, "SER", "Method", Some(5), true).unwrap();
-        let r2 = verify_device(path.to_str().unwrap(), size, "SER", "Method", Some(5), true).unwrap();
+        let r1 =
+            verify_device(path.to_str().unwrap(), size, "SER", "Method", Some(5), true).unwrap();
+        let r2 =
+            verify_device(path.to_str().unwrap(), size, "SER", "Method", Some(5), true).unwrap();
 
-        assert_eq!(r1.fingerprint_hash, r2.fingerprint_hash, "Same inputs should produce same fingerprint");
+        assert_eq!(
+            r1.fingerprint_hash, r2.fingerprint_hash,
+            "Same inputs should produce same fingerprint"
+        );
         assert_eq!(r1.rng_seed, r2.rng_seed);
     }
 }
