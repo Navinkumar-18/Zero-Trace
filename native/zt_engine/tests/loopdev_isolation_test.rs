@@ -163,6 +163,22 @@ fn table_region(disk: &str) -> Vec<u8> {
     buf
 }
 
+/// Assert that `sectors` starting at `start_sector` in `image_bytes` are zero.
+fn assert_zero_range(image_bytes: &[u8], start_sector: u64, sectors: u64, what: &str) {
+    let start = (start_sector * SECTOR) as usize;
+    let end = start + (sectors * SECTOR) as usize;
+    assert!(
+        end <= image_bytes.len(),
+        "{} range is outside the image",
+        what
+    );
+    assert!(
+        image_bytes[start..end].iter().all(|b| *b == 0),
+        "{} was not fully overwritten",
+        what
+    );
+}
+
 /// These tests are `#[ignore]`d and must not run in a normal suite. Running
 /// them with `--ignored` also requires the `loopdev_tests` feature.
 #[allow(clippy::assertions_on_constants)]
@@ -281,31 +297,49 @@ async fn whole_device_wipe_overwrites_table_and_all_partitions() {
         "whole-device wipe must cover the entire device"
     );
 
-    // Table + boot region.
-    assert!(
-        table_region(disk.disk()).iter().all(|b| *b == 0),
-        "partition table survived a whole-device wipe"
+    // The wipe zeroes the MBR, so the kernel/udev may remove the
+    // /dev/loopNpX partition nodes. Verify against the backing image file
+    // instead of reopening partition devices.
+    let whole = fs::read(&disk.image).expect("read backing image");
+    assert_eq!(
+        whole.len() as u64,
+        IMAGE_SECTORS * SECTOR,
+        "backing image size changed during the wipe"
     );
 
-    // All three partitions.
-    for n in 1..=3 {
-        let bytes = read_bytes(&disk.part(n));
-        assert!(
-            bytes.iter().all(|b| *b == 0),
-            "partition {} survived a whole-device wipe",
-            n
+    // Partition table + boot region.
+    assert_zero_range(
+        &whole,
+        0,
+        PART_START[0],
+        "partition table / pre-partition region",
+    );
+
+    // All former partition ranges.
+    for (i, start) in PART_START.iter().enumerate() {
+        assert_zero_range(
+            &whole,
+            *start,
+            PART_SECTORS,
+            &format!("former partition {}", i + 1),
         );
     }
 
     // The raw image itself is zero from start to end (no gap survived).
-    let whole = read_bytes(disk.disk());
     assert!(
         whole.iter().all(|b| *b == 0),
         "whole-device wipe left non-zero bytes"
     );
+    let zero_image = vec![0u8; whole.len()];
+    assert_eq!(
+        sha256(&whole),
+        sha256(&zero_image),
+        "backing image hash does not match an all-zero image"
+    );
 
     println!(
-        "P3 whole-device: {} bytes zeroed across table + 3 partitions",
-        whole.len()
+        "P3 whole-device: {} bytes zeroed across table + 3 partitions (sha256={})",
+        whole.len(),
+        sha256(&whole)
     );
 }

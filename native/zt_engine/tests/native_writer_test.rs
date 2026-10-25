@@ -6,6 +6,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
+use std::process::Command;
 use std::time::Instant;
 use tempfile::{NamedTempFile, TempDir};
 use tokio::sync::mpsc;
@@ -795,31 +796,107 @@ async fn test_cancel_via_real_sigterm_signal() {
     );
 }
 
+/// Owns a loop device allocated for this test only; detaches it (also on
+/// panic) and removes the backing image.
+struct TestLoopDevice {
+    path: String,
+    _tmp: TempDir,
+}
+
+impl TestLoopDevice {
+    fn allocate() -> Self {
+        let tmp = TempDir::new().expect("create temp dir for loop image");
+        let image = tmp.path().join("zt_native_writer_loop.img");
+        OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&image)
+            .expect("create loop backing image")
+            .set_len(64 * 1024 * 1024)
+            .expect("size loop backing image");
+
+        let output = Command::new("losetup")
+            .args(["--find", "--show"])
+            .arg(&image)
+            .output()
+            .expect("losetup must be installed (util-linux)");
+        assert!(
+            output.status.success(),
+            "losetup --find --show failed (root required): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        // Construct the detach guard before any further assertion can panic.
+        let guard = Self { path, _tmp: tmp };
+        assert!(
+            guard.path.starts_with("/dev/loop"),
+            "unexpected losetup output: {:?}",
+            guard.path
+        );
+
+        // The allocated device must be backed by this test's own image.
+        let name = guard.path.rsplit('/').next().unwrap();
+        let backing = std::fs::read_to_string(format!("/sys/block/{}/loop/backing_file", name))
+            .expect("read loop backing_file from sysfs");
+        let backing =
+            std::fs::canonicalize(backing.trim()).expect("canonicalize sysfs loop backing_file");
+        let expected = std::fs::canonicalize(&image).expect("canonicalize test loop image");
+        assert_eq!(
+            backing, expected,
+            "allocated loop device {} is not backed by the test image",
+            guard.path
+        );
+
+        guard
+    }
+
+    fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+impl Drop for TestLoopDevice {
+    fn drop(&mut self) {
+        let _ = Command::new("losetup")
+            .args(["--detach", &self.path])
+            .output();
+    }
+}
+
 #[test]
-#[ignore = "Requires root/sudo privileges: setup via `sudo losetup -fP /tmp/zt_loop.img`"]
+#[ignore = "requires root; run with: sudo env \"PATH=$PATH\" cargo test --test native_writer_test test_direct_block_writer_and_o_excl_on_real_loop_device -- --ignored --nocapture"]
 fn test_direct_block_writer_and_o_excl_on_real_loop_device() {
-    // Documented manual instructions:
-    // 1. Create 100MB sparse file: truncate -s 100M /tmp/zt_loop.img
-    // 2. Attach loopback: sudo losetup -fP /tmp/zt_loop.img
-    // 3. Find device: losetup -a | grep zt_loop.img -> /dev/loop7
-    // 4. Run test: ZT_TEST_LOOP_DEV=/dev/loop7 cargo test test_direct_block_writer_and_o_excl_on_real_loop_device -- --ignored --nocapture
-    let loop_dev = std::env::var("ZT_TEST_LOOP_DEV").unwrap_or_else(|_| "/dev/loop7".to_string());
-    let c_path = std::ffi::CString::new(loop_dev.as_str()).unwrap();
+    let loop_dev = TestLoopDevice::allocate();
+    let loop_path = loop_dev.path();
+    let c_path = std::ffi::CString::new(loop_path).unwrap();
 
     // Test kernel mutual exclusion: open with O_RDWR | O_EXCL
     let fd1 = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_EXCL) };
-    if fd1 < 0 {
-        let err = std::io::Error::last_os_error();
-        panic!("Failed to open {} with O_EXCL: {}", loop_dev, err);
-    }
+    assert!(
+        fd1 >= 0,
+        "Failed to open {} with O_EXCL: {}",
+        loop_path,
+        std::io::Error::last_os_error()
+    );
 
     // Second concurrent open must return EBUSY
     let fd2 = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_EXCL) };
-    assert_eq!(fd2, -1, "Second concurrent O_EXCL open must fail");
     let err2 = std::io::Error::last_os_error();
-    assert_eq!(err2.raw_os_error(), Some(libc::EBUSY), "Concurrent open must return EBUSY");
 
+    // Close before asserting so the Drop guard can detach even on panic.
     unsafe { libc::close(fd1) };
+    if fd2 >= 0 {
+        unsafe { libc::close(fd2) };
+    }
+
+    assert_eq!(fd2, -1, "Second concurrent O_EXCL open must fail");
+    assert_eq!(
+        err2.raw_os_error(),
+        Some(libc::EBUSY),
+        "Concurrent open must return EBUSY"
+    );
 }
 
 #[tokio::test]
