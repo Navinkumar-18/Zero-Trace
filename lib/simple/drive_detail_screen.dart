@@ -931,8 +931,11 @@ class DriveDetailScreen extends StatelessWidget {
               case CapabilityStatus.available:
                 statusColor = AppTheme.simpleSuccess;
                 break;
+              // P1: "not supported on this device" is informational, not a
+              // failure — red is reserved for real errors. The reason text
+              // (cap.description) stays visible below every row.
               case CapabilityStatus.notAvailable:
-                statusColor = AppTheme.simpleDestructive;
+                statusColor = AppTheme.textMuted;
                 break;
               case CapabilityStatus.unknown:
                 statusColor = AppTheme.accentOrange;
@@ -1227,12 +1230,14 @@ class _PartitionChooserSection extends StatelessWidget {
     final disabled = reason != null;
     final isSelected = !disabled && selectedNames.contains(p.name);
 
-    // B1: Windows-friendly name ("Windows volume (NTFS, 237 GB)", "Recovery",
-    // "EFI System", …) — never invents drive letters; label/size/fs stay
-    // visible in the detail line.
-    final displayName = p.friendlyDisplayName;
+    // B1/P1: filesystem-based name ("exFAT volume", "NTFS volume", "Recovery",
+    // "EFI System", …) — never assumes an OS from the filesystem and never
+    // invents drive letters. "Windows volume" only appears for NTFS once the
+    // read-only probe actually found a Windows installation; label/size/fs
+    // stay visible in the detail line.
     final likelyWindows = controller.windowsProbeResults[p.devicePath];
     final probeError = controller.windowsProbeErrors[p.devicePath];
+    final displayName = p.displayName(windowsInstallDetected: likelyWindows == true);
     final title = likelyWindows == true
         ? '$displayName — likely C: (Windows installed)'
         : displayName;

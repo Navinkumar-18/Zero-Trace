@@ -5,6 +5,68 @@ All notable changes to the Zero Trace project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - Phase P: Polish, Firmware Hardening & Knowledge Base
+
+### Changed
+- **Partition labels are filesystem-based (Phase P1):** `PartitionInfo.displayName`
+  now renders `FAT32 volume`, `exFAT volume`, `NTFS volume`, `ext4 volume`, …
+  with the size. `Windows volume (NTFS, size)` appears only when the read-only
+  probe confirmed `\Windows` on that volume; EFI System / Recovery / Microsoft
+  Reserved keep their structural names, and unknown filesystems fall back to the
+  type name or partition number. The detail line no longer repeats a filesystem
+  already present in the title.
+- **Capability status colors (Phase P1):** "not supported on this device"
+  (`CapabilityStatus.notAvailable`) now renders in neutral gray like "not
+  applicable"; red is reserved for real failures. Reason text stays visible.
+- **Firmware flows take a guard-minted `ValidatedTarget` (Phase P2):**
+  `ata_secure_erase`, `ata_sanitize`, `nvme_sanitize`, `opal_revert` and
+  `emmc_sanitize` run through target-taking entry points (`*_validated`) and
+  re-validate the device identity immediately before every destructive tool:
+  boot-disk state against current mounts, node `st_rdev`/inode, sysfs serial
+  (when exposed) and the size pinned at mint time. `main_linux` mints the
+  target once, in the historic check order. The old
+  `(device, token, serial)` signatures remain as compatibility adapters that
+  mint a target first; existing dry-run tests are unchanged.
+- **No shell for tool arguments (Phase P2):** the historic
+  `sh -c "umount -f <device>*"` glob pass is removed. Mounted partition
+  sources come from backend mount facts and are unmounted with an argv list.
+  All firmware/probe commands now go through `BlockBackend::exec`
+  (`detect.rs` probes and the read-only Windows mount/unmount included), so
+  no production source outside `src/backend/` spawns a process.
+
+### Added
+- **Pre-tool identity revalidation (Phase P2):** `ValidatedTarget` pins the
+  device size at mint time; `guard::revalidate_target_identity` refuses a
+  changed node/serial/size or a target that became the boot disk with typed
+  `IdentityMismatch` / `BootDiskProtection` errors. Refused steps are recorded
+  as `[REFUSED] …` in the command log and never reach the tool.
+- **MockBackend command log + P2 tests:** `MockBackend::executed_commands`
+  records exact tool invocations, `mutate_mountinfo` simulates a mount-state
+  TOCTOU, and three tests cover identity drift, boot-disk drift and the exact
+  hdparm command sequence of a validate-then-execute flow.
+- **Stronger static scan (Phase P2):**
+  `guard_entry_scan_test::destructive_tools_require_backend_or_validated_target`
+  fails on shell construction, unresolved `Command::new(...)` outside
+  `src/backend/`, or a destructive tool literal outside a function taking
+  `&ValidatedTarget`.
+- **Loop-image isolation tests (Phase P3):** feature-gated (`loopdev_tests`),
+  `#[ignore]`d tests build a three-partition image, wipe only partition 3 and
+  assert the table and sibling partitions are byte-identical, then repeat for
+  a whole-device wipe. Manual root command is documented in README/AGENTS.
+- **Reviewed knowledge base (Phase P4):** six entries ship in
+  `assets/knowledge/` (`clear_vs_purge`, `nist_standards`, `crypto_erase`,
+  `pales_research`, `ssd_overwrite`, `partition_overwrite`), grounded in the
+  repo's own handlers, matrix and behavior. New tests assert the lint gate,
+  ≥2 routing samples per entry, and consistency with the capability matrix
+  (partition/flash wipes are Clear; Purge requires a whole-device hardware
+  command).
+
+### Documentation
+- AGENTS/README/CHANGELOG/TASKS now describe the P1 display rules, the P2
+  firmware contract and scan, the P3 manual tests, and the reviewed knowledge
+  base; the earlier "no reviewed knowledge entries" gap is closed. The Phase C2c
+  fail-closed scan behavior remains documented in the section below.
+
 ## [Unreleased] - Phase C2: Guarded Legacy Writers & Fail-Closed Scans
 
 ### Changed

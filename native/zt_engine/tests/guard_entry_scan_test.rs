@@ -344,3 +344,137 @@ fn no_direct_device_opens_or_ioctls_outside_backend() {
         violations.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------
+// P2: external tool invocations.
+//
+// Destructive tools (secure erase / sanitize / format / discard) must never
+// be spawned from a plain device path. The scan fails if `Command::new` for a
+// destructive tool appears outside `src/backend/` unless the enclosing
+// function takes a `ValidatedTarget`, and it fails on **any** unresolved
+// `Command::new(...)` outside `src/backend/` (a generic exec helper could be
+// handed a destructive tool) or any shell construction.
+// ---------------------------------------------------------------------------
+
+/// Tools that can destroy data when pointed at a device.
+const DESTRUCTIVE_TOOLS: &[&str] = &[
+    "hdparm",
+    "nvme",
+    "sedutil-cli",
+    "blkdiscard",
+    "smartctl",
+    "mmc",
+    "wipefs",
+    "shred",
+];
+
+/// Enclosing function name and signature text for `lines[idx]` (rustfmt puts
+/// `fn` declarations at column 0; signatures may span lines).
+fn enclosing_fn_signature(lines: &[&str], idx: usize) -> (String, String) {
+    let mut start = None;
+    for i in (0..=idx).rev() {
+        let t = lines[i].trim_start();
+        if t.starts_with("fn ")
+            || t.starts_with("pub fn ")
+            || t.starts_with("pub(crate) fn ")
+            || t.starts_with("pub async fn ")
+            || t.starts_with("async fn ")
+        {
+            start = Some(i);
+            break;
+        }
+    }
+    let Some(s) = start else {
+        return (String::new(), String::new());
+    };
+    let mut sig = String::new();
+    for line in &lines[s..=idx] {
+        sig.push_str(line);
+        sig.push('\n');
+        if line.contains('{') {
+            break;
+        }
+    }
+    let name = lines[s]
+        .split("fn ")
+        .nth(1)
+        .unwrap_or("")
+        .split('(')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    (name, sig)
+}
+
+#[test]
+fn destructive_tools_require_backend_or_validated_target() {
+    let files = production_sources_outside_backend();
+    assert!(
+        files.len() >= 6,
+        "static scan found only {} source files outside backend/ — layout changed?",
+        files.len()
+    );
+
+    let mut violations = Vec::new();
+    for (name, src) in &files {
+        let lines: Vec<&str> = src.split('\n').collect();
+        let mut in_tests = false;
+        for (idx, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed == "mod tests {" {
+                in_tests = true;
+                continue;
+            }
+            if in_tests {
+                if *line == "}" {
+                    in_tests = false;
+                }
+                continue;
+            }
+            let loc = format!("{}:{}", name, idx + 1);
+
+            // 1. Never build tool arguments through a shell.
+            if line.contains("Command::new(\"sh\")") || line.contains("Command::new(\"bash\")") {
+                violations.push(format!(
+                    "{}: shell construction outside backend/ — pass tool arguments as an argv list",
+                    loc
+                ));
+            }
+
+            if !line.contains("Command::new(") {
+                continue;
+            }
+
+            let (func, sig) = enclosing_fn_signature(&lines, idx);
+
+            // 2. A generic `Command::new(variable)` outside backend/ could be
+            //    handed a destructive tool: refuse it outright.
+            let mut destructive_literal = false;
+            for tool in DESTRUCTIVE_TOOLS {
+                if line.contains(&format!("Command::new(\"{}\")", tool)) {
+                    destructive_literal = true;
+                    break;
+                }
+            }
+            let generic = !line.contains("Command::new(\"");
+            if generic {
+                violations.push(format!(
+                    "{}: unresolved `Command::new(...)` in fn `{}` outside backend/ — route tools through the backend",
+                    loc, func
+                ));
+            } else if destructive_literal && !sig.contains("ValidatedTarget") {
+                // 3. Literal destructive tool: allowed only in backend/ (this
+                //    scan excludes it) or in a function taking a target.
+                violations.push(format!(
+                    "{}: destructive `Command::new` in fn `{}` outside backend/ without a `&ValidatedTarget` parameter",
+                    loc, func
+                ));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "external tool invocation outside backend/ (device tools take a &ValidatedTarget):\n{}",
+        violations.join("\n")
+    );
+}

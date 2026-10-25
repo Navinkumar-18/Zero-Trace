@@ -95,12 +95,21 @@ pub struct ValidatedTarget {
     canonical_path: String,
     guard_identity: GuardIdentity,
     scope: TargetScope,
+    /// P2: device size pinned at mint time and re-checked immediately before
+    /// every destructive firmware command. `0` = geometry unavailable at
+    /// mint time (fixture backends), comparison skipped.
+    pinned_size_bytes: u64,
 }
 
 impl ValidatedTarget {
     /// Sealed constructor — private to this module (the guard chain).
-    fn sealed(canonical_path: String, guard_identity: GuardIdentity, scope: TargetScope) -> Self {
-        Self { canonical_path, guard_identity, scope }
+    fn sealed(
+        canonical_path: String,
+        guard_identity: GuardIdentity,
+        scope: TargetScope,
+        pinned_size_bytes: u64,
+    ) -> Self {
+        Self { canonical_path, guard_identity, scope, pinned_size_bytes }
     }
 
     pub fn canonical_path(&self) -> &str {
@@ -117,6 +126,11 @@ impl ValidatedTarget {
 
     pub fn device_serial(&self) -> &str {
         &self.guard_identity.device_serial
+    }
+
+    /// P2: size pinned at validation time (0 = unknown).
+    pub fn pinned_size_bytes(&self) -> u64 {
+        self.pinned_size_bytes
     }
 }
 
@@ -1058,6 +1072,7 @@ pub fn validate_partition_target(
             size_bytes,
             logical_block_size: lbs,
         },
+        size_bytes,
     ))
 }
 
@@ -1074,10 +1089,12 @@ pub fn validate_whole_disk_target(
     verify_confirmation(confirmation_token, device_serial)?;
     check_boot_disk_protection(backend, device, dry_run)?;
     let guard_identity = get_guard_identity(backend, device, dry_run, device_serial)?;
+    let pinned_size = pinned_device_size(backend, device);
     Ok(ValidatedTarget::sealed(
         guard_identity.canonical_path.clone(),
         guard_identity,
         TargetScope::WholeDisk,
+        pinned_size,
     ))
 }
 
@@ -1097,11 +1114,131 @@ pub fn validate_whole_disk_flow_target(
     check_boot_disk_protection(backend, device, dry_run)?;
     verify_confirmation(confirmation_token, device_serial)?;
     let guard_identity = get_guard_identity(backend, device, dry_run, device_serial)?;
+    let pinned_size = pinned_device_size(backend, &guard_identity.canonical_path);
     Ok(ValidatedTarget::sealed(
         guard_identity.canonical_path.clone(),
         guard_identity,
         TargetScope::WholeDisk,
+        pinned_size,
     ))
+}
+
+/// P2: geometry snapshot for the pre-tool identity re-check. Best-effort at
+/// mint time (fixture backends without sysfs geometry pin `0` = unknown), so
+/// no guard path gains a new hard failure here.
+fn pinned_device_size(backend: &dyn BlockBackend, canonical_path: &str) -> u64 {
+    backend
+        .device_geometry(canonical_path)
+        .map(|g| g.size_bytes)
+        .unwrap_or(0)
+}
+
+/// P2: live serial for a whole-device node, when sysfs exposes one.
+fn live_device_serial(backend: &dyn BlockBackend, canonical: &str) -> Option<String> {
+    let name = canonical.strip_prefix("/dev/").unwrap_or(canonical);
+    for attr in &["device/serial", "serial"] {
+        if let Ok(Some(content)) = backend.sysfs_class_attr(name, attr) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    for attr in &["device/uevent", "uevent"] {
+        if let Ok(Some(uevent)) = backend.sysfs_class_attr(name, attr) {
+            for line in uevent.lines() {
+                if let Some(s) = line
+                    .strip_prefix("ID_SERIAL_SHORT=")
+                    .or_else(|| line.strip_prefix("ID_SERIAL="))
+                    .or_else(|| line.strip_prefix("SERIAL="))
+                {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// P2: re-validate a guard-minted target **immediately before** a destructive
+/// external tool runs. Catches the TOCTOU window between selection/validation
+/// and command execution:
+///
+/// * boot-disk protection is re-evaluated against current mount state,
+/// * the node identity (`st_rdev`, inode) must still match the pinned one,
+/// * the sysfs serial (when exposed) must still match the confirmed serial,
+/// * the device size (when pinned) must be unchanged.
+///
+/// Skipped in dry-run: no external tool is invoked, so there is nothing to
+/// guard. Returns `IdentityMismatch` / `BootDiskProtection` on drift.
+pub fn revalidate_target_identity(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+    dry_run: bool,
+) -> Result<(), ExecuteError> {
+    if dry_run {
+        return Ok(());
+    }
+
+    let path = target.canonical_path();
+
+    // 1. Boot-disk protection against current mount/swap state.
+    check_boot_disk_protection(backend, path, false)?;
+
+    // 2. Same node as the one validated (rdev + inode pinning).
+    let stat = backend.stat_path(path).map_err(|e| {
+        ExecuteError::IdentityMismatch(format!(
+            "Cannot re-stat target {} before firmware command: {}",
+            path, e
+        ))
+    })?;
+    let id = target.guard_identity();
+    // `libc::dev_t` is u64 on Linux and u32 on Windows: identity conversion on
+    // Linux (clippy) and widening on Windows.
+    #[allow(clippy::useless_conversion)]
+    let pinned_rdev = u64::from(id.st_rdev);
+    if stat.is_block != id.is_block
+        || stat.rdev != pinned_rdev
+        || (id.st_ino != 0 && stat.ino != id.st_ino)
+    {
+        return Err(ExecuteError::IdentityMismatch(format!(
+            "Target {} identity changed after validation (expected rdev {} ino {}, found rdev {} ino {})",
+            path, id.st_rdev, id.st_ino, stat.rdev, stat.ino
+        )));
+    }
+
+    // 3. Serial — only compared when the backend exposes one.
+    if !id.device_serial.is_empty() {
+        if let Some(live) = live_device_serial(backend, path) {
+            if live != id.device_serial {
+                return Err(ExecuteError::IdentityMismatch(format!(
+                    "Target {} serial changed after validation (expected {}, found {})",
+                    path, id.device_serial, live
+                )));
+            }
+        }
+    }
+
+    // 4. Size — only compared when geometry was pinned at mint time.
+    if target.pinned_size_bytes > 0 {
+        let geo = backend.device_geometry(path).map_err(|e| {
+            ExecuteError::IdentityMismatch(format!(
+                "Cannot re-read geometry for {} before firmware command: {}",
+                path, e
+            ))
+        })?;
+        if geo.size_bytes != target.pinned_size_bytes {
+            return Err(ExecuteError::IdentityMismatch(format!(
+                "Target {} size changed after validation (expected {} bytes, found {})",
+                path, target.pinned_size_bytes, geo.size_bytes
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -3,9 +3,10 @@ use std::path::Path;
 use std::process;
 use tokio::sync::mpsc;
 use zt_engine::execute::{
-    ata_sanitize, ata_secure_erase, discard_erase, discard_erase_partition, emmc_sanitize,
-    nvme_sanitize, opal_revert, software_overwrite, software_overwrite_partition,
-    AtaSanitizeAction, EngineMethod, OverwritePattern, PartitionTargetParams, ProgressEvent,
+    ata_sanitize_validated, ata_secure_erase_validated, discard_erase, discard_erase_partition,
+    emmc_sanitize_validated, nvme_sanitize_validated, opal_revert_validated, software_overwrite,
+    software_overwrite_partition, validate_whole_disk_flow_target_ctx, AtaSanitizeAction,
+    EngineMethod, FsContext, OverwritePattern, PartitionTargetParams, ProgressEvent,
     SanitizeAction,
 };
 use zt_engine::verify::{verify_device, verify_device_scoped};
@@ -153,43 +154,69 @@ pub async fn run() {
                     }
                 }
             } else {
-                match engine_method {
-                    EngineMethod::AtaSecureErase => {
-                        ata_secure_erase(device, false, token, serial, dry_run, tx).await
+                // P2: firmware methods take a guard-minted `ValidatedTarget`,
+                // never a bare path. Mint once here in the historic check
+                // order (boot-disk protection → confirmation token →
+                // identity pinning); every destructive tool re-validates the
+                // device identity immediately before it runs.
+                if engine_method.is_firmware() {
+                    let target = match validate_whole_disk_flow_target_ctx(
+                        device,
+                        token,
+                        serial,
+                        dry_run,
+                        &FsContext::default(),
+                    ) {
+                        Ok(target) => target,
+                        Err(err) => {
+                            eprintln!("Error executing sanitize: {:?}", err);
+                            process::exit(3);
+                        }
+                    };
+
+                    match engine_method {
+                        EngineMethod::AtaSecureErase => {
+                            ata_secure_erase_validated(&target, false, dry_run, tx).await
+                        }
+                        EngineMethod::AtaEnhancedSecureErase => {
+                            ata_secure_erase_validated(&target, true, dry_run, tx).await
+                        }
+                        EngineMethod::AtaSanitizeBlock => {
+                            ata_sanitize_validated(&target, AtaSanitizeAction::BlockErase, dry_run, tx).await
+                        }
+                        EngineMethod::AtaSanitizeCrypto => {
+                            ata_sanitize_validated(&target, AtaSanitizeAction::CryptoScramble, dry_run, tx).await
+                        }
+                        EngineMethod::NvmeSanitizeBlock => {
+                            nvme_sanitize_validated(&target, SanitizeAction::BlockErase, dry_run, tx).await
+                        }
+                        EngineMethod::NvmeSanitizeCrypto => {
+                            nvme_sanitize_validated(&target, SanitizeAction::CryptoErase, dry_run, tx).await
+                        }
+                        EngineMethod::OpalRevert => {
+                            opal_revert_validated(&target, psid, dry_run, tx).await
+                        }
+                        EngineMethod::EmmcSanitize => {
+                            emmc_sanitize_validated(&target, dry_run, tx).await
+                        }
+                        _ => unreachable!("is_firmware() matched above"),
                     }
-                    EngineMethod::AtaEnhancedSecureErase => {
-                        ata_secure_erase(device, true, token, serial, dry_run, tx).await
-                    }
-                    EngineMethod::AtaSanitizeBlock => {
-                        ata_sanitize(device, AtaSanitizeAction::BlockErase, token, serial, dry_run, tx).await
-                    }
-                    EngineMethod::AtaSanitizeCrypto => {
-                        ata_sanitize(device, AtaSanitizeAction::CryptoScramble, token, serial, dry_run, tx).await
-                    }
-                    EngineMethod::NvmeSanitizeBlock => {
-                        nvme_sanitize(device, SanitizeAction::BlockErase, token, serial, dry_run, tx).await
-                    }
-                    EngineMethod::NvmeSanitizeCrypto => {
-                        nvme_sanitize(device, SanitizeAction::CryptoErase, token, serial, dry_run, tx).await
-                    }
-                    EngineMethod::OpalRevert => {
-                        opal_revert(device, psid, token, serial, dry_run, tx).await
-                    }
-                    EngineMethod::EmmcSanitize => {
-                        emmc_sanitize(device, token, serial, dry_run, tx).await
-                    }
-                    // A6: removable-media discard (whole device)
-                    EngineMethod::Discard => {
-                        discard_erase(device, token, serial, dry_run, tx).await
-                    }
-                    EngineMethod::OverwriteZero => {
-                        software_overwrite(device, 1, OverwritePattern::Zeros, token, serial, dry_run, tx).await
-                    }
-                    EngineMethod::OverwriteRandom => {
-                        software_overwrite(device, 1, OverwritePattern::Random, token, serial, dry_run, tx).await
-                    }
-                    EngineMethod::Overwrite3Pass => {
-                        software_overwrite(device, 3, OverwritePattern::MultiPass3, token, serial, dry_run, tx).await
+                } else {
+                    match engine_method {
+                        // A6: removable-media discard (whole device)
+                        EngineMethod::Discard => {
+                            discard_erase(device, token, serial, dry_run, tx).await
+                        }
+                        EngineMethod::OverwriteZero => {
+                            software_overwrite(device, 1, OverwritePattern::Zeros, token, serial, dry_run, tx).await
+                        }
+                        EngineMethod::OverwriteRandom => {
+                            software_overwrite(device, 1, OverwritePattern::Random, token, serial, dry_run, tx).await
+                        }
+                        EngineMethod::Overwrite3Pass => {
+                            software_overwrite(device, 3, OverwritePattern::MultiPass3, token, serial, dry_run, tx).await
+                        }
+                        _ => unreachable!("firmware methods handled above"),
                     }
                 }
             };

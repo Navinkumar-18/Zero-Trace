@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::process::Command;
 
+use crate::backend::BlockBackend;
 use crate::execute::FsContext;
 
 // ---------------------------------------------------------------------------
@@ -559,16 +559,18 @@ pub fn probe_windows_volume(device: &str) -> WindowsProbe {
     }
     let mnt_str = mnt.to_string_lossy().to_string();
 
-    let mount_out = Command::new("mount")
-        .args(["-o", "ro,noexec,nosuid,nodev", "--", device, &mnt_str])
-        .output();
+    // P2: read-only probe tools go through the backend (argv list, no shell).
+    let backend = crate::backend::linux::LinuxBackend::new(
+        crate::execute::FsContext::default(),
+    );
+    let mount_out = backend.exec(
+        "mount",
+        &["-o", "ro,noexec,nosuid,nodev", "--", device, &mnt_str],
+    );
     let mounted = match mount_out {
-        Ok(o) if o.status.success() => true,
-        Ok(o) => {
-            probe.error = Some(format!(
-                "read-only mount failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            ));
+        Ok((_, _, 0)) => true,
+        Ok((_, stderr, _)) => {
+            probe.error = Some(format!("read-only mount failed: {}", stderr.trim()));
             false
         }
         Err(e) => {
@@ -588,7 +590,7 @@ pub fn probe_windows_volume(device: &str) -> WindowsProbe {
             probe.used_bytes = Some(used);
         }
         // Always unmount — the read-only mount must not outlive the probe.
-        let _ = Command::new("umount").arg(&mnt_str).output();
+        let _ = backend.exec("umount", &[&mnt_str]);
     }
 
     // Remove our (now unmounted) mountpoint. If removal fails the dir is

@@ -151,18 +151,17 @@ and the certificate changes. Findings and fixes:
   commands).
 - The knowledge base loads once at startup via `KnowledgeBase.initialize()`
   (`lib/services/knowledge/knowledge_base.dart`), called from `main()`. Assets are
-  registered at `assets/knowledge/` (currently only `.gitkeep`). Release builds
+  registered at `assets/knowledge/`. Release builds
   serve only `review_status: reviewed`; non-reviewed/malformed entries are
   skipped. `AiAssistantScreen` takes an optional injected `AiService` and
   otherwise uses the startup instance.
-- Zero reviewed entries ship today, so all answers come from the built-in
-  handlers until KB entries are authored and reviewed.
+- Six reviewed entries ship as of Phase P4, so conceptual questions are
+  answered from `assets/knowledge/` when a reviewed entry matches; otherwise
+  the built-in handlers answer.
 
-## KB entries needed (do not write from memory)
-- `clear_vs_purge` — NIST SP 800-88 Clear vs Purge definitions (reviewed).
-- `nist_standards` — NIST SP 800-88 categories and applicability.
-- `crypto_erase` — cryptographic erase semantics and key-destruction caveats.
-- `pales_research` — peer-reviewed PALES findings on overwrite reliability.
-- `ssd_overwrite` — FTL / wear-levelling explanation for flash media.
-- `partition_overwrite` — assurance limits of partitioning and partial targets.
-- Each must pass `KnowledgeLint` before it is added to `assets/knowledge/`.
+## KB entries shipped (Phase P4)
+- `clear_vs_purge`, `nist_standards`, `crypto_erase`, `pales_research`,
+  `ssd_overwrite`, `partition_overwrite` — all `review_status: reviewed`,
+  lint-clean, reachable from at least two sample questions each, and checked
+  against the capability matrix by `test/ai/knowledge_required_entries_test.dart`.
+  Update an entry and its assertions together whenever behavior changes.

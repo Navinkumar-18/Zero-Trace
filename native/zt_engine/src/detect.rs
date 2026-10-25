@@ -6,7 +6,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+
+use crate::backend::BlockBackend;
 use thiserror::Error;
 
 // ---------------------------------------------------------------------------
@@ -580,19 +581,19 @@ pub fn parse_mmc_extcsd(stdout: &str) -> MmcData {
 // High-level probe function — shells out to real CLI tools
 // ---------------------------------------------------------------------------
 
-/// Run a CLI command and capture stdout. Returns Ok(stdout) or Err with stderr.
+/// Run a CLI probe through the platform backend and capture stdout.
+///
+/// P2: non-destructive probes may take a device path, but they never spawn a
+/// tool directly — commands go through `BlockBackend::exec`, so the backend
+/// (and mock backends in tests) own process execution.
 fn run_command(program: &str, args: &[&str]) -> Result<String, String> {
-    match Command::new(program).args(args).output() {
-        Ok(output) => {
-            if output.status.success() || !output.stdout.is_empty() {
-                Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    let backend = crate::backend::linux::LinuxBackend::new(crate::execute::FsContext::default());
+    match backend.exec(program, args) {
+        Ok((stdout, stderr, code)) => {
+            if code == 0 || !stdout.is_empty() {
+                Ok(stdout)
             } else {
-                Err(format!(
-                    "{} exited with code {:?}: {}",
-                    program,
-                    output.status.code(),
-                    String::from_utf8_lossy(&output.stderr)
-                ))
+                Err(format!("{} exited with code {}: {}", program, code, stderr))
             }
         }
         Err(e) => Err(format!("Failed to execute {}: {}", program, e)),

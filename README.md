@@ -11,7 +11,7 @@ Zero Trace 2.0 is a media-aware, research-backed secure sanitization and verific
 
 - **UI Layer (Flutter Desktop):** Cross-platform interface built in Flutter for Linux desktop, providing hardware discovery visualization, risk assessment, interactive sanitization workflow, and certificate verification.
 - **Engine Layer (`native/zt_engine`):** High-assurance Rust execution core interfacing directly with Linux block devices and storage controller commands (ATA Secure Erase, NVMe Format/Sanitize, cryptographic erase, multi-pass block overwrite).
-- **Safety Layer (`PolicyLayer`):** Multi-layered safeguards ensuring system/boot disks cannot be targeted, requiring explicit device serial-number confirmation, and keeping the built-in assistant **advisory-only and deterministic** (offline rule-based handlers, no cloud service, no LLM).
+- **Safety Layer (`PolicyLayer`):** Multi-layered safeguards ensuring system/boot disks cannot be targeted, requiring explicit device serial-number confirmation, and keeping the built-in assistant **advisory-only and deterministic** (offline rule-based handlers plus reviewed local knowledge entries, no cloud service, no LLM). Firmware commands run only against a guard-minted `ValidatedTarget`, and the device identity (node, serial, size, boot-disk state) is re-checked immediately before every destructive tool call.
 
 ---
 
@@ -28,6 +28,22 @@ Zero Trace 2.0 is a media-aware, research-backed secure sanitization and verific
 | **Optical Media / Tape** | **Not Supported** | — | Physical destruction required |
 | **Smartphones / Tablets** | **Not Supported** | — | Planned for future research |
 | **RAID / Virtual Volumes** | **Not Supported** | — | Only direct physical block devices |
+
+---
+
+## Device Display Rules
+
+Device detail pages describe what the facts actually say:
+
+- **Partition labels are filesystem-based:** `FAT32 volume`, `exFAT volume`,
+  `NTFS volume`, `ext4 volume`, … with the partition size. `Windows volume
+  (NTFS, size)` appears only after the read-only probe confirmed a Windows
+  installation on that volume; EFI System, Recovery and Microsoft Reserved
+  keep their structural names. The raw volume label stays visible in the
+  detail line.
+- **Capability status colors:** green = available, orange = unknown, gray =
+  not applicable **or** not supported on this device (with the reason text
+  shown). Red is reserved for real failures.
 
 ---
 
@@ -94,6 +110,20 @@ cd native/zt_engine
 cargo test
 cargo build --release
 ```
+
+### Manual Loop-Image Isolation Tests (root only)
+
+The engine ships two `#[ignore]`d tests that build a three-partition image,
+wipe one partition (or the whole device) and compare the untouched bytes. They
+attach real loop devices and are never part of the normal suite:
+
+```bash
+cd native/zt_engine
+sudo env "PATH=$PATH" cargo test --features loopdev_tests \
+    --test loopdev_isolation_test -- --ignored --nocapture
+```
+
+Do not run them automatically in CI or in agent sessions.
 
 ---
 

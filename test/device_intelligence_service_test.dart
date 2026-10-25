@@ -96,7 +96,7 @@ void main() {
       expect(os.role, 'windows_data');
       expect(os.partTypeName, 'Microsoft Basic Data');
       expect(os.usedBytes, 123456789000);
-      expect(os.friendlyDisplayName, startsWith('Windows volume (NTFS'));
+      expect(os.friendlyDisplayName, startsWith('NTFS volume'));
 
       final vault = parts[2];
       expect(vault.role, 'luks');
@@ -173,7 +173,7 @@ void main() {
       final p = profiles.first.partitions.single;
       expect(p.partTypeName, 'Windows NTFS/exFAT');
       expect(p.role, 'windows_data');
-      expect(p.friendlyDisplayName, startsWith('Windows volume (NTFS'));
+      expect(p.friendlyDisplayName, startsWith('NTFS volume'));
     });
   });
 }

@@ -234,10 +234,51 @@ class PartitionInfo {
   // B1/B2: display
   // -------------------------------------------------------------------------
 
-  /// B1: Windows-friendly display name. Never invents drive letters — Linux
+  /// P1: canonical filesystem token for volume labels — never infers an OS
+  /// from the filesystem. Unknown filesystems return null.
+  String? get _volumeFsLabel {
+    final fs = fsType?.trim().toLowerCase();
+    if (fs == null || fs.isEmpty) return null;
+    switch (fs) {
+      case 'ntfs':
+        return 'NTFS';
+      case 'exfat':
+        return 'exFAT';
+      case 'fat32':
+        return 'FAT32';
+      case 'fat16':
+        return 'FAT16';
+      case 'fat12':
+        return 'FAT12';
+      case 'vfat':
+        return 'FAT';
+      case 'ext2':
+      case 'ext3':
+      case 'ext4':
+        return fs;
+      case 'btrfs':
+        return 'btrfs';
+      case 'xfs':
+        return 'XFS';
+      case 'f2fs':
+        return 'F2FS';
+      case 'bitlocker':
+        return 'BitLocker';
+    }
+    return null;
+  }
+
+  /// P1: Windows-friendly display name. Never invents drive letters — Linux
   /// cannot know them reliably. Volume label + size + fs stay visible in
   /// [detailLine] so C: vs D: stays recognizable.
-  String get friendlyDisplayName {
+  ///
+  /// Volumes are labeled by **filesystem** ("FAT32 volume", "exFAT volume",
+  /// "NTFS volume", "ext4 volume") instead of assuming an OS. "Windows
+  /// volume" appears only for NTFS when the read-only probe actually found a
+  /// Windows installation ([windowsInstallDetected]).
+  String get friendlyDisplayName => displayName();
+
+  String displayName({bool windowsInstallDetected = false}) {
     switch (role) {
       case 'efi_system':
         return 'EFI System';
@@ -248,11 +289,20 @@ class PartitionInfo {
       case 'windows_recovery':
         return 'Recovery';
       case 'windows_data':
-        final fs = fsType;
-        if (fs != null && fs.isNotEmpty) {
-          return 'Windows volume (${fs.toUpperCase()}, $formattedSize)';
+        final fs = _volumeFsLabel;
+        if (windowsInstallDetected && fs == 'NTFS') {
+          return 'Windows volume (NTFS, $formattedSize)';
         }
-        return 'Windows volume ($formattedSize)';
+        if (fs != null) {
+          return '$fs volume ($formattedSize)';
+        }
+        final typeName = partTypeName;
+        if (typeName != null &&
+            typeName.isNotEmpty &&
+            typeName != 'Unknown') {
+          return '$typeName ($formattedSize)';
+        }
+        return 'Partition $partitionNumber ($formattedSize)';
       case 'luks':
       case 'linux_crypt':
         final enc = encryptionKind;
@@ -263,6 +313,9 @@ class PartitionInfo {
     }
     final lbl = label.sanitized;
     if (lbl.isNotEmpty) return lbl;
+    // P1: filesystem-based label when known (ext4 volume, btrfs volume, …).
+    final fs = _volumeFsLabel;
+    if (fs != null) return '$fs volume ($formattedSize)';
     final typeName = partTypeName;
     if (typeName != null && typeName.isNotEmpty && typeName != 'Unknown') {
       return typeName;
@@ -279,7 +332,12 @@ class PartitionInfo {
     final lbl = label.sanitized;
     if (lbl.isNotEmpty && lbl != title) bits.add(lbl);
     final fs = fsType;
-    if (fs != null && fs.isNotEmpty && !title.contains(fs.toUpperCase())) {
+    // P1: case-insensitive — fs-based titles use canonical mixed case
+    // ("exFAT volume", "ext4 volume"), so an uppercase compare would repeat
+    // the filesystem in the detail line.
+    if (fs != null &&
+        fs.isNotEmpty &&
+        !title.toLowerCase().contains(fs.toLowerCase())) {
       bits.add(fs.toUpperCase());
     }
     if (!title.contains(formattedSize)) bits.add(formattedSize);

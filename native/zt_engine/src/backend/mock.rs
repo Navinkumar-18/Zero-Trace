@@ -61,6 +61,9 @@ pub struct MockBackend {
     raw_files: HashMap<String, Vec<u8>>,
     stats: HashMap<String, StatFact>,
     exec_results: HashMap<String, (String, String, i32)>,
+    /// P2: every `exec` invocation in order — firmware-flow tests assert the
+    /// exact steps that actually reached a tool.
+    exec_calls: Arc<Mutex<Vec<String>>>,
     /// O_EXCL probe failure injection (busy device).
     exclusive_busy: bool,
 
@@ -103,6 +106,7 @@ impl MockBackend {
             raw_files: HashMap::new(),
             stats: HashMap::new(),
             exec_results: HashMap::new(),
+            exec_calls: Arc::new(Mutex::new(Vec::new())),
             exclusive_busy: false,
             data: Arc::new(Mutex::new(Vec::new())),
             write_fault: WriteFault::None,
@@ -272,6 +276,12 @@ impl MockBackend {
         self
     }
 
+    /// P2: replace the mountinfo content **after** a target was minted — the
+    /// mount-state TOCTOU fault (device became the boot disk post-validation).
+    pub fn mutate_mountinfo(&mut self, content: &str) {
+        self.mountinfo = Some(content.to_string());
+    }
+
     /// Size the shared device image to `len` zero bytes.
     pub fn with_device_size(mut self, len: usize) -> Self {
         self.data = Arc::new(Mutex::new(vec![0u8; len]));
@@ -293,6 +303,12 @@ impl MockBackend {
     /// Snapshot of the shared device image.
     pub fn data(&self) -> Vec<u8> {
         self.data.lock().unwrap().clone()
+    }
+
+    /// P2: exact external-tool invocations that reached this backend, in
+    /// order (refused steps never appear here).
+    pub fn executed_commands(&self) -> Vec<String> {
+        self.exec_calls.lock().unwrap().clone()
     }
 
     /// Truncate the shared device image (device-shrink fault).
@@ -623,6 +639,7 @@ impl BlockBackend for MockBackend {
 
     fn exec(&self, program: &str, args: &[&str]) -> Result<(String, String, i32), BackendError> {
         let cmd = format!("{} {}", program, args.join(" "));
+        self.exec_calls.lock().unwrap().push(cmd.clone());
         let (out, err, code) = self
             .exec_results
             .get(&cmd)

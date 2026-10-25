@@ -657,4 +657,124 @@ mod linux_fixture {
         let env2 = backend.boot_environment().expect("live root");
         assert_eq!(env2, crate::types::BootEnvironment::Live);
     }
+
+    // -----------------------------------------------------------------------
+    // P2: firmware tools require a ValidatedTarget and re-validate identity
+    // immediately before execution; refusals never reach the tool.
+    // -----------------------------------------------------------------------
+
+    #[cfg(target_os = "linux")]
+    fn firmware_fixture() -> MockBackend {
+        // sda is the boot disk; sdb is a free 8 MiB disk with serial + size
+        // pinned by the guard at mint time.
+        MockBackend::new()
+            .with_id("firmware-mock")
+            .with_mountinfo("25 30 8:0 / / rw,relatime shared:1 - ext4 /dev/sda rw\n")
+            .with_mounts("")
+            .with_swaps("")
+            .add_block("sda", 8, 0)
+            .add_block("sdb", 16, 0)
+            .set_attr("sdb", "size", "16384")
+            .set_attr("sdb", "device/serial", SERIAL)
+            .with_device_size(8 * 1024 * 1024)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn firmware_tool_refused_when_target_identity_changed() {
+        use crate::execute::run_firmware_cmd;
+        use crate::guard::validate_whole_disk_flow_target;
+
+        let mut backend = firmware_fixture();
+        let target = validate_whole_disk_flow_target(&backend, "/dev/sdb", SERIAL, SERIAL, false)
+            .expect("confirmed free disk must mint");
+
+        // TOCTOU: the node is swapped/replaced after validation.
+        backend.mutate_attr("sdb", "device/serial", "SOME-OTHER-DISK");
+
+        let mut log = Vec::new();
+        let err = run_firmware_cmd(
+            &backend,
+            &target,
+            "hdparm",
+            &["--security-erase", "p", "/dev/sdb"],
+            true,
+            false,
+            &mut log,
+        )
+        .expect_err("identity drift must refuse the tool");
+
+        match err {
+            ExecuteError::IdentityMismatch(msg) => {
+                assert!(msg.contains("serial"), "message must name the drift: {}", msg)
+            }
+            other => panic!("expected IdentityMismatch, got {:?}", other),
+        }
+        assert_eq!(log.len(), 1, "the refused step must be logged exactly once");
+        assert!(log[0].starts_with("[REFUSED] hdparm --security-erase p /dev/sdb"));
+        assert!(backend.executed_commands().is_empty(), "no tool may run");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn firmware_tool_refused_when_target_becomes_boot_disk() {
+        use crate::execute::run_firmware_cmd;
+        use crate::guard::validate_whole_disk_flow_target;
+
+        let mut backend = firmware_fixture();
+        let target = validate_whole_disk_flow_target(&backend, "/dev/sdb", SERIAL, SERIAL, false)
+            .expect("confirmed free disk must mint");
+
+        // TOCTOU: the device is mounted as / after validation (16:0 = sdb).
+        backend.mutate_mountinfo("25 30 16:0 / / rw,relatime shared:1 - ext4 /dev/sdb rw\n");
+
+        let mut log = Vec::new();
+        let err = run_firmware_cmd(
+            &backend,
+            &target,
+            "nvme",
+            &["sanitize", "/dev/sdb", "-a", "start-block-erase"],
+            true,
+            false,
+            &mut log,
+        )
+        .expect_err("boot disk must refuse the tool");
+
+        match err {
+            ExecuteError::BootDiskProtection(_) => {}
+            other => panic!("expected BootDiskProtection, got {:?}", other),
+        }
+        assert!(log[0].starts_with("[REFUSED] nvme sanitize /dev/sdb"));
+        assert!(backend.executed_commands().is_empty(), "no tool may run");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn firmware_flow_logs_exact_commands_on_validated_target() {
+        use crate::execute::ata_secure_erase_with;
+        use crate::guard::validate_whole_disk_flow_target;
+
+        let backend = firmware_fixture();
+        let target = validate_whole_disk_flow_target(&backend, "/dev/sdb", SERIAL, SERIAL, false)
+            .expect("confirmed free disk must mint");
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(32);
+        let report = ata_secure_erase_with(&backend, &target, false, false, tx)
+            .await
+            .expect("mock tool sequence must succeed");
+
+        let expected = vec![
+            "hdparm -I /dev/sdb".to_string(),
+            "hdparm --user-master u --security-set-pass p /dev/sdb".to_string(),
+            "hdparm --security-erase p /dev/sdb".to_string(),
+            "hdparm -F /dev/sdb".to_string(),
+        ];
+        assert!(report.success);
+        assert_eq!(report.command_log, expected, "exact executed steps, in order");
+        assert_eq!(
+            backend.executed_commands(),
+            expected,
+            "the backend saw exactly the logged steps (no shell, no extras)"
+        );
+    }
 }

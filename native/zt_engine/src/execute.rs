@@ -16,7 +16,6 @@ use std::fs;
 use std::io;
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -366,14 +365,36 @@ async fn send_detailed_progress(
     }).await;
 }
 
-/// Run a shell command and capture output. In dry_run mode, only log the command.
-fn run_cmd(
+/// P2: run one external tool step for an execution flow.
+///
+/// Every external tool invocation from a flow goes through the backend
+/// (`BlockBackend::exec`), never `Command` directly and never through a
+/// shell — arguments stay an argv list. Destructive commands (secure erase,
+/// sanitize, format, discard, PSID revert, …) require a guard-minted
+/// [`ValidatedTarget`] and **re-validate the device identity immediately
+/// before execution** (boot-disk protection, node rdev/inode, serial, size;
+/// see [`crate::guard::revalidate_target_identity`]).
+///
+/// A refused step records a `[REFUSED]` line in the command log and never
+/// reaches the tool.
+pub fn run_firmware_cmd(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
     program: &str,
     args: &[&str],
+    destructive: bool,
     dry_run: bool,
     command_log: &mut Vec<String>,
 ) -> Result<(String, String, i32), ExecuteError> {
     let full_cmd = format!("{} {}", program, args.join(" "));
+
+    if destructive {
+        if let Err(err) = crate::guard::revalidate_target_identity(backend, target, dry_run) {
+            command_log.push(format!("[REFUSED] {}: {}", full_cmd, err));
+            return Err(err);
+        }
+    }
+
     command_log.push(full_cmd.clone());
 
     if dry_run {
@@ -384,66 +405,64 @@ fn run_cmd(
         ));
     }
 
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|e| ExecuteError::CommandFailed(format!("Failed to run {}: {}", program, e)))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let code = output.status.code().unwrap_or(-1);
-
-    Ok((stdout, stderr, code))
+    backend.exec(program, args).map_err(|e| {
+        ExecuteError::CommandFailed(format!("Failed to run {}: {}", program, e))
+    })
 }
 
-/// Safely unmount active filesystems on the target device or its partitions.
-/// Resolves mounted partition paths from /proc/mounts and shells out via `sh -c` for glob expansion.
-fn unmount_device_if_mounted(
-    device: &str,
+/// P2: unmount every mounted partition backing the validated target.
+///
+/// Sources come from the backend's mount facts (so fixture/mock backends are
+/// exercised identically) and `umount` runs with an argv list — the historic
+/// `sh -c "umount -f <device>*"` glob pass is gone: no shell interpolation of
+/// a device path, and no command that can touch a node outside the validated
+/// target's mount set.
+fn unmount_target_if_mounted(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
     dry_run: bool,
     command_log: &mut Vec<String>,
 ) -> (String, String) {
     let mut stdout_accum = String::new();
     let mut stderr_accum = String::new();
+    let device = target.canonical_path();
 
     if dry_run {
-        command_log.push(format!("[DRY RUN] Would check mounts and unmount active partitions on {}", device));
+        command_log.push(format!(
+            "[DRY RUN] Would check mounts and unmount active partitions on {}",
+            device
+        ));
         return (stdout_accum, stderr_accum);
     }
 
-    // 1. Resolve exact mounted partition paths from /proc/mounts
-    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-        let mut mounted_targets = Vec::new();
-        for line in mounts.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if !parts.is_empty() {
-                let mount_src = parts[0];
-                if mount_src == device
-                    || (mount_src.starts_with(device)
-                        && mount_src[device.len()..]
-                            .chars()
-                            .next()
-                            .is_some_and(|c| c.is_ascii_digit() || c == 'p'))
-                {
-                    mounted_targets.push(mount_src.to_string());
-                }
-            }
-        }
-
-        for target in mounted_targets {
-            command_log.push(format!("[UNMOUNT] Unmounting active filesystem target: {}", target));
-            if let Ok((stdout, stderr, _)) = run_cmd("umount", &["-f", &target], dry_run, command_log) {
-                stdout_accum.push_str(&stdout);
-                stderr_accum.push_str(&stderr);
+    // Resolve exact mounted partition paths from the backend's mount facts.
+    let mounts = backend.mounts_file();
+    let mut mounted_targets = Vec::new();
+    for line in mounts.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if !parts.is_empty() {
+            let mount_src = parts[0];
+            if mount_src == device
+                || (mount_src.starts_with(device)
+                    && mount_src[device.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_digit() || c == 'p'))
+            {
+                mounted_targets.push(mount_src.to_string());
             }
         }
     }
 
-    // 2. Explicit shell expansion pass via sh -c for any remaining partition globs
-    let glob_cmd = format!("umount -f {}* 2>/dev/null || true", device);
-    if let Ok((stdout, stderr, _)) = run_cmd("sh", &["-c", &glob_cmd], dry_run, command_log) {
-        stdout_accum.push_str(&stdout);
-        stderr_accum.push_str(&stderr);
+    for mount_src in mounted_targets {
+        command_log.push(format!(
+            "[UNMOUNT] Unmounting active filesystem target: {}",
+            mount_src
+        ));
+        if let Ok((stdout, stderr, _)) = backend.exec("umount", &["-f", &mount_src]) {
+            stdout_accum.push_str(&stdout);
+            stderr_accum.push_str(&stderr);
+        }
     }
 
     (stdout_accum, stderr_accum)
@@ -453,7 +472,10 @@ fn unmount_device_if_mounted(
 // Execution functions
 // ---------------------------------------------------------------------------
 
-/// NVMe Sanitize — issues `nvme sanitize` command and polls sanitize-log.
+/// P2 compatibility adapter: mints a guard [`ValidatedTarget`] from the
+/// historic `(device, token, serial)` arguments and runs the validated flow.
+/// Tool execution itself lives in [`nvme_sanitize_validated`], which only
+/// accepts a `&ValidatedTarget`.
 pub async fn nvme_sanitize(
     device: &str,
     action: SanitizeAction,
@@ -462,22 +484,57 @@ pub async fn nvme_sanitize(
     dry_run: bool,
     tx: mpsc::Sender<ProgressEvent>,
 ) -> Result<ExecutionReport, ExecuteError> {
+    let target = validate_whole_disk_flow_target_ctx(
+        device,
+        confirmation_token,
+        device_serial,
+        dry_run,
+        &FsContext::default(),
+    )?;
+    nvme_sanitize_validated(&target, action, dry_run, tx).await
+}
+
+/// NVMe Sanitize — issues `nvme sanitize` command and polls sanitize-log.
+///
+/// P2: takes a guard-minted [`ValidatedTarget`]. Boot-disk protection,
+/// confirmation token and identity are validated at mint time; the device
+/// identity is re-validated immediately before the destructive command.
+pub async fn nvme_sanitize_validated(
+    target: &ValidatedTarget,
+    action: SanitizeAction,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> Result<ExecutionReport, ExecuteError> {
+    nvme_sanitize_with(
+        &LinuxBackend::new(FsContext::default()),
+        target,
+        action,
+        dry_run,
+        tx,
+    )
+    .await
+}
+
+pub async fn nvme_sanitize_with(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+    action: SanitizeAction,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> Result<ExecutionReport, ExecuteError> {
     let start = Instant::now();
     let mut command_log = Vec::new();
     let mut all_stdout = String::new();
     let mut all_stderr = String::new();
-
-    // Safety checks
-    check_boot_disk_protection(device, dry_run)?;
-    verify_confirmation(confirmation_token, device_serial)?;
+    let device = target.canonical_path();
 
     // Unmount any active partitions on device
-    let (u_out, u_err) = unmount_device_if_mounted(device, dry_run, &mut command_log);
+    let (u_out, u_err) = unmount_target_if_mounted(backend, target, dry_run, &mut command_log);
     all_stdout.push_str(&u_out);
     all_stderr.push_str(&u_err);
 
     // Verify exclusive access and re-check boot protection post-unmount
-    verify_exclusive_access_and_recheck(device, dry_run, &FsContext::default())?;
+    crate::guard::verify_exclusive_access_and_recheck(backend, device, dry_run)?;
 
     let action_arg = match action {
         SanitizeAction::BlockErase => "start-block-erase",
@@ -493,9 +550,12 @@ pub async fn nvme_sanitize(
     send_progress(&tx, ExecutionPhase::FirmwareCommand,
         &format!("Issuing nvme sanitize -a {} on {}", action_arg, device), None).await;
 
-    let (stdout, stderr, code) = run_cmd(
+    let (stdout, stderr, code) = run_firmware_cmd(
+        backend,
+        target,
         "nvme",
         &["sanitize", device, "-a", action_arg],
+        true,
         dry_run,
         &mut command_log,
     )?;
@@ -521,7 +581,15 @@ pub async fn nvme_sanitize(
     if dry_run {
         send_progress(&tx, ExecutionPhase::FirmwareCommand,
             "[DRY RUN] Firmware sanitize command sent to controller", None).await;
-        let (s, e, _) = run_cmd("nvme", &["sanitize-log", device], dry_run, &mut command_log)?;
+        let (s, e, _) = run_firmware_cmd(
+            backend,
+            target,
+            "nvme",
+            &["sanitize-log", device],
+            false,
+            dry_run,
+            &mut command_log,
+        )?;
         all_stdout.push_str(&s);
         all_stderr.push_str(&e);
     }
@@ -552,7 +620,8 @@ pub async fn nvme_sanitize(
     })
 }
 
-/// ATA Secure Erase — handles full ATA SE sequence including frozen-state check.
+/// P2 compatibility adapter: mints a guard [`ValidatedTarget`] from the
+/// historic `(device, token, serial)` arguments and runs the validated flow.
 pub async fn ata_secure_erase(
     device: &str,
     enhanced: bool,
@@ -561,33 +630,75 @@ pub async fn ata_secure_erase(
     dry_run: bool,
     tx: mpsc::Sender<ProgressEvent>,
 ) -> Result<ExecutionReport, ExecuteError> {
+    let target = validate_whole_disk_flow_target_ctx(
+        device,
+        confirmation_token,
+        device_serial,
+        dry_run,
+        &FsContext::default(),
+    )?;
+    ata_secure_erase_validated(&target, enhanced, dry_run, tx).await
+}
+
+/// ATA Secure Erase — handles full ATA SE sequence including frozen-state check.
+///
+/// P2: takes a guard-minted [`ValidatedTarget`]; identity is re-validated
+/// immediately before the password-setting and erase commands.
+pub async fn ata_secure_erase_validated(
+    target: &ValidatedTarget,
+    enhanced: bool,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> Result<ExecutionReport, ExecuteError> {
+    ata_secure_erase_with(
+        &LinuxBackend::new(FsContext::default()),
+        target,
+        enhanced,
+        dry_run,
+        tx,
+    )
+    .await
+}
+
+pub async fn ata_secure_erase_with(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+    enhanced: bool,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> Result<ExecutionReport, ExecuteError> {
     let start = Instant::now();
     let mut command_log = Vec::new();
     let mut all_stdout = String::new();
     let mut all_stderr = String::new();
+    let device = target.canonical_path();
     let method_name = if enhanced {
         "ATA Enhanced Secure Erase".to_string()
     } else {
         "ATA Secure Erase".to_string()
     };
 
-    // Safety checks
-    check_boot_disk_protection(device, dry_run)?;
-    verify_confirmation(confirmation_token, device_serial)?;
-
     // Unmount any active partitions on device
-    let (u_out, u_err) = unmount_device_if_mounted(device, dry_run, &mut command_log);
+    let (u_out, u_err) = unmount_target_if_mounted(backend, target, dry_run, &mut command_log);
     all_stdout.push_str(&u_out);
     all_stderr.push_str(&u_err);
 
     // Verify exclusive access and re-check boot protection post-unmount
-    verify_exclusive_access_and_recheck(device, dry_run, &FsContext::default())?;
+    crate::guard::verify_exclusive_access_and_recheck(backend, device, dry_run)?;
 
     // Phase 1: Check frozen state
     send_progress(&tx, ExecutionPhase::SecurityUnlock,
         "Checking ATA security frozen state with hdparm -I...", Some(10)).await;
 
-    let (stdout, stderr, _) = run_cmd("hdparm", &["-I", device], dry_run, &mut command_log)?;
+    let (stdout, stderr, _) = run_firmware_cmd(
+        backend,
+        target,
+        "hdparm",
+        &["-I", device],
+        false,
+        dry_run,
+        &mut command_log,
+    )?;
     all_stdout.push_str(&stdout);
     all_stderr.push_str(&stderr);
 
@@ -602,9 +713,12 @@ pub async fn ata_secure_erase(
     send_progress(&tx, ExecutionPhase::SecurityUnlock,
         "Setting temporary ATA security password...", Some(8)).await;
 
-    let (stdout, stderr, code) = run_cmd(
+    let (stdout, stderr, code) = run_firmware_cmd(
+        backend,
+        target,
         "hdparm",
         &["--user-master", "u", "--security-set-pass", "p", device],
+        true,
         dry_run,
         &mut command_log,
     )?;
@@ -632,9 +746,12 @@ pub async fn ata_secure_erase(
     send_progress(&tx, ExecutionPhase::FirmwareCommand,
         &format!("Issuing hdparm {} on {}...", erase_arg, device), None).await;
 
-    let (stdout, stderr, code) = run_cmd(
+    let (stdout, stderr, code) = run_firmware_cmd(
+        backend,
+        target,
         "hdparm",
         &[erase_arg, "p", device],
+        true,
         dry_run,
         &mut command_log,
     )?;
@@ -670,7 +787,15 @@ pub async fn ata_secure_erase(
         "Flushing write cache...", Some(1)).await;
 
     if !dry_run {
-        let (s, e, _) = run_cmd("hdparm", &["-F", device], dry_run, &mut command_log)?;
+        let (s, e, _) = run_firmware_cmd(
+            backend,
+            target,
+            "hdparm",
+            &["-F", device],
+            false,
+            dry_run,
+            &mut command_log,
+        )?;
         all_stdout.push_str(&s);
         all_stderr.push_str(&e);
     }
@@ -692,7 +817,8 @@ pub async fn ata_secure_erase(
     })
 }
 
-/// ATA Sanitize — Block Erase, Crypto Scramble, or Overwrite via hdparm.
+/// P2 compatibility adapter: mints a guard [`ValidatedTarget`] from the
+/// historic `(device, token, serial)` arguments and runs the validated flow.
 pub async fn ata_sanitize(
     device: &str,
     action: AtaSanitizeAction,
@@ -701,21 +827,56 @@ pub async fn ata_sanitize(
     dry_run: bool,
     tx: mpsc::Sender<ProgressEvent>,
 ) -> Result<ExecutionReport, ExecuteError> {
+    let target = validate_whole_disk_flow_target_ctx(
+        device,
+        confirmation_token,
+        device_serial,
+        dry_run,
+        &FsContext::default(),
+    )?;
+    ata_sanitize_validated(&target, action, dry_run, tx).await
+}
+
+/// ATA Sanitize — Block Erase, Crypto Scramble, or Overwrite via hdparm.
+///
+/// P2: takes a guard-minted [`ValidatedTarget`]; identity is re-validated
+/// immediately before the sanitize command.
+pub async fn ata_sanitize_validated(
+    target: &ValidatedTarget,
+    action: AtaSanitizeAction,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> Result<ExecutionReport, ExecuteError> {
+    ata_sanitize_with(
+        &LinuxBackend::new(FsContext::default()),
+        target,
+        action,
+        dry_run,
+        tx,
+    )
+    .await
+}
+
+pub async fn ata_sanitize_with(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+    action: AtaSanitizeAction,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> Result<ExecutionReport, ExecuteError> {
     let start = Instant::now();
     let mut command_log = Vec::new();
     let mut all_stdout = String::new();
     let mut all_stderr = String::new();
-
-    check_boot_disk_protection(device, dry_run)?;
-    verify_confirmation(confirmation_token, device_serial)?;
+    let device = target.canonical_path();
 
     // Unmount any active partitions on device
-    let (u_out, u_err) = unmount_device_if_mounted(device, dry_run, &mut command_log);
+    let (u_out, u_err) = unmount_target_if_mounted(backend, target, dry_run, &mut command_log);
     all_stdout.push_str(&u_out);
     all_stderr.push_str(&u_err);
 
     // Verify exclusive access and re-check boot protection post-unmount
-    verify_exclusive_access_and_recheck(device, dry_run, &FsContext::default())?;
+    crate::guard::verify_exclusive_access_and_recheck(backend, device, dry_run)?;
 
     let (action_arg, method_name) = match action {
         AtaSanitizeAction::BlockErase => ("block-erase", "ATA Sanitize Block Erase"),
@@ -731,9 +892,12 @@ pub async fn ata_sanitize(
 
     // hdparm --sanitize-block-erase / --sanitize-crypto-scramble
     let hdparm_arg = format!("--sanitize-{}", action_arg);
-    let (stdout, stderr, code) = run_cmd(
+    let (stdout, stderr, code) = run_firmware_cmd(
+        backend,
+        target,
         "hdparm",
         &[&hdparm_arg, device],
+        true,
         dry_run,
         &mut command_log,
     )?;
@@ -766,7 +930,8 @@ pub async fn ata_sanitize(
     })
 }
 
-/// TCG OPAL Revert — uses sedutil-cli for PSID revert or crypto erase.
+/// P2 compatibility adapter: mints a guard [`ValidatedTarget`] from the
+/// historic `(device, token, serial)` arguments and runs the validated flow.
 pub async fn opal_revert(
     device: &str,
     psid: Option<&str>,
@@ -775,27 +940,70 @@ pub async fn opal_revert(
     dry_run: bool,
     tx: mpsc::Sender<ProgressEvent>,
 ) -> Result<ExecutionReport, ExecuteError> {
+    let target = validate_whole_disk_flow_target_ctx(
+        device,
+        confirmation_token,
+        device_serial,
+        dry_run,
+        &FsContext::default(),
+    )?;
+    opal_revert_validated(&target, psid, dry_run, tx).await
+}
+
+/// TCG OPAL Revert — uses sedutil-cli for PSID revert or crypto erase.
+///
+/// P2: takes a guard-minted [`ValidatedTarget`]; identity is re-validated
+/// immediately before the revert command.
+pub async fn opal_revert_validated(
+    target: &ValidatedTarget,
+    psid: Option<&str>,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> Result<ExecutionReport, ExecuteError> {
+    opal_revert_with(
+        &LinuxBackend::new(FsContext::default()),
+        target,
+        psid,
+        dry_run,
+        tx,
+    )
+    .await
+}
+
+pub async fn opal_revert_with(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+    psid: Option<&str>,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> Result<ExecutionReport, ExecuteError> {
     let start = Instant::now();
     let mut command_log = Vec::new();
     let mut all_stdout = String::new();
     let mut all_stderr = String::new();
-
-    check_boot_disk_protection(device, dry_run)?;
-    verify_confirmation(confirmation_token, device_serial)?;
+    let device = target.canonical_path();
 
     // Unmount any active partitions on device
-    let (u_out, u_err) = unmount_device_if_mounted(device, dry_run, &mut command_log);
+    let (u_out, u_err) = unmount_target_if_mounted(backend, target, dry_run, &mut command_log);
     all_stdout.push_str(&u_out);
     all_stderr.push_str(&u_err);
 
     // Verify exclusive access and re-check boot protection post-unmount
-    verify_exclusive_access_and_recheck(device, dry_run, &FsContext::default())?;
+    crate::guard::verify_exclusive_access_and_recheck(backend, device, dry_run)?;
 
     send_progress(&tx, ExecutionPhase::SecurityUnlock,
         "Querying TCG OPAL SED state...", Some(3)).await;
 
     // Query OPAL state first
-    let (stdout, stderr, _) = run_cmd("sedutil-cli", &["--query", device], dry_run, &mut command_log)?;
+    let (stdout, stderr, _) = run_firmware_cmd(
+        backend,
+        target,
+        "sedutil-cli",
+        &["--query", device],
+        false,
+        dry_run,
+        &mut command_log,
+    )?;
     all_stdout.push_str(&stdout);
     all_stderr.push_str(&stderr);
 
@@ -804,12 +1012,14 @@ pub async fn opal_revert(
 
     // PSID revert or password-based revert
     let (stdout, stderr, code) = if let Some(psid_val) = psid {
-        run_cmd("sedutil-cli", &["--yesIreallywanttoERASEALLmydatausingthePSID", psid_val, device],
-            dry_run, &mut command_log)?
+        run_firmware_cmd(backend, target, "sedutil-cli",
+            &["--yesIreallywanttoERASEALLmydatausingthePSID", psid_val, device],
+            true, dry_run, &mut command_log)?
     } else {
         // Try with default SID
-        run_cmd("sedutil-cli", &["--revertTPer", "SID", device],
-            dry_run, &mut command_log)?
+        run_firmware_cmd(backend, target, "sedutil-cli",
+            &["--revertTPer", "SID", device],
+            true, dry_run, &mut command_log)?
     };
     all_stdout.push_str(&stdout);
     all_stderr.push_str(&stderr);
@@ -840,7 +1050,8 @@ pub async fn opal_revert(
     })
 }
 
-/// eMMC Sanitize — issues `mmc sanitize` command.
+/// P2 compatibility adapter: mints a guard [`ValidatedTarget`] from the
+/// historic `(device, token, serial)` arguments and runs the validated flow.
 pub async fn emmc_sanitize(
     device: &str,
     confirmation_token: &str,
@@ -848,21 +1059,53 @@ pub async fn emmc_sanitize(
     dry_run: bool,
     tx: mpsc::Sender<ProgressEvent>,
 ) -> Result<ExecutionReport, ExecuteError> {
+    let target = validate_whole_disk_flow_target_ctx(
+        device,
+        confirmation_token,
+        device_serial,
+        dry_run,
+        &FsContext::default(),
+    )?;
+    emmc_sanitize_validated(&target, dry_run, tx).await
+}
+
+/// eMMC Sanitize — issues `mmc sanitize` command.
+///
+/// P2: takes a guard-minted [`ValidatedTarget`]; identity is re-validated
+/// immediately before the sanitize command.
+pub async fn emmc_sanitize_validated(
+    target: &ValidatedTarget,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> Result<ExecutionReport, ExecuteError> {
+    emmc_sanitize_with(
+        &LinuxBackend::new(FsContext::default()),
+        target,
+        dry_run,
+        tx,
+    )
+    .await
+}
+
+pub async fn emmc_sanitize_with(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+) -> Result<ExecutionReport, ExecuteError> {
     let start = Instant::now();
     let mut command_log = Vec::new();
     let mut all_stdout = String::new();
     let mut all_stderr = String::new();
-
-    check_boot_disk_protection(device, dry_run)?;
-    verify_confirmation(confirmation_token, device_serial)?;
+    let device = target.canonical_path();
 
     // Unmount any active partitions on device
-    let (u_out, u_err) = unmount_device_if_mounted(device, dry_run, &mut command_log);
+    let (u_out, u_err) = unmount_target_if_mounted(backend, target, dry_run, &mut command_log);
     all_stdout.push_str(&u_out);
     all_stderr.push_str(&u_err);
 
     // Verify exclusive access and re-check boot protection post-unmount
-    verify_exclusive_access_and_recheck(device, dry_run, &FsContext::default())?;
+    crate::guard::verify_exclusive_access_and_recheck(backend, device, dry_run)?;
 
     send_progress(&tx, ExecutionPhase::SecurityUnlock,
         "Reading eMMC extcsd sanitize capability...", Some(3)).await;
@@ -870,7 +1113,15 @@ pub async fn emmc_sanitize(
     send_progress(&tx, ExecutionPhase::FirmwareCommand,
         &format!("Issuing mmc sanitize on {}...", device), None).await;
 
-    let (stdout, stderr, code) = run_cmd("mmc", &["sanitize", device], dry_run, &mut command_log)?;
+    let (stdout, stderr, code) = run_firmware_cmd(
+        backend,
+        target,
+        "mmc",
+        &["sanitize", device],
+        true,
+        dry_run,
+        &mut command_log,
+    )?;
     all_stdout.push_str(&stdout);
     all_stderr.push_str(&stderr);
 
@@ -1178,7 +1429,7 @@ pub async fn discard_erase_ctx(
         "Unmounting filesystems on target device...", false).await;
 
     // 3. Unmount any active partitions on the device
-    let (_stdout, _stderr) = unmount_device_if_mounted(device, false, &mut command_log);
+    let (_stdout, _stderr) = unmount_target_if_mounted(&backend, &validated_target, false, &mut command_log);
 
     // 4. Verify exclusive access and re-check boot protection post-unmount
     verify_exclusive_access_and_recheck(device, false, ctx)?;
@@ -2216,7 +2467,7 @@ pub async fn software_overwrite(
         "Unmounting filesystems on target device...", false).await;
 
     // 3. Unmount any active partitions
-    let (_stdout, _stderr) = unmount_device_if_mounted(device, false, &mut command_log);
+    let (_stdout, _stderr) = unmount_target_if_mounted(&backend, &validated_target, false, &mut command_log);
 
     // 4. Verify exclusive access and re-check boot protection post-unmount
     verify_exclusive_access_and_recheck(device, false, &FsContext::default())?;
@@ -2313,6 +2564,23 @@ impl EngineMethod {
                 | EngineMethod::Overwrite3Pass
                 // A6: BLKDISCARD targets an explicit byte range natively.
                 | EngineMethod::Discard
+        )
+    }
+
+    /// P2: methods that invoke a vendor firmware tool on the whole device
+    /// (secure erase, sanitize, OPAL revert). These require a guard-minted
+    /// `ValidatedTarget` rather than a device path.
+    pub fn is_firmware(&self) -> bool {
+        matches!(
+            self,
+            EngineMethod::AtaSecureErase
+                | EngineMethod::AtaEnhancedSecureErase
+                | EngineMethod::AtaSanitizeBlock
+                | EngineMethod::AtaSanitizeCrypto
+                | EngineMethod::NvmeSanitizeBlock
+                | EngineMethod::NvmeSanitizeCrypto
+                | EngineMethod::OpalRevert
+                | EngineMethod::EmmcSanitize
         )
     }
 }

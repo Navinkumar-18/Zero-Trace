@@ -44,13 +44,44 @@ Rules for agents:
   `backend/linux.rs`; `execute` only re-exports the type so its
   characterization tests keep compiling unchanged. Firmware flows drive
   external tools and never open devices in-process.
-- **Static scan (Phase C2b):** `tests/guard_entry_scan_test.rs`
+- **Firmware flows take a `ValidatedTarget` (Phase P2):** `ata_secure_erase`,
+  `ata_sanitize`, `nvme_sanitize`, `opal_revert` and `emmc_sanitize` expose
+  target-taking entry points (`*_validated` plus backend-injectable `*_with`
+  variants used by the MockBackend tests). Every external tool call goes
+  through `BlockBackend::exec` with an argv list — never `Command` directly,
+  never a shell — and every destructive call
+  (`execute::run_firmware_cmd`) runs
+  `guard::revalidate_target_identity` immediately before execution:
+  boot-disk protection against current mounts, node `st_rdev`/inode, sysfs
+  serial (when exposed) and the size pinned at mint time. The historic
+  `(device, token, serial)` signatures remain only as compatibility adapters
+  that mint a target first. Partition table/partition probes and the
+  read-only Windows probe also route through the backend.
+- **Static scan (Phase C2b + P2):** `tests/guard_entry_scan_test.rs`
   (`no_direct_device_opens_or_ioctls_outside_backend`) fails the build if
   any source outside `src/backend/` uses `libc::open`/`libc::ioctl` or
-  opens device paths with std. The only `libc::open` exception is the
-  checkpoint temp-file creation (`write_checkpoint_file_in_dir`,
-  `O_CREAT|O_EXCL|O_NOFOLLOW` on a plain file, never a device); the
-  std-open exception list is empty.
+  opens device paths with std; `destructive_tools_require_backend_or_
+  validated_target` fails on shell construction, unresolved
+  `Command::new(...)` outside `src/backend/`, or a destructive tool literal
+  (`hdparm`, `nvme`, `sedutil-cli`, `blkdiscard`, `smartctl`, `mmc`, …)
+  outside a function taking `&ValidatedTarget`. The only `libc::open`
+  exception is the checkpoint temp-file creation
+  (`write_checkpoint_file_in_dir`, `O_CREAT|O_EXCL|O_NOFOLLOW` on a plain
+  file, never a device); the std-open exception list is empty.
+- **Display rules (Phase P1):** partition titles are filesystem-based
+  (`FAT32 volume`, `exFAT volume`, `NTFS volume`, `ext4 volume`, size);
+  `Windows volume (NTFS, size)` appears only when the read-only probe found
+  `\Windows`. EFI System / Recovery / Microsoft Reserved keep structural
+  names. Capability rows use green (available), orange (unknown), gray
+  (not applicable **or** not supported on this device); red is reserved for
+  real failures.
+- **Knowledge base (Phase P4):** `assets/knowledge/*.md` entries are
+  `review_status: reviewed`, pass `KnowledgeLint`, are reachable through the
+  assistant router for at least two sample questions, and must agree with the
+  capability matrix (`test/ai/knowledge_required_entries_test.dart`). Entries
+  never contain runnable commands, brittle citations, or overclaiming
+  wording. When engine/UI behavior changes, update the affected entry and its
+  assertions in the same change.
 - **Fail-closed scans (Phase C2c — the single intended behavior change,
   stricter never looser):** during the guard scan, exists-but-unreadable
   sysfs/procfs state blocks the wipe with a typed `BootDiskProtection`
@@ -62,7 +93,11 @@ Rules for agents:
   `MockBackend::with_unreadable_relation`, `with_unreadable_mountinfo`,
   `with_unreadable_attr` and the Linux-fixture unreadable-swaps test.
 - **Never run the ignored hardware tests** (`cargo test --ignored`): the two
-  loop-device tests need real disks + sudo and are permanently out of scope.
+  legacy loop-device tests and the two P3 loop-image isolation tests need
+  real loop devices + sudo and are permanently out of scope. The P3 tests are
+  additionally gated behind `--features loopdev_tests`; manual command:
+  `sudo env "PATH=$PATH" cargo test --features loopdev_tests --test
+  loopdev_isolation_test -- --ignored --nocapture`.
 - **Goldens** (`tests/fixtures/golden/*`,
   `test/fixtures/certificate_payload_v4_golden.json`) are characterization
   baselines: they may only change for an intentional, reviewed protocol
@@ -74,10 +109,12 @@ Rules for agents:
   checkpoints may gain fields only when present (old fixtures must verify or
   parse byte-identically).
 
-Reference test counts after Phase C2 (Phase C baseline: Dart 434 / Rust
-197 + 2 ignored): `flutter test` → 434 passing; `cargo test` → 203
-passing, 2 ignored, 0 failed (includes the `compile_fail` doc test; the
-+6 are the new C2 conformance/scan tests); `flutter analyze` and
+Reference test counts after Phase P (Phase C baseline: Dart 434 / Rust
+197 + 2 ignored): `flutter test` → 439 passing; `cargo test` → 207
+passing, 4 ignored, 0 failed (includes the `compile_fail` doc test; the
+four ignored are the two legacy loop-device tests plus the two P3
+loop-image isolation tests, which also require `--features loopdev_tests`
+to execute); `flutter analyze` and
 `cargo clippy --all-targets -- -D warnings` must be clean, and
 `cargo check` must pass for the `x86_64-pc-windows-gnu` and
 `aarch64-linux-android` targets.

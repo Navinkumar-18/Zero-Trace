@@ -118,22 +118,51 @@ void main() {
       expect(part(role: 'windows_recovery').friendlyDisplayName, 'Recovery');
     });
 
-    test('Windows volume shows fs + size', () {
+    test('NTFS volume is labeled by filesystem, not by assumed OS', () {
       final p = part(
         role: 'windows_data',
         fsType: 'ntfs',
         sizeBytes: 237 * 1024 * 1024 * 1024,
         label: 'OS',
       );
-      expect(p.friendlyDisplayName, 'Windows volume (NTFS, 237.0 GB)');
+      // P1: no Windows assumption from NTFS alone.
+      expect(p.friendlyDisplayName, 'NTFS volume (237.0 GB)');
       // Label stays visible in the detail line — never a drive letter.
       expect(p.detailLine, contains('OS'));
       expect(p.friendlyDisplayName, isNot(contains('C:')));
     });
 
-    test('Windows volume without fs still shows size', () {
+    test('probe-confirmed Windows install labels NTFS as Windows volume', () {
+      final p = part(
+        role: 'windows_data',
+        fsType: 'ntfs',
+        sizeBytes: 237 * 1024 * 1024 * 1024,
+      );
+      expect(p.displayName(windowsInstallDetected: true),
+          'Windows volume (NTFS, 237.0 GB)');
+      // The probe flag never affects non-NTFS volumes.
+      final fat = part(role: 'windows_data', fsType: 'fat32');
+      expect(fat.displayName(windowsInstallDetected: true),
+          'FAT32 volume (500.0 GB)');
+    });
+
+    test('FAT32, exFAT and ext4 volumes use filesystem labels (P1)', () {
+      expect(
+          part(role: 'windows_data', fsType: 'fat32').friendlyDisplayName,
+          'FAT32 volume (500.0 GB)');
+      expect(
+          part(role: 'windows_data', fsType: 'exfat').friendlyDisplayName,
+          'exFAT volume (500.0 GB)');
+      expect(part(role: 'linux', fsType: 'ext4').friendlyDisplayName,
+          'ext4 volume (500.0 GB)');
+      expect(part(role: 'linux', fsType: 'btrfs').friendlyDisplayName,
+          'btrfs volume (500.0 GB)');
+    });
+
+    test('Windows volume without fs assumes no OS', () {
       final p = part(role: 'windows_data', fsType: null);
-      expect(p.friendlyDisplayName, 'Windows volume (500.0 GB)');
+      expect(p.friendlyDisplayName, 'Partition 1 (500.0 GB)');
+      expect(p.friendlyDisplayName, isNot(contains('Windows')));
     });
 
     test('encrypted volume names the encryption kind (B2)', () {
@@ -155,7 +184,10 @@ void main() {
         mountPoint: '/mnt/data',
         encryptionKind: null,
       );
-      expect(p.detailLine, 'EXT4 • 500.0 GB • /mnt/data');
+      // P1: fs + size now live in the filesystem-based title
+      // ("ext4 volume (500.0 GB)"); the detail line adds the mountpoint.
+      expect(p.friendlyDisplayName, 'ext4 volume (500.0 GB)');
+      expect(p.detailLine, '/mnt/data');
     });
 
     test('encrypted and used-space details appear', () {
@@ -164,7 +196,8 @@ void main() {
         encryptionKind: 'BitLocker',
         usedBytes: 100 * 1024 * 1024 * 1024,
       );
-      expect(p.detailLine, contains('NTFS'));
+      // P1: the filesystem is part of the title, not repeated below.
+      expect(p.friendlyDisplayName, startsWith('NTFS volume'));
       expect(p.detailLine, contains('BitLocker (encrypted)'));
       expect(p.detailLine, contains('100.0 GB used'));
     });
