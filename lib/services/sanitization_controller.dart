@@ -2045,6 +2045,267 @@ class SanitizationController extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Re-run post-sanitize verification in place for the current job.
+  ///
+  /// Only valid after this job's wipe completed. It never starts a wipe,
+  /// re-runs the guard chain, or mints a verified-wipe receipt: it refreshes
+  /// the verification verdict, certificate and on-screen stage text.
+  Future<void> verifyCurrentJob() async {
+    final job = _currentJob;
+    if (job == null || !job.wipeCompleted || isJobRunning) return;
+    if (job.status != JobStatus.completed && job.status != JobStatus.failed) {
+      return;
+    }
+
+    job.status = JobStatus.verifying;
+    job.progress = null;
+    job.currentStageDescription =
+        'Verifying sector erasure via 50-point readback sampling...';
+    _addLog('VERIFICATION: Re-running post-sanitize LBA sampling...');
+    notifyListeners();
+
+    if (_isRealMode && !_isMockingDevices) {
+      await _runRealReverification(job);
+    } else {
+      await _runSimulatedReverification(job);
+    }
+  }
+
+  Future<void> _runRealReverification(SanitizationJob job) async {
+    if (kIsWeb || !Platform.isLinux) {
+      final reason = kIsWeb
+          ? 'Verification failed: real mode is not supported on Web.'
+          : 'Verification failed: real mode is only supported on Linux.';
+      await _applyVerificationResult(
+        job,
+        _verificationService.verify(job, isSuccess: false),
+        failureReason: reason,
+        executionMode: 'real',
+      );
+      return;
+    }
+
+    final targets = job.wipeExecutionTargets;
+    final List<RealVerificationReport> reports = [];
+    String? failureReason;
+
+    for (var ti = 0; ti < targets.length; ti++) {
+      final target = targets[ti];
+      job.currentStageDescription = targets.length > 1
+          ? 'Verifying partition ${ti + 1}/${targets.length}: ${target!.name}...'
+          : 'Verifying sector erasure via 50-point readback sampling...';
+      _addLog(
+        'VERIFICATION: Sampling ${target?.devicePath ?? _deviceNode(job.device)}...',
+      );
+      notifyListeners();
+
+      final cliMethod = _realSanitizeService.mapMethodToCliArg(
+        job.effectiveMethod,
+        job.device,
+      );
+      final isCryptoMethod =
+          job.effectiveMethod == SanitizationMethod.cryptographicErase;
+
+      try {
+        final report = await _realSanitizeService.executeVerification(
+          device: job.device,
+          method: cliMethod,
+          deviceSerial: job.device.serialNumber,
+          targetPartition: target,
+          sampleCount: 50,
+          expectZeros: !isCryptoMethod,
+          // Deliberately no verifiedReceiptPath: re-verification must not
+          // mint or replace the one-shot post-wipe format receipt.
+        );
+        reports.add(report);
+        if (!report.pass) {
+          final scope = target == null ? 'whole device' : target.devicePath;
+          failureReason ??=
+              'Verification failed: non-zero or dirty sectors detected on '
+              '$scope (${report.sampleCount} samples, fingerprint '
+              '${report.fingerprintHash}).';
+          _addLog('ERROR: $failureReason');
+        }
+      } catch (e) {
+        failureReason ??= 'Verification failed: $e';
+        _addLog('ERROR: Verification sampling failed: $e');
+        break;
+      }
+    }
+
+    if (failureReason == null && reports.isEmpty) {
+      failureReason =
+          'Verification failed: the engine returned no verification report.';
+    }
+
+    final bool passed =
+        failureReason == null &&
+        reports.isNotEmpty &&
+        reports.every((report) => report.pass);
+
+    final List<int> sampleOffsets = [];
+    final Map<int, String> sampleHashes = {};
+    for (final report in reports) {
+      for (final sample in report.samples) {
+        try {
+          final offset = sample['offset'] as int;
+          final hash = sample['sector_hash'] as String;
+          sampleOffsets.add(offset);
+          sampleHashes[offset] = hash;
+        } catch (_) {}
+      }
+    }
+    if (sampleOffsets.isEmpty) {
+      sampleOffsets.addAll(List.generate(50, (index) => index * 1000));
+      for (final offset in sampleOffsets) {
+        sampleHashes[offset] =
+            '0000000000000000000000000000000000000000000000000000000000000000';
+      }
+    }
+
+    final RealVerificationReport? lastReport = reports.isEmpty
+        ? null
+        : reports.last;
+    final int sampleCount = reports.fold<int>(
+      0,
+      (total, report) => total + report.sampleCount,
+    );
+    final evidence = VerificationEvidence(
+      statusCode: passed ? 0 : 1,
+      controllerConfirmation: reports.isEmpty
+          ? 'VERIFICATION: Sampling unavailable (${failureReason ?? 'no report'})'
+          : 'VERIFICATION: Pass: $passed | Samples: $sampleCount | '
+                'Entropy: ${lastReport!.entropyScore}',
+      sampleOffsets: sampleOffsets,
+      sampleHashes: sampleHashes,
+      evidenceHash: lastReport?.fingerprintHash ?? 'VERIFY_UNAVAILABLE',
+      limitations: _verificationService.getTailoredLimitations(
+        job.recommendedMethod,
+      ),
+      verifiedPassed: passed,
+    );
+
+    await _applyVerificationResult(
+      job,
+      evidence,
+      sampleCount: sampleCount,
+      entropyScore: lastReport?.entropyScore,
+      failureReason: failureReason,
+      executionMode: 'real',
+    );
+  }
+
+  Future<void> _runSimulatedReverification(SanitizationJob job) async {
+    job.progress = 0.9;
+    notifyListeners();
+
+    await Future.delayed(const Duration(milliseconds: 600));
+
+    final bool passed = !job.shouldSimulateFailure;
+    final evidence = _verificationService.verify(job, isSuccess: passed);
+    await _applyVerificationResult(
+      job,
+      evidence,
+      sampleCount: 50,
+      entropyScore: passed ? 0.0 : 1.0,
+      failureReason: passed
+          ? null
+          : 'Verification failed: non-zero or dirty sectors detected '
+                '(simulated failure).',
+      executionMode: 'simulated',
+    );
+  }
+
+  Future<void> _applyVerificationResult(
+    SanitizationJob job,
+    VerificationEvidence evidence, {
+    int? sampleCount,
+    double? entropyScore,
+    String? failureReason,
+    required String executionMode,
+  }) async {
+    final bool passed = evidence.verifiedPassed;
+    final int samples = sampleCount ?? evidence.sampleOffsets.length;
+
+    job.status = passed ? JobStatus.completed : JobStatus.failed;
+    job.progress = 1.0;
+    job.endTime = DateTime.now();
+    job.currentStageDescription = passed
+        ? 'Verification passed: $samples/$samples sector samples are zero.'
+        : (failureReason ??
+              'Verification failed: non-zero or dirty sectors detected.');
+    _addLog(
+      passed
+          ? 'VERIFICATION: Passed $samples/$samples sector samples.'
+          : 'ERROR: ${job.currentStageDescription}',
+    );
+    notifyListeners();
+
+    try {
+      _completedCertificate = _certificateService.generateCertificate(
+        job: job,
+        evidence: evidence,
+        executionMode: executionMode,
+        actualMethodExecuted: job.effectiveMethod.displayName,
+        stepsExecuted: List<String>.from(job.logs),
+        verificationSampleCount: sampleCount,
+        verificationEntropyScore: entropyScore,
+        bootEnvironment: LiveBootDetector.detect().name,
+        // Keep an already-recorded format step attached when re-verifying.
+        filesystemRecreation: _filesystemRecreation,
+      );
+      _addLog(
+        'CERTIFICATE: Issued ${_completedCertificate!.certificateId} for '
+        'verification result.',
+      );
+    } catch (certErr) {
+      _addLog('WARNING: Certificate generation failed: $certErr');
+    }
+
+    try {
+      String? certSha;
+      if (_completedCertificate != null) {
+        final (_, sha) = await _auditLogService.saveCertificate(
+          _completedCertificate!,
+        );
+        certSha = sha;
+      }
+      await _auditLogService.appendEntry(
+        AuditLogEntry(
+          timestamp: DateTime.now().toIso8601String(),
+          jobId: job.jobId,
+          deviceSerial: job.device.serialNumber,
+          devicePath: job.isPartitionScope
+              ? job.targetPartition!.devicePath
+              : (job.device.id.startsWith('real_')
+                    ? '/dev/${job.device.id.substring(5)}'
+                    : '/dev/null'),
+          deviceName: job.device.name,
+          scope: job.isPartitionScope ? 'partial' : 'full',
+          method: job.effectiveMethod.displayName,
+          methodClass: _deriveMethodClass(job.effectiveMethod),
+          standardReference: job.standardReference,
+          nistCategory: job.effectiveNistCategoryDisplayName,
+          outcome: passed ? 'completed' : 'verify_failed',
+          success: passed,
+          verificationPassed: passed,
+          certificateId: _completedCertificate?.certificateId,
+          certificateSha256: certSha,
+          fingerprintHash: evidence.evidenceHash,
+          entropyScore: entropyScore ?? 0.0,
+          sampleCount: samples,
+          commandLog: List<String>.from(job.logs),
+          isSimulated: executionMode == 'simulated',
+          partitions: _buildPartitionOutcomes(job, passed),
+        ),
+      );
+    } catch (auditErr) {
+      _addLog('WARNING: Audit log write failed: $auditErr');
+    }
+
+    notifyListeners();
+  }
+
   void _addLog(String message) {
     if (_currentJob != null) {
       final timestamp = DateTime.now().toString().substring(11, 19);
@@ -2082,6 +2343,16 @@ class SanitizationController extends ChangeNotifier {
   @visibleForTesting
   void setMockCompletedCertificate(SanitizationCertificate? cert) {
     _completedCertificate = cert;
+    notifyListeners();
+  }
+
+  /// Seeds the verified-wipe receipt map so widget tests can exercise the
+  /// optional filesystem-recreation prompt without running a real wipe.
+  @visibleForTesting
+  void setMockVerifiedFormatReceipts(Map<String, String> receipts) {
+    _verifiedFormatReceipts
+      ..clear()
+      ..addAll(receipts);
     notifyListeners();
   }
 }

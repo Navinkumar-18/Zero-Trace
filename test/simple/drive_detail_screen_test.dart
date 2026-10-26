@@ -1,9 +1,15 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:go_router/go_router.dart';
 import 'package:provider/provider.dart';
+import 'package:zero_trace/core/app_paths.dart';
 import 'package:zero_trace/models/certificate.dart';
 import 'package:zero_trace/models/device_profile.dart';
+import 'package:zero_trace/models/partition_info.dart';
 import 'package:zero_trace/models/sanitization_job.dart';
+import 'package:zero_trace/models/untrusted_text.dart';
 import 'package:zero_trace/services/sanitization_controller.dart';
 import 'package:zero_trace/simple/drive_detail_screen.dart';
 
@@ -18,6 +24,77 @@ void main() {
     isRemovable: true,
   );
 
+  const wipedPartition = PartitionInfo(
+    partitionNumber: 1,
+    name: 'sdb1',
+    devicePath: '/dev/sdb1',
+    startSector: 2048,
+    sizeSectors: 2048000,
+    sizeBytes: 1048576000,
+    label: UntrustedText('DATA'),
+    fsType: 'vfat',
+  );
+
+  const partitionDevice = DeviceProfile(
+    id: 'sdb',
+    name: 'SanDisk Cruzer Blade',
+    serialNumber: '4C530000151121111494',
+    mediaType: MediaType.usbFlash,
+    busType: 'USB',
+    capacityBytes: 16000000000,
+    isRemovable: true,
+    partitions: [wipedPartition],
+    partitionTableType: 'gpt',
+  );
+
+  SanitizationJob completedPartitionJob() => SanitizationJob(
+        jobId: 'JOB-VERIFY-IN-PLACE',
+        device: partitionDevice,
+        dataSensitivity: DataSensitivity.confidential,
+        deviceCondition: DeviceCondition.functional,
+        disposalPath: DisposalPath.recycling,
+        riskScore: 50,
+        targetCategory: NistCategory.clear,
+        recommendedMethod: SanitizationMethod.singlePassOverwrite,
+        standardReference: 'NIST SP 800-88 Rev. 1 (Clear)',
+        explanationText: 'Partition wipe completed',
+        targetPartition: wipedPartition,
+        targetPartitions: const [wipedPartition],
+        status: JobStatus.completed,
+        progress: 1.0,
+        currentStageDescription: 'Sanitization & Audit Verification Complete.',
+        wipeCompleted: true,
+      );
+
+  SanitizationCertificate passedCertificate(SanitizationJob job) =>
+      SanitizationCertificate(
+        certificateId: 'CERT-VERIFY-IN-PLACE',
+        jobId: job.jobId,
+        deviceSerial: job.device.serialNumber,
+        deviceModel: job.device.name,
+        mediaType: 'USB Flash',
+        capacity: '16 GB',
+        method: 'Single-Pass Overwrite',
+        sanitizationCategory: 'CLEAR',
+        standardReference: 'NIST SP 800-88 Rev. 1',
+        startTime: DateTime.now().subtract(const Duration(minutes: 5)),
+        endTime: DateTime.now(),
+        result: 'PASSED',
+        verificationSummary: 'Verified 50 samples',
+        softwareVersion: '2.0.0',
+        signature: 'MOCK-SIG',
+        publicKeyPem: 'MOCK-KEY',
+        evidence: VerificationEvidence(
+          statusCode: 0,
+          controllerConfirmation: 'Confirmed',
+          sampleOffsets: const [0, 512, 1024],
+          sampleHashes: const {0: 'hash0'},
+          evidenceHash: 'evidence-hash',
+          limitations: 'None',
+          verifiedPassed: true,
+        ),
+      );
+
   Widget createSubject(SanitizationController controller, {String deviceId = '4C530000151121111494'}) {
     return ChangeNotifierProvider<SanitizationController>.value(
       value: controller,
@@ -28,6 +105,39 @@ void main() {
       ),
     );
   }
+
+  Widget createRoutedSubject(SanitizationController controller, GoRouter router) {
+    return ChangeNotifierProvider<SanitizationController>.value(
+      value: controller,
+      child: MaterialApp.router(routerConfig: router),
+    );
+  }
+
+  GoRouter createDriveRouter() => GoRouter(
+        initialLocation: '/drive/${partitionDevice.stableId}',
+        routes: [
+          GoRoute(
+            path: '/',
+            builder: (context, state) => const Scaffold(
+              body: Center(child: Text('HOME ROUTE')),
+            ),
+          ),
+          GoRoute(
+            path: '/drive/:deviceId',
+            builder: (context, state) => Scaffold(
+              body: DriveDetailScreen(
+                deviceId: state.pathParameters['deviceId'] ?? '',
+              ),
+            ),
+          ),
+          // The legacy verification route used to swallow the Verify action
+          // after a completed wipe by redirecting to home.
+          GoRoute(
+            path: '/advanced/verification',
+            redirect: (context, state) => '/',
+          ),
+        ],
+      );
 
   testWidgets('Idle state shows Method: Decided at confirmation, Wipe enabled, Verify and Certificate disabled', (tester) async {
     tester.view.physicalSize = const Size(1920, 1080);
@@ -180,6 +290,163 @@ void main() {
 
     final certButton = tester.widget<OutlinedButton>(find.widgetWithText(OutlinedButton, 'Certificate'));
     expect(certButton.onPressed, isNotNull);
+  });
+
+  testWidgets('Verify after a completed partition wipe runs in place and reaches passed', (tester) async {
+    tester.view.physicalSize = const Size(1920, 1080);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final dir = Directory.systemTemp.createTempSync('zt_verify_in_place_');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final controller = SanitizationController(
+      appPaths: AppPaths(
+        baseDir: dir,
+        checkpointDir: Directory('${dir.path}/checkpoints'),
+      ),
+      enableAutoPolling: false,
+      deferInitialDiscovery: true,
+    );
+    addTearDown(controller.dispose);
+    controller.setMockDevices([partitionDevice]);
+    controller.isSimulated = true;
+
+    final job = completedPartitionJob();
+    controller.setMockJob(job);
+
+    final router = createDriveRouter();
+    addTearDown(router.dispose);
+
+    await tester.pumpWidget(createRoutedSubject(controller, router));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(DriveDetailScreen), findsOneWidget);
+    expect(find.text('HOME ROUTE'), findsNothing);
+
+    final verifyButton = tester.widget<OutlinedButton>(
+      find.widgetWithText(OutlinedButton, 'Verify'),
+    );
+    expect(verifyButton.onPressed, isNotNull);
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Verify'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+
+    // The verify runs in place: no home/legacy route, still on drive detail.
+    expect(find.byType(DriveDetailScreen), findsOneWidget);
+    expect(find.text('HOME ROUTE'), findsNothing);
+    expect(controller.currentJob!.status, JobStatus.verifying);
+
+    await tester.pumpAndSettle();
+
+    expect(find.byType(DriveDetailScreen), findsOneWidget);
+    expect(find.text('HOME ROUTE'), findsNothing);
+    expect(controller.currentJob!.status, JobStatus.completed);
+    expect(controller.completedCertificate?.evidence.verifiedPassed, isTrue);
+  });
+
+  testWidgets('Verify still works after the Recreate filesystem prompt is dismissed with Not now', (tester) async {
+    tester.view.physicalSize = const Size(1920, 1080);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final dir = Directory.systemTemp.createTempSync('zt_verify_after_not_now_');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final controller = SanitizationController(
+      appPaths: AppPaths(
+        baseDir: dir,
+        checkpointDir: Directory('${dir.path}/checkpoints'),
+      ),
+      enableAutoPolling: false,
+      deferInitialDiscovery: true,
+    );
+    addTearDown(controller.dispose);
+    controller.setMockDevices([partitionDevice]);
+    controller.isSimulated = true;
+
+    final job = completedPartitionJob();
+    controller.setMockJob(job);
+    controller.setMockCompletedCertificate(passedCertificate(job));
+    controller.setMockVerifiedFormatReceipts({
+      wipedPartition.devicePath: '${dir.path}/verified_wipe.json',
+    });
+
+    final router = createDriveRouter();
+    addTearDown(router.dispose);
+
+    await tester.pumpWidget(createRoutedSubject(controller, router));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Recreate filesystem?'), findsOneWidget);
+    await tester.tap(find.text('Not now'));
+    await tester.pump();
+    expect(find.text('Recreate filesystem?'), findsNothing);
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Verify'));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+
+    expect(find.byType(DriveDetailScreen), findsOneWidget);
+    expect(find.text('HOME ROUTE'), findsNothing);
+    expect(controller.currentJob!.status, JobStatus.verifying);
+
+    await tester.pumpAndSettle();
+
+    expect(find.byType(DriveDetailScreen), findsOneWidget);
+    expect(find.text('HOME ROUTE'), findsNothing);
+    expect(controller.currentJob!.status, JobStatus.completed);
+    expect(controller.completedCertificate?.evidence.verifiedPassed, isTrue);
+    expect(find.text('Recreate filesystem?'), findsNothing);
+  });
+
+  testWidgets('Failed in-place Verify stays on drive detail and shows the reason', (tester) async {
+    tester.view.physicalSize = const Size(1920, 1080);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final dir = Directory.systemTemp.createTempSync('zt_verify_failure_');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final controller = SanitizationController(
+      appPaths: AppPaths(
+        baseDir: dir,
+        checkpointDir: Directory('${dir.path}/checkpoints'),
+      ),
+      enableAutoPolling: false,
+      deferInitialDiscovery: true,
+    );
+    addTearDown(controller.dispose);
+    controller.setMockDevices([partitionDevice]);
+    controller.isSimulated = true;
+
+    final job = completedPartitionJob()..shouldSimulateFailure = true;
+    controller.setMockJob(job);
+
+    final router = createDriveRouter();
+    addTearDown(router.dispose);
+
+    await tester.pumpWidget(createRoutedSubject(controller, router));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.widgetWithText(OutlinedButton, 'Verify'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(DriveDetailScreen), findsOneWidget);
+    expect(find.text('HOME ROUTE'), findsNothing);
+    expect(controller.currentJob!.status, JobStatus.failed);
+    expect(controller.completedCertificate?.evidence.verifiedPassed, isFalse);
+    expect(
+      find.textContaining('Verification failed: non-zero data detected'),
+      findsOneWidget,
+    );
   });
 
   testWidgets('Device not found state when ID does not match', (tester) async {

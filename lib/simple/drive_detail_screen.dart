@@ -1032,7 +1032,7 @@ class DriveDetailScreen extends StatelessWidget {
                   ),
                 ),
                 onPressed: canVerify
-                    ? () => context.go('/advanced/verification')
+                    ? () => _handleVerify(context, controller)
                     : null,
               ),
             ),
@@ -1079,6 +1079,23 @@ class DriveDetailScreen extends StatelessWidget {
         ),
       ],
     );
+  }
+
+  Future<void> _handleVerify(
+    BuildContext context,
+    SanitizationController controller,
+  ) async {
+    try {
+      await controller.verifyCurrentJob();
+    } catch (e) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Verification failed: $e'),
+          backgroundColor: AppTheme.accentRose,
+        ),
+      );
+    }
   }
 
   Future<void> _handleWipe(
