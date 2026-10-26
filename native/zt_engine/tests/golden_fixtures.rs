@@ -17,6 +17,8 @@
 //!
 //! Never regenerate to "fix" a refactor regression — the diff IS the signal.
 
+#![cfg(target_os = "linux")]
+
 use std::fs;
 use std::path::PathBuf;
 

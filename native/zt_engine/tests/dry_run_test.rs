@@ -7,6 +7,8 @@
 //! 4. Confirmation token mismatch is rejected
 //! 5. ProgressEvents are streamed correctly
 
+#![cfg(target_os = "linux")]
+
 use tokio::sync::mpsc;
 use zt_engine::execute::*;
 

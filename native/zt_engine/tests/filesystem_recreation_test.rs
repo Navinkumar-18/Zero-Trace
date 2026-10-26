@@ -2,6 +2,8 @@
 //!
 //! Every test uses [`MockBackend`] — no real devices or hardware.
 
+#![cfg(target_os = "linux")]
+
 use zt_engine::backend::conformance::{mock_fixture, partition_params};
 use zt_engine::backend::mock::MockBackend;
 use zt_engine::execute::{

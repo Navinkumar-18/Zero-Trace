@@ -7,6 +7,8 @@
 //! Shape-only: exact key set, and the fixture's non-timestamp field values.
 //! Never writes to a real block device.
 
+#![cfg(target_os = "linux")]
+
 use std::fs;
 use std::path::PathBuf;
 

@@ -3,6 +3,8 @@
 //! These tests verify that detect.rs parsers correctly extract capabilities
 //! from real-world CLI tool outputs without requiring any hardware.
 
+#![cfg(target_os = "linux")]
+
 use zt_engine::detect::*;
 
 fn load_fixture(name: &str) -> String {

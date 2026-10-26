@@ -528,4 +528,5 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "windows-sys",
 ]

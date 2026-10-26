@@ -30,6 +30,7 @@ pub mod linux;
 pub mod mock;
 pub mod unsupported;
 pub mod windows;
+pub mod windows_parse;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -176,7 +177,7 @@ pub struct DeviceGeometry {
 /// Discovery facts (C1 `enumerate_devices` / `enumerate_partitions`).
 /// The Linux backend fills these from the same probing the Dart layer uses;
 /// stub backends return `Unsupported`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceInfo {
     pub name: String,
     pub model: Option<String>,
@@ -187,7 +188,7 @@ pub struct DeviceInfo {
     pub transport: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartitionFacts {
     pub name: String,
     pub partition_number: u32,

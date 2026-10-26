@@ -3,6 +3,8 @@
 //! Note: As mandated by safety ground rules, NEVER write to real block devices in tests.
 //! Uses tempfile, FileBlockWriter, and MockBlockWriter.
 
+#![cfg(target_os = "linux")]
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;

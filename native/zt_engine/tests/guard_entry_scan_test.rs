@@ -484,3 +484,67 @@ fn destructive_tools_require_backend_or_validated_target() {
         violations.join("\n")
     );
 }
+
+#[test]
+fn win32_device_apis_only_in_backend() {
+    let files = production_sources_outside_backend();
+    let mut violations = Vec::new();
+
+    for (name, src) in &files {
+        for (idx, line) in src.split('\n').enumerate() {
+            if line.contains("CreateFileW") || line.contains("DeviceIoControl") {
+                violations.push(format!(
+                    "{}:{}: Win32 device open/ioctl outside backend/",
+                    name,
+                    idx + 1
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Win32 device APIs (CreateFileW, DeviceIoControl) must appear ONLY in src/backend/:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn windows_backend_strictly_read_only_in_this_pass() {
+    let path = format!("{}/src/backend/windows.rs", env!("CARGO_MANIFEST_DIR"));
+    let src = std::fs::read_to_string(&path).expect("read src/backend/windows.rs");
+
+    const FORBIDDEN: &[&str] = &[
+        "GENERIC_WRITE",
+        "GENERIC_ALL",
+        "FILE_WRITE_DATA",
+        "WriteFile",
+        "FSCTL_LOCK_VOLUME",
+        "FSCTL_DISMOUNT_VOLUME",
+        "IOCTL_DISK_SET_",
+    ];
+
+    let mut violations = Vec::new();
+    for (idx, line) in src.split('\n').enumerate() {
+        let trimmed = line.trim();
+        // Ignore comments
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+            continue;
+        }
+        for &forbidden in FORBIDDEN {
+            if line.contains(forbidden) {
+                violations.push(format!(
+                    "src/backend/windows.rs:{}: forbidden write symbol '{}'",
+                    idx + 1,
+                    forbidden
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "WindowsBackend must be strictly read-only in this pass. Forbidden write primitives found:\n{}",
+        violations.join("\n")
+    );
+}

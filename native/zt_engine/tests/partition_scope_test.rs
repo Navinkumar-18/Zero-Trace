@@ -1,6 +1,8 @@
 //! Integration tests for partition-scoped sanitization, geometry validation,
 //! MBR extended container checks, fingerprint verification, and PartitionRangeWriter.
 
+#![cfg(target_os = "linux")]
+
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
