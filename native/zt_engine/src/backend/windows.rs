@@ -5,7 +5,13 @@
 //!   Zero write access is ever requested.
 //! - Every destructive / write operation returns `BackendError::Unsupported`.
 //! - Pure byte parsing is delegated to `crate::backend::windows_parse`.
-//! - PhysicalDrive0..63 scan: not-found = absent; access-denied or any other error = typed error, never skipped.
+//! - Discovery is fail-closed: a drive that is absent is skipped, but
+//!   access-denied, an unreadable volume, a failed/short geometry probe or a
+//!   `FindNextVolumeW` error is a typed error — never a silent skip, never
+//!   `size_bytes = 0`.
+//!
+//! Note: this pass reports facts only. The `C:` / system-disk refusal and all
+//! write paths arrive in a later piece.
 
 #[cfg(not(target_os = "windows"))]
 pub use crate::backend::unsupported::UnsupportedBackend as WindowsBackend;
@@ -13,6 +19,274 @@ pub use crate::backend::unsupported::UnsupportedBackend as WindowsBackend;
 #[cfg(not(target_os = "windows"))]
 pub fn windows_backend() -> WindowsBackend {
     crate::backend::unsupported::UnsupportedBackend::new("windows", "windows")
+}
+
+/// Pure discovery decisions, shared by the Windows implementation and unit
+/// tests. Kept platform-neutral (no Win32 calls) so every error path can be
+/// exercised on Linux without a device.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod discovery {
+    use crate::backend::windows_parse::{ParseError, ParsedGeometry, ParsedVolumeExtents};
+    use crate::backend::BackendError;
+
+    /// Result of opening a physical drive or enumerated volume.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum OpenFailure {
+        NotFound,
+        AccessDenied,
+        Other(u32),
+    }
+
+    /// Only "file/path not found" means absent: `Ok(())` tells the scan to
+    /// skip this slot. Access-denied and every other Win32 error are fatal for
+    /// discovery, so they return `Err`.
+    pub(crate) fn decide_drive_open(outcome: OpenFailure) -> Result<(), BackendError> {
+        match outcome {
+            OpenFailure::NotFound => Ok(()),
+            OpenFailure::AccessDenied => Err(BackendError::Io(
+                "Access denied probing a physical drive".to_string(),
+            )),
+            OpenFailure::Other(code) => Err(BackendError::Io(format!(
+                "Error probing a physical drive (Win32 error {})",
+                code
+            ))),
+        }
+    }
+
+    /// An enumerated volume that cannot be opened or queried is a failure, not
+    /// an absent volume.
+    pub(crate) fn volume_open_error(outcome: OpenFailure) -> BackendError {
+        match outcome {
+            OpenFailure::NotFound => BackendError::Unavailable(
+                "Enumerated volume disappeared before it could be read".to_string(),
+            ),
+            OpenFailure::AccessDenied => {
+                BackendError::Io("Access denied reading an enumerated volume".to_string())
+            }
+            OpenFailure::Other(code) => BackendError::Io(format!(
+                "Failed to read an enumerated volume (Win32 error {})",
+                code
+            )),
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum FindNextOutcome {
+        Found,
+        NoMoreFiles,
+        Failed(u32),
+    }
+
+    /// `Ok(true)` = another volume was returned; `Ok(false)` = clean end of
+    /// enumeration; `Err` = any other `FindNextVolumeW` failure.
+    pub(crate) fn decide_find_next(outcome: FindNextOutcome) -> Result<bool, BackendError> {
+        match outcome {
+            FindNextOutcome::Found => Ok(true),
+            FindNextOutcome::NoMoreFiles => Ok(false),
+            FindNextOutcome::Failed(code) => Err(BackendError::Io(format!(
+                "FindNextVolumeW failed (Win32 error {})",
+                code
+            ))),
+        }
+    }
+
+    /// A failed or malformed geometry probe must never produce a device with
+    /// `size_bytes = 0`; it is a typed error instead.
+    pub(crate) fn decide_geometry_probe(
+        ioctl_ok: bool,
+        win32_error: u32,
+        parsed: Option<Result<ParsedGeometry, ParseError>>,
+    ) -> Result<ParsedGeometry, BackendError> {
+        if !ioctl_ok {
+            return Err(BackendError::Io(format!(
+                "Drive geometry probe failed (Win32 error {})",
+                win32_error
+            )));
+        }
+        let parsed = parsed.ok_or_else(|| {
+            BackendError::Io("Drive geometry probe returned no buffer".to_string())
+        })?;
+        let geom =
+            parsed.map_err(|e| BackendError::Io(format!("Malformed drive geometry: {}", e)))?;
+        if geom.size_bytes == 0 {
+            return Err(BackendError::Unavailable(
+                "Drive geometry probe reported zero size".to_string(),
+            ));
+        }
+        Ok(geom)
+    }
+
+    /// A volume must map to exactly one disk extent for the current
+    /// partition-mapping model. Unreadable, empty or multi-extent volumes are
+    /// typed errors rather than silently skipped.
+    pub(crate) fn decide_volume_extents(
+        ioctl_ok: bool,
+        win32_error: u32,
+        parsed: Option<Result<ParsedVolumeExtents, ParseError>>,
+    ) -> Result<ParsedVolumeExtents, BackendError> {
+        if !ioctl_ok {
+            return Err(BackendError::Io(format!(
+                "Volume disk-extent probe failed (Win32 error {})",
+                win32_error
+            )));
+        }
+        let parsed = parsed.ok_or_else(|| {
+            BackendError::Io("Volume disk-extent probe returned no buffer".to_string())
+        })?;
+        let parsed = parsed
+            .map_err(|e| BackendError::Io(format!("Malformed volume disk extents: {}", e)))?;
+        if parsed.extents.is_empty() {
+            return Err(BackendError::Unavailable(
+                "Volume reported no disk extents".to_string(),
+            ));
+        }
+        if parsed.is_multi_extent || parsed.extents.len() != 1 {
+            return Err(BackendError::Unavailable(format!(
+                "Volume spans {} disk extents; cannot map it to one partition",
+                parsed.extents.len()
+            )));
+        }
+        Ok(parsed)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::backend::windows_parse::{ParsedExtent, ParsedGeometry};
+
+        fn geometry(size_bytes: u64) -> ParsedGeometry {
+            ParsedGeometry {
+                size_bytes,
+                bytes_per_sector: 512,
+            }
+        }
+
+        fn extents(count: u32, multi: bool) -> ParsedVolumeExtents {
+            ParsedVolumeExtents {
+                extents: (0..count)
+                    .map(|i| ParsedExtent {
+                        disk_number: i,
+                        starting_offset: u64::from(i) * 1024,
+                        extent_length: 1024,
+                    })
+                    .collect(),
+                is_multi_extent: multi,
+            }
+        }
+
+        #[test]
+        fn not_found_drive_is_the_only_absent_outcome() {
+            assert!(decide_drive_open(OpenFailure::NotFound).is_ok());
+        }
+
+        #[test]
+        fn access_denied_drive_is_an_error_not_absent() {
+            let err = decide_drive_open(OpenFailure::AccessDenied).unwrap_err();
+            assert!(matches!(err, BackendError::Io(_)));
+            assert!(err.to_string().contains("Access denied"));
+        }
+
+        #[test]
+        fn other_drive_open_error_is_typed() {
+            let err = decide_drive_open(OpenFailure::Other(32)).unwrap_err();
+            assert!(matches!(err, BackendError::Io(_)));
+            assert!(err.to_string().contains("Win32 error 32"));
+        }
+
+        #[test]
+        fn enumerating_volume_failures_are_typed() {
+            assert!(matches!(
+                volume_open_error(OpenFailure::NotFound),
+                BackendError::Unavailable(_)
+            ));
+            assert!(matches!(
+                volume_open_error(OpenFailure::AccessDenied),
+                BackendError::Io(_)
+            ));
+            let other = volume_open_error(OpenFailure::Other(21));
+            assert!(matches!(other, BackendError::Io(_)));
+            assert!(other.to_string().contains("Win32 error 21"));
+        }
+
+        #[test]
+        fn find_next_found_and_no_more_files_are_clean() {
+            assert!(decide_find_next(FindNextOutcome::Found).unwrap());
+            assert!(!decide_find_next(FindNextOutcome::NoMoreFiles).unwrap());
+        }
+
+        #[test]
+        fn find_next_other_error_is_not_a_silent_break() {
+            let err = decide_find_next(FindNextOutcome::Failed(5)).unwrap_err();
+            assert!(matches!(err, BackendError::Io(_)));
+            assert!(err.to_string().contains("FindNextVolumeW failed"));
+            assert!(err.to_string().contains("Win32 error 5"));
+        }
+
+        #[test]
+        fn geometry_ioctl_failure_is_typed() {
+            let err = decide_geometry_probe(false, 5, None).unwrap_err();
+            assert!(matches!(err, BackendError::Io(_)));
+            assert!(err.to_string().contains("geometry probe failed"));
+        }
+
+        #[test]
+        fn geometry_malformed_or_missing_buffer_is_typed() {
+            let malformed =
+                decide_geometry_probe(true, 0, Some(Err(ParseError("short".to_string()))))
+                    .unwrap_err();
+            assert!(matches!(malformed, BackendError::Io(_)));
+            assert!(malformed.to_string().contains("Malformed drive geometry"));
+
+            let missing = decide_geometry_probe(true, 0, None).unwrap_err();
+            assert!(matches!(missing, BackendError::Io(_)));
+        }
+
+        #[test]
+        fn geometry_zero_size_is_rejected_not_reported() {
+            let err = decide_geometry_probe(true, 0, Some(Ok(geometry(0)))).unwrap_err();
+            assert!(matches!(err, BackendError::Unavailable(_)));
+            assert!(err.to_string().contains("zero size"));
+        }
+
+        #[test]
+        fn geometry_success_returns_the_nonzero_size() {
+            let geom = decide_geometry_probe(true, 0, Some(Ok(geometry(4096)))).unwrap();
+            assert_eq!(geom.size_bytes, 4096);
+            assert_eq!(geom.bytes_per_sector, 512);
+        }
+
+        #[test]
+        fn volume_extent_ioctl_and_parse_failures_are_typed() {
+            let ioctl = decide_volume_extents(false, 5, None).unwrap_err();
+            assert!(matches!(ioctl, BackendError::Io(_)));
+
+            let malformed =
+                decide_volume_extents(true, 0, Some(Err(ParseError("short".to_string()))))
+                    .unwrap_err();
+            assert!(matches!(malformed, BackendError::Io(_)));
+            assert!(malformed
+                .to_string()
+                .contains("Malformed volume disk extents"));
+        }
+
+        #[test]
+        fn empty_or_multi_extent_volume_is_rejected_not_skipped() {
+            let empty = decide_volume_extents(true, 0, Some(Ok(extents(0, false)))).unwrap_err();
+            assert!(matches!(empty, BackendError::Unavailable(_)));
+            assert!(empty.to_string().contains("no disk extents"));
+
+            let multi = decide_volume_extents(true, 0, Some(Ok(extents(2, true)))).unwrap_err();
+            assert!(matches!(multi, BackendError::Unavailable(_)));
+            assert!(multi.to_string().contains("2 disk extents"));
+            assert!(multi.to_string().contains("cannot map"));
+        }
+
+        #[test]
+        fn single_extent_volume_is_accepted() {
+            let parsed = decide_volume_extents(true, 0, Some(Ok(extents(1, false)))).unwrap();
+            assert_eq!(parsed.extents.len(), 1);
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -33,12 +307,12 @@ mod windows_impl {
         GetVolumePathNamesForVolumeNameW, FILE_FLAGS_AND_ATTRIBUTES, FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ, FILE_SHARE_WRITE, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
     };
-    use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::{
         PropertyStandardQuery, StorageDeviceProperty, StorageDeviceSeekPenaltyProperty,
         IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
         IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_PROPERTY_QUERY,
     };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
 
     use crate::backend::windows_parse::{
         parse_disk_geometry_ex, parse_drive_layout_ex, parse_seek_penalty_descriptor,
@@ -50,6 +324,11 @@ mod windows_impl {
     };
     use crate::guard::ValidatedTarget;
     use crate::types::{BootEnvironment, ExecuteError};
+
+    use super::discovery::{
+        decide_drive_open, decide_find_next, decide_geometry_probe, decide_volume_extents,
+        volume_open_error, FindNextOutcome, OpenFailure,
+    };
 
     /// Scoped RAII handle wrapper ensuring `CloseHandle` is always called.
     struct ScopedHandle(HANDLE);
@@ -88,7 +367,10 @@ mod windows_impl {
 
     /// Read-only open helper: `dwDesiredAccess = 0` (FILE_ANY_ACCESS) or `FILE_READ_ATTRIBUTES`.
     /// Never uses `GENERIC_WRITE` or `GENERIC_READ`.
-    fn open_read_only_handle(path: &str, access_attributes_only: bool) -> Result<ScopedHandle, BackendError> {
+    fn open_read_only_handle(
+        path: &str,
+        access_attributes_only: bool,
+    ) -> Result<ScopedHandle, BackendError> {
         let wide = to_wide_null(path);
         // dwDesiredAccess: 0 allows query IOCTLs; FILE_READ_ATTRIBUTES allows querying volume metadata.
         let access = if access_attributes_only {
@@ -112,7 +394,10 @@ mod windows_impl {
         if handle == INVALID_HANDLE_VALUE {
             let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
             if err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND {
-                return Err(BackendError::Unavailable(format!("Device not found: {}", path)));
+                return Err(BackendError::Unavailable(format!(
+                    "Device not found: {}",
+                    path
+                )));
             } else if err == ERROR_ACCESS_DENIED {
                 return Err(BackendError::Io(format!(
                     "Access denied opening {} (Win32 error {})",
@@ -128,6 +413,42 @@ mod windows_impl {
 
         ScopedHandle::new(handle)
             .ok_or_else(|| BackendError::Io(format!("Invalid handle for {}", path)))
+    }
+
+    fn classify_open_failure(err: u32) -> OpenFailure {
+        if err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND {
+            OpenFailure::NotFound
+        } else if err == ERROR_ACCESS_DENIED {
+            OpenFailure::AccessDenied
+        } else {
+            OpenFailure::Other(err)
+        }
+    }
+
+    /// Opens an enumerated volume read-only. Unlike an absent physical-drive
+    /// scan slot, a volume returned by `FindFirstVolumeW`/`FindNextVolumeW`
+    /// that cannot be opened is a typed discovery error.
+    fn open_volume_read_only(path: &str) -> Result<ScopedHandle, BackendError> {
+        let wide = to_wide_null(path);
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0 as FILE_FLAGS_AND_ATTRIBUTES,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if handle == INVALID_HANDLE_VALUE {
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            return Err(volume_open_error(classify_open_failure(err)));
+        }
+
+        ScopedHandle::new(handle)
+            .ok_or_else(|| BackendError::Io(format!("Invalid volume handle for {}", path)))
     }
 
     #[derive(Debug, Default)]
@@ -176,15 +497,10 @@ mod windows_impl {
 
                 if handle == INVALID_HANDLE_VALUE {
                     let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-                    // Absent drive: skip
-                    if err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND {
-                        continue;
-                    }
-                    // Access denied or any other error: typed error, NEVER silently skip!
-                    return Err(BackendError::Io(format!(
-                        "Error probing physical drive {} (Win32 error {})",
-                        path, err
-                    )));
+                    // Only file/path-not-found is an absent scan slot; every
+                    // other Win32 error aborts discovery.
+                    decide_drive_open(classify_open_failure(err))?;
+                    continue;
                 }
 
                 let handle = ScopedHandle(handle);
@@ -205,13 +521,20 @@ mod windows_impl {
                     )
                 };
 
+                // Fail closed: a failed, short or malformed geometry probe is a
+                // typed error. It must never become `size_bytes = 0`.
                 let geom = if ok != 0 {
-                    parse_disk_geometry_ex(&geom_buf[..bytes_returned as usize]).ok()
+                    let returned = (bytes_returned as usize).min(geom_buf.len());
+                    decide_geometry_probe(
+                        true,
+                        0,
+                        Some(parse_disk_geometry_ex(&geom_buf[..returned])),
+                    )?
                 } else {
-                    None
+                    let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+                    decide_geometry_probe(false, err, None)?
                 };
-
-                let size_bytes = geom.as_ref().map(|g| g.size_bytes).unwrap_or(0);
+                let size_bytes = geom.size_bytes;
 
                 // 2. Query StorageDeviceProperty (model, serial, bus type, removable)
                 let mut query = STORAGE_PROPERTY_QUERY {
@@ -234,7 +557,8 @@ mod windows_impl {
                 };
 
                 let desc = if ok_desc != 0 {
-                    parse_storage_device_descriptor(&desc_buf[..bytes_returned as usize]).ok()
+                    let returned = (bytes_returned as usize).min(desc_buf.len());
+                    parse_storage_device_descriptor(&desc_buf[..returned]).ok()
                 } else {
                     None
                 };
@@ -260,7 +584,8 @@ mod windows_impl {
                 };
 
                 let is_rotational = if ok_seek != 0 {
-                    parse_seek_penalty_descriptor(&seek_buf[..bytes_returned as usize]).unwrap_or(true)
+                    let returned = (bytes_returned as usize).min(seek_buf.len());
+                    parse_seek_penalty_descriptor(&seek_buf[..returned]).unwrap_or(true)
                 } else {
                     // Default to rotational when query unsupported
                     true
@@ -434,7 +759,9 @@ mod windows_impl {
         }
 
         fn read_raw(&self, _path: &str, _offset: u64, _len: u64) -> Result<Vec<u8>, BackendError> {
-            Err(BackendError::Unsupported("raw reads on Windows in this pass"))
+            Err(BackendError::Unsupported(
+                "raw reads on Windows in this pass",
+            ))
         }
 
         fn stat_path(&self, _path: &str) -> Result<StatFact, BackendError> {
@@ -452,8 +779,14 @@ mod windows_impl {
             )))
         }
 
-        fn exec(&self, _program: &str, _args: &[&str]) -> Result<(String, String, i32), BackendError> {
-            Err(BackendError::Unsupported("external command exec on Windows"))
+        fn exec(
+            &self,
+            _program: &str,
+            _args: &[&str],
+        ) -> Result<(String, String, i32), BackendError> {
+            Err(BackendError::Unsupported(
+                "external command exec on Windows",
+            ))
         }
 
         fn device_geometry(&self, target: &str) -> Result<DeviceGeometry, BackendError> {
@@ -473,16 +806,13 @@ mod windows_impl {
                 )
             };
 
-            if ok == 0 {
+            let geom = if ok != 0 {
+                let returned = (bytes_returned as usize).min(geom_buf.len());
+                decide_geometry_probe(true, 0, Some(parse_disk_geometry_ex(&geom_buf[..returned])))?
+            } else {
                 let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
-                return Err(BackendError::Io(format!(
-                    "Failed to get device geometry for {} (Win32 error {})",
-                    target, err
-                )));
-            }
-
-            let geom = parse_disk_geometry_ex(&geom_buf[..bytes_returned as usize])
-                .map_err(|e| BackendError::Io(e.0))?;
+                decide_geometry_probe(false, err, None)?
+            };
 
             Ok(DeviceGeometry {
                 size_bytes: geom.size_bytes,
@@ -496,8 +826,13 @@ mod windows_impl {
             Err(BackendError::Unsupported("unmount on Windows"))
         }
 
-        fn open_exclusive(&self, _target: &ValidatedTarget) -> Result<ExclusiveHandle, BackendError> {
-            Err(BackendError::Unsupported("exclusive write access on Windows"))
+        fn open_exclusive(
+            &self,
+            _target: &ValidatedTarget,
+        ) -> Result<ExclusiveHandle, BackendError> {
+            Err(BackendError::Unsupported(
+                "exclusive write access on Windows",
+            ))
         }
 
         fn discard_range(
@@ -510,7 +845,9 @@ mod windows_impl {
         }
 
         fn reread_partition_table(&self, _target: &ValidatedTarget) -> Result<(), BackendError> {
-            Err(BackendError::Unsupported("partition-table re-read on Windows"))
+            Err(BackendError::Unsupported(
+                "partition-table re-read on Windows",
+            ))
         }
     }
 
@@ -521,25 +858,38 @@ mod windows_impl {
         fs_type: Option<String>,
     }
 
-    /// Enumerates all volumes and maps (disk_number, starting_offset) -> MappedVolume
+    /// Enumerates all volumes and maps (disk_number, starting_offset) -> MappedVolume.
+    ///
+    /// The `FindVolume` handle is always closed, including on the error paths.
     fn collect_volume_mappings() -> Result<HashMap<(u32, u64), MappedVolume>, BackendError> {
-        let mut map = HashMap::new();
         let mut volume_name = [0u16; 512];
 
-        let find_handle = unsafe {
-            FindFirstVolumeW(volume_name.as_mut_ptr(), volume_name.len() as u32)
-        };
+        let find_handle =
+            unsafe { FindFirstVolumeW(volume_name.as_mut_ptr(), volume_name.len() as u32) };
 
         if find_handle == INVALID_HANDLE_VALUE {
             let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
             if err == ERROR_NO_MORE_FILES {
-                return Ok(map);
+                return Ok(HashMap::new());
             }
             return Err(BackendError::Io(format!(
                 "FindFirstVolumeW failed (Win32 error {})",
                 err
             )));
         }
+
+        let result = collect_volume_mappings_from(find_handle, &mut volume_name);
+        unsafe {
+            FindVolumeClose(find_handle);
+        }
+        result
+    }
+
+    fn collect_volume_mappings_from(
+        find_handle: HANDLE,
+        volume_name: &mut [u16; 512],
+    ) -> Result<HashMap<(u32, u64), MappedVolume>, BackendError> {
+        let mut map = HashMap::new();
 
         loop {
             let vol_guid_path = String::from_utf16_lossy(
@@ -549,69 +899,77 @@ mod windows_impl {
             // Strip trailing backslash to open device handle (e.g. `\\?\Volume{...}`)
             let vol_dev_path = vol_guid_path.trim_end_matches('\\');
 
-            // Open volume device with dwDesiredAccess = 0
-            if let Ok(vol_handle) = open_read_only_handle(vol_dev_path, false) {
-                let mut extents_buf = [0u8; 1024];
-                let mut bytes_returned = 0u32;
-                let ok = unsafe {
-                    DeviceIoControl(
-                        vol_handle.get(),
-                        IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
-                        std::ptr::null(),
-                        0,
-                        extents_buf.as_mut_ptr() as *mut _,
-                        extents_buf.len() as u32,
-                        &mut bytes_returned,
-                        std::ptr::null_mut(),
-                    )
-                };
+            // An enumerated volume that cannot be opened is an error, not an
+            // absent device. This keeps access-denied and vanished volumes
+            // visible instead of silently dropping their partitions.
+            let vol_handle = open_volume_read_only(vol_dev_path)?;
+            let mut extents_buf = [0u8; 1024];
+            let mut bytes_returned = 0u32;
+            let ok = unsafe {
+                DeviceIoControl(
+                    vol_handle.get(),
+                    IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                    std::ptr::null(),
+                    0,
+                    extents_buf.as_mut_ptr() as *mut _,
+                    extents_buf.len() as u32,
+                    &mut bytes_returned,
+                    std::ptr::null_mut(),
+                )
+            };
 
-                if ok != 0 {
-                    if let Ok(parsed) = parse_volume_disk_extents(&extents_buf[..bytes_returned as usize]) {
-                        // Multi-extent volumes => ambiguous/unsupported; single extent matches 1:1
-                        if !parsed.is_multi_extent && parsed.extents.len() == 1 {
-                            let ext = &parsed.extents[0];
-                            let key = (ext.disk_number, ext.starting_offset);
+            let parsed = if ok != 0 {
+                let returned = (bytes_returned as usize).min(extents_buf.len());
+                decide_volume_extents(
+                    true,
+                    0,
+                    Some(parse_volume_disk_extents(&extents_buf[..returned])),
+                )?
+            } else {
+                let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+                decide_volume_extents(false, err, None)?
+            };
 
-                            // Get drive letter(s)
-                            let drive_letter = get_volume_path_name(&vol_guid_path);
+            // decide_volume_extents guarantees exactly one extent.
+            let ext = &parsed.extents[0];
+            let key = (ext.disk_number, ext.starting_offset);
 
-                            // Get volume label and filesystem
-                            let (label, fs_type) = get_volume_info(&vol_guid_path);
+            // Get drive letter(s)
+            let drive_letter = get_volume_path_name(&vol_guid_path);
 
-                            map.insert(
-                                key,
-                                MappedVolume {
-                                    drive_letter,
-                                    label,
-                                    fs_type,
-                                },
-                            );
-                        }
-                    }
-                }
-            }
+            // Get volume label and filesystem
+            let (label, fs_type) = get_volume_info(&vol_guid_path);
 
-            let next_ok = unsafe {
+            map.insert(
+                key,
+                MappedVolume {
+                    drive_letter,
+                    label,
+                    fs_type,
+                },
+            );
+
+            let next_outcome = if unsafe {
                 FindNextVolumeW(
                     find_handle,
                     volume_name.as_mut_ptr(),
                     volume_name.len() as u32,
                 )
-            };
-
-            if next_ok == 0 {
+            } != 0
+            {
+                FindNextOutcome::Found
+            } else {
                 let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
                 if err == ERROR_NO_MORE_FILES {
-                    break;
+                    FindNextOutcome::NoMoreFiles
+                } else {
+                    FindNextOutcome::Failed(err)
                 }
-                // Log and stop enumeration
+            };
+
+            if !decide_find_next(next_outcome)? {
                 break;
             }
-        }
-
-        unsafe {
-            FindVolumeClose(find_handle);
         }
 
         Ok(map)

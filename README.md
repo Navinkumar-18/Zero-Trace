@@ -57,7 +57,7 @@ decision lives in the shared guard chain (`native/zt_engine/src/guard.rs`).
 | Platform | Engine backend | Device discovery | UI actions | Status |
 | :--- | :--- | :--- | :--- | :--- |
 | **Linux** (x86_64) | `LinuxBackend` — real sysfs/proc facts, O_EXCL exclusive access, raw I/O | `lsblk` via `LinuxPlatformBackend` | Fully enabled | **Supported** — the only shipping platform; all tests run here |
-| **Windows** (x86_64-pc-windows-gnu) | `UnsupportedBackend` stub — returns `Unsupported`, zero capability flags | Returns an empty list | Disabled with the reason *"Not available on this platform"* | Compile-only stub; gated by CI `cargo check` |
+| **Windows** (x86_64-pc-windows-gnu / x86_64-pc-windows-msvc) | `WindowsBackend` — read-only Win32 facts (drive geometry, partition layout, storage descriptors, single-disk volume extents); every write/wipe action returns `Unsupported` and all capabilities are false | Read-only scan of `PhysicalDrive0..63` plus volume enumeration; fails closed on access-denied, unreadable volumes, failed/short geometry probes and non-`ERROR_NO_MORE_FILES` enumeration errors | Disabled with the reason *"Not available on this platform"* | **Read-only facts only** — no write, lock, dismount, discard or format path; system-disk (`C:`) refusal arrives in a later piece; CI `cargo check` on both Windows targets |
 | **Android** (aarch64-linux-android) | `UnsupportedBackend` stub — returns `Unsupported`, zero capability flags | Returns an empty list | Disabled with the reason *"Not available on this platform"* | Compile-only stub; gated by CI `cargo check` |
 | **Anything else** | `UnsupportedBackend` stub (fail closed) | Returns an empty list | Disabled with the reason *"Not available on this platform*" | Refused |
 
@@ -66,6 +66,13 @@ Notes:
 - A backend can never write without a guard-minted `ValidatedTarget`
   (private constructor; proven by a `compile_fail` doc test), so stub
   platforms are denied at compile time, not just at runtime.
+- The Windows backend is a facts-only probe in this pass: on Windows the
+  engine answers `zt_engine windows-facts` with read-only device/partition
+  JSON, and every other command exits 2. It never requests write access,
+  never locks, dismounts, discards or formats, and never reports
+  `size_bytes = 0` for a failed probe — discovery errors are returned
+  instead of skipped. The Dart `WindowsPlatformBackend` and the `C:` /
+  system-disk refusal are deliberately out of scope for this piece.
 - `DETECT_REPORT` output carries additive `platform` and `capabilities`
   fields; v4 certificates carry signed `platform`/`backend` fields only when
   present, so all older certificates verify byte-identically.

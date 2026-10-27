@@ -64,7 +64,7 @@ jobs:
         run: cargo test
 
   rust-cross:
-    name: Cargo check (Windows / Android stub targets)
+    name: Cargo check (Windows / Android targets)
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -76,18 +76,22 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-gnu,aarch64-linux-android
+          targets: x86_64-pc-windows-gnu,x86_64-pc-windows-msvc,aarch64-linux-android
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: native/zt_engine
 
-      # C5/C8: the shared guard chain + backend trait and the compile-only
-      # Windows/Android stub backends must keep building on both targets.
-      # Only lib+bins are checked — the integration tests exercise Linux
-      # sysfs/proc paths and are Linux-only by design.
+      # C5/C8: the shared guard chain + backend trait and the read-only
+      # Windows backend must keep building on both Windows ABIs; the
+      # compile-only Android stub must keep building too. Only lib+bins are
+      # checked — the integration tests exercise Linux sysfs/proc paths and
+      # are Linux-only by design.
       - name: cargo check (x86_64-pc-windows-gnu)
         run: cargo check --target x86_64-pc-windows-gnu
+
+      - name: cargo check (x86_64-pc-windows-msvc)
+        run: cargo check --target x86_64-pc-windows-msvc
 
       - name: cargo check (aarch64-linux-android)
         run: cargo check --target aarch64-linux-android

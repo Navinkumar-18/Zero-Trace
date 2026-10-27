@@ -19,7 +19,8 @@ One shared guard chain + one UI; platform-specific disk access sits behind the
 | Shared types + `ValidatedTarget` (private constructor) | `src/types.rs`, `src/guard.rs` | every target |
 | `BlockBackend` trait, `current_backend()`, capabilities | `src/backend.rs` | every target |
 | `LinuxBackend` (the only real backend; owns all raw device opens/ioctls incl. `DirectBlockWriter` and the read/write primitives) | `src/backend/linux.rs` | Linux |
-| Windows/Android/unknown stubs (`Unsupported`, caps all false) | `src/backend/{unsupported,windows,android}.rs` | every target |
+| `WindowsBackend` — read-only facts only (geometry, drive layout, storage descriptors, single-disk volume extents); all capabilities false, every write/wipe action `Unsupported` | `src/backend/windows.rs` + `src/backend/windows_parse.rs` | Windows; the pure parse/decision modules also build under `cfg(test)` on every host |
+| Android/unknown stubs (`Unsupported`, caps all false) | `src/backend/{unsupported,android}.rs` | every target |
 | `MockBackend` + shared conformance suite | `src/backend/{mock,conformance}.rs` | every target |
 | Engine modules (`detect`, `execute`, `partitions`, `verify`, `main`) | `src/` | Linux only (`#[cfg(target_os = "linux")]`); other targets get a stub `main` that exits 2 |
 | Dart `PlatformBackend` + provider | `lib/services/platform_backend.dart` | picked via `Platform.isX`; stubs report `isSupported=false` with *"Not available on this platform"* |
@@ -57,6 +58,18 @@ Rules for agents:
   `(device, token, serial)` signatures remain only as compatibility adapters
   that mint a target first. Partition table/partition probes and the
   read-only Windows probe also route through the backend.
+- **Windows is facts-only (Phase D):** `WindowsBackend` opens every disk and
+  volume with `dwDesiredAccess = 0` or `FILE_READ_ATTRIBUTES` only; no write,
+  lock, dismount, discard or format path exists, `capabilities()` is all-false
+  and every action returns `Unsupported`. Discovery fails closed: only
+  `ERROR_FILE_NOT_FOUND` / `ERROR_PATH_NOT_FOUND` mean an absent
+  `PhysicalDriveN`; access-denied, unreadable volumes, non-
+  `ERROR_NO_MORE_FILES` `FindNextVolumeW` errors, failed/short/malformed/zero
+  geometry probes and empty/multi-extent volume probes are typed errors, never
+  a silent skip and never `size_bytes = 0`. The `C:` / system-disk refusal and
+  the Dart Windows platform backend arrive later and must not be assumed
+  present. Parser fixtures and discovery decisions run on Linux through
+  `#[cfg(any(target_os = "windows", test))]`; no test touches a real device.
 - **Static scan (Phase C2b + P2):** `tests/guard_entry_scan_test.rs`
   (`no_direct_device_opens_or_ioctls_outside_backend`) fails the build if
   any source outside `src/backend/` uses `libc::open`/`libc::ioctl` or
@@ -109,12 +122,14 @@ Rules for agents:
   checkpoints may gain fields only when present (old fixtures must verify or
   parse byte-identically).
 
-Reference test counts after Phase P (Phase C baseline: Dart 434 / Rust
-197 + 2 ignored): `flutter test` → 439 passing; `cargo test` → 207
-passing, 4 ignored, 0 failed (includes the `compile_fail` doc test; the
-four ignored are the two legacy loop-device tests plus the two P3
-loop-image isolation tests, which also require `--features loopdev_tests`
-to execute); `flutter analyze` and
-`cargo clippy --all-targets -- -D warnings` must be clean, and
-`cargo check` must pass for the `x86_64-pc-windows-gnu` and
-`aarch64-linux-android` targets.
+Reference test counts after Phase D (Phase C baseline: Dart 434 / Rust
+197 + 2 ignored): `flutter test` → 455 passing; `cargo test` → 252
+passing, 5 ignored, 0 failed (includes the `compile_fail` doc test; the
+five ignored are the two legacy loop-device writer tests
+(`native_writer_test`, `partition_scope_test`) plus the three loop-image
+tests (`loopdev_filesystem_recreation_test` and two in
+`loopdev_isolation_test`), all of which need root + real loop devices;
+the loop-image ones also require `--features loopdev_tests` to execute);
+`flutter analyze` and `cargo clippy --all-targets -- -D warnings` must be
+clean, and `cargo check` must pass for the `x86_64-pc-windows-gnu`,
+`x86_64-pc-windows-msvc` and `aarch64-linux-android` targets.
