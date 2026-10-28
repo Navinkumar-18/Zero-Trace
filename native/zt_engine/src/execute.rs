@@ -635,25 +635,32 @@ pub fn record_verified_wipe(
 /// Build a receipt stamp for a verified path. Used by the `verify` CLI after
 /// verification passed, so the separate `format` process can prove it is
 /// formatting the same just-verified target.
+///
+/// The stamp carries the **canonicalized** path — the same string
+/// [`crate::guard::get_guard_identity`] re-derives for the format target —
+/// never the raw argv path: a receipt minted from a `/dev/disk/by-id/...`
+/// symlink could otherwise never be adopted. Canonicalization failure is a
+/// typed error (fail closed); there is no raw-path fallback.
 pub fn verified_wipe_stamp_for_path(
     backend: &dyn BlockBackend,
     device_path: &str,
     device_serial: &str,
 ) -> Result<VerifiedWipeStamp, ExecuteError> {
-    let stat = backend.stat_path(device_path).map_err(|e| {
+    let canonical = backend.canonicalize_path(device_path, false)?;
+    let stat = backend.stat_path(&canonical).map_err(|e| {
         ExecuteError::IdentityMismatch(format!(
             "cannot stat verified target {}: {}",
-            device_path, e
+            canonical, e
         ))
     })?;
-    let name = device_path.strip_prefix("/dev/").unwrap_or(device_path);
+    let name = canonical.strip_prefix("/dev/").unwrap_or(&canonical);
     let part_attr = backend
         .sysfs_class_attr(name, "partition")
         .unwrap_or_default();
     let (scope, parent_name, partition_number, fingerprint) = match part_attr {
         Some(raw) => {
             let num = raw.trim().parse::<u32>().unwrap_or(0);
-            let parent = crate::guard::resolve_parent_disk(backend, device_path)?;
+            let parent = crate::guard::resolve_parent_disk(backend, &canonical)?;
             (
                 "partial".to_string(),
                 Some(parent.clone()),
@@ -666,7 +673,7 @@ pub fn verified_wipe_stamp_for_path(
         None => ("full".to_string(), None, None, None),
     };
     Ok(VerifiedWipeStamp {
-        canonical_path: device_path.to_string(),
+        canonical_path: canonical,
         device_serial: device_serial.to_string(),
         rdev: stat.rdev,
         ino: stat.ino,
@@ -679,27 +686,92 @@ pub fn verified_wipe_stamp_for_path(
 }
 
 /// Persist a verification receipt (0600) for the separate format process.
+///
+/// The write is atomic and fail-closed: a unique temp file is created in the
+/// same directory with `create_new` (`O_CREAT|O_EXCL`), mode `0600` and
+/// `O_NOFOLLOW`, the payload is written and fsynced, then renamed over the
+/// final path and the parent directory is fsynced. Every failure removes the
+/// temp file and returns a typed [`ExecuteError::VerifiedWipeReceiptFailed`]
+/// so the `verify` CLI can exit non-zero instead of silently downgrading to a
+/// warning the app could never honor.
+///
+/// Scan note (`guard_entry_scan_test`): this uses std `OpenOptions`, never
+/// `libc::open` — no whitelist entry was added to the frozen scan.
 pub fn write_verified_wipe_receipt(
     path: &Path,
     stamp: &VerifiedWipeStamp,
 ) -> Result<(), ExecuteError> {
-    let data = serde_json::to_vec_pretty(stamp).map_err(|e| {
-        ExecuteError::FilesystemRecreationFailed(format!("cannot serialize receipt: {}", e))
-    })?;
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fn receipt_err(msg: String) -> ExecuteError {
+        ExecuteError::VerifiedWipeReceiptFailed(msg)
     }
-    fs::write(path, data).map_err(|e| {
-        ExecuteError::FilesystemRecreationFailed(format!(
-            "cannot write verification receipt {}: {}",
+
+    let data = serde_json::to_vec_pretty(stamp)
+        .map_err(|e| receipt_err(format!("cannot serialize receipt: {}", e)))?;
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(dir) = parent {
+        fs::create_dir_all(dir).map_err(|e| {
+            receipt_err(format!(
+                "cannot create receipt directory {}: {}",
+                dir.display(),
+                e
+            ))
+        })?;
+    }
+
+    // Unique temp name in the same directory: the rename must never cross
+    // a device boundary, and create_new refuses to reuse a stale file.
+    let base = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("receipt.json");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_path =
+        path.with_file_name(format!(".{}.{}.{}.tmp", base, std::process::id(), nanos));
+
+    let mut tmp = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp_path)
+        .map_err(|e| {
+            receipt_err(format!(
+                "cannot create receipt temp file {}: {}",
+                tmp_path.display(),
+                e
+            ))
+        })?;
+    if let Err(e) = tmp.write_all(&data).and_then(|()| tmp.sync_all()) {
+        drop(tmp);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(receipt_err(format!(
+            "cannot write receipt {}: {}",
+            tmp_path.display(),
+            e
+        )));
+    }
+    drop(tmp);
+    if let Err(e) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(receipt_err(format!(
+            "cannot commit receipt {}: {}",
             path.display(),
             e
-        ))
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        )));
+    }
+
+    // Durability: fsync the containing directory so the rename survives.
+    if let Some(dir) = parent {
+        if let Ok(handle) = fs::File::open(dir) {
+            let _ = handle.sync_all();
+        }
     }
     Ok(())
 }

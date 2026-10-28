@@ -1,6 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
+
 import '../core/app_paths.dart';
 import '../models/device_profile.dart';
 import '../models/partition_info.dart';
@@ -109,6 +111,15 @@ class RealVerificationReport {
   final String? scope;
   final String? limitation;
 
+  /// Exit code of the `zt_engine verify` process: 0 = ok, 2 = verification
+  /// failed, 3 = engine error, 4 = verification passed but the engine could
+  /// not save the verified-wipe receipt (Phase F).
+  final int exitCode;
+
+  /// Raw stderr of the verify process — the engine's typed refusal reason
+  /// (surfaced in place of the format prompt on exit 4).
+  final String stderr;
+
   RealVerificationReport({
     required this.pass,
     required this.sampleCount,
@@ -120,9 +131,15 @@ class RealVerificationReport {
     this.partitionSize,
     this.scope,
     this.limitation,
+    this.exitCode = 0,
+    this.stderr = '',
   });
 
-  factory RealVerificationReport.fromJson(Map<String, dynamic> json) {
+  factory RealVerificationReport.fromJson(
+    Map<String, dynamic> json, {
+    int exitCode = 0,
+    String stderr = '',
+  }) {
     return RealVerificationReport(
       pass: json['pass'] as bool? ?? false,
       sampleCount: json['sample_count'] as int? ?? 0,
@@ -134,6 +151,8 @@ class RealVerificationReport {
       partitionSize: (json['partition_size'] as num?)?.toInt(),
       scope: json['scope'] as String?,
       limitation: json['limitation'] as String?,
+      exitCode: exitCode,
+      stderr: stderr,
     );
   }
 }
@@ -208,11 +227,18 @@ class RealSanitizationService {
 
   Process? get activeProcess => _activeProcess;
 
+  /// Phase F test seam: when non-null, the engine binary spawned by this
+  /// service instead of the platform-resolved one. Test-only — never set
+  /// from settings, environment or the UI. Defaults to null, so production
+  /// always resolves through the platform backend.
+  @visibleForTesting
+  static String? binaryPathOverride;
+
   /// Resolves the compiled zt_engine binary path through the platform
   /// backend (C6) so discovery enrichment and execution always agree on
   /// which engine runs; unsupported platforms refuse with a clear reason.
-  Future<String> getBinaryPath() =>
-      currentPlatformBackend().resolveEngineBinaryPath();
+  Future<String> getBinaryPath() async =>
+      binaryPathOverride ?? currentPlatformBackend().resolveEngineBinaryPath();
 
   /// Maps the recommended sanitization method to the corresponding CLI action parameter.
   String mapMethodToCliArg(SanitizationMethod method, DeviceProfile device) {
@@ -627,14 +653,27 @@ class RealSanitizationService {
       },
     );
 
-    if (result.exitCode == 0 && result.stdout != null) {
+    // Exit 0 is the normal path; exit 4 means verification PASSED and the
+    // report was printed, but the verified-wipe receipt could not be saved
+    // (typed engine failure). Every other non-zero exit stays a
+    // verification failure with no report.
+    final bool reportableExit =
+        result.exitCode == 0 || result.exitCode == 4;
+    final rawStderr = result.stderr as String? ?? '';
+    if (reportableExit && result.stdout != null) {
       final lines = (result.stdout as String).split('\n');
       for (final line in lines) {
         if (line.startsWith('VERIFY_REPORT:')) {
           try {
             final jsonStr = line.substring('VERIFY_REPORT:'.length);
             final parsed = jsonDecode(jsonStr);
-            return RealVerificationReport.fromJson(parsed);
+            if (parsed is Map) {
+              return RealVerificationReport.fromJson(
+                Map<String, dynamic>.from(parsed),
+                exitCode: result.exitCode,
+                stderr: rawStderr,
+              );
+            }
           } catch (_) {}
         }
       }
@@ -648,6 +687,8 @@ class RealSanitizationService {
       entropyScore: 1.0,
       fingerprintHash: 'ERROR_VERIFICATION_FAILED',
       rngSeed: 0,
+      exitCode: result.exitCode,
+      stderr: rawStderr,
     );
   }
 }

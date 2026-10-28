@@ -14,6 +14,7 @@ import 'classification_service.dart';
 import 'device_intelligence_service.dart';
 import 'device_simulator.dart';
 import 'policy_layer.dart';
+import 'partition_table_service.dart';
 import 'platform_backend.dart';
 import 'recommendation_service.dart';
 import 'risk_scoring_service.dart';
@@ -54,18 +55,38 @@ class SanitizationController extends ChangeNotifier {
   bool _isFormattingFilesystem = false;
   bool _formatPromptDismissed = false;
   String? _filesystemRecreationError;
+  String? _filesystemRecreationUnavailableReason;
 
   bool get isFormattingFilesystem => _isFormattingFilesystem;
   String? get filesystemRecreationError => _filesystemRecreationError;
 
+  /// Why the optional "Recreate filesystem?" prompt is NOT offered after this
+  /// job's wipe even though verification passed: the engine did not write the
+  /// receipt, the receipt did not match this target, or the engine refused
+  /// (exit 4). Null when a receipt was accepted or none was ever expected.
+  String? get filesystemRecreationUnavailableReason =>
+      _filesystemRecreationUnavailableReason;
+
   /// True only after this job's wipe completed *and* verification passed for
-  /// at least one target, with a matching verified-wipe receipt available.
+  /// at least one target, with a verified-wipe receipt that still exists on
+  /// disk. The proof can disappear (one-shot cleanup, manual delete); the
+  /// app must never offer a format the engine can no longer honor.
   bool get canRecreateFilesystem {
     final job = _currentJob;
     if (job == null || _isFormattingFilesystem) return false;
     if (!job.wipeCompleted || job.status != JobStatus.completed) return false;
     if (_completedCertificate?.evidence.verifiedPassed != true) return false;
-    return _verifiedFormatReceipts.isNotEmpty && _filesystemRecreation == null;
+    if (_filesystemRecreation != null) return false;
+    return _hasLiveReceipt(job);
+  }
+
+  /// True when the current job has at least one receipt file that still
+  /// exists on disk: per live target for partition scope, per device node
+  /// for whole-device scope.
+  bool _hasLiveReceipt(SanitizationJob job) {
+    if (job.isPartitionScope) return filesystemRecreationTargets.isNotEmpty;
+    final receipt = _verifiedFormatReceipts[_deviceNode(job.device)];
+    return receipt != null && File(receipt).existsSync();
   }
 
   /// UI gate: the prompt disappears once the user formats or dismisses it.
@@ -706,16 +727,19 @@ class SanitizationController extends ChangeNotifier {
       ? '/dev/${device.id.substring(5)}'
       : '/dev/sdb';
 
-  /// Partition-scope targets of the current job, in wipe order.
+  /// Partition-scope targets of the current job, in wipe order, whose
+  /// receipt file still exists on disk (a deleted receipt means the format
+  /// step is no longer provable).
   List<PartitionInfo> get filesystemRecreationTargets {
     final job = _currentJob;
     if (job == null || !job.isPartitionScope) return const [];
     final parts = job.targetPartitions.isEmpty
         ? <PartitionInfo>[job.targetPartition!]
         : job.targetPartitions;
-    return parts
-        .where((p) => _verifiedFormatReceipts.containsKey(p.devicePath))
-        .toList();
+    return parts.where((p) {
+      final receipt = _verifiedFormatReceipts[p.devicePath];
+      return receipt != null && File(receipt).existsSync();
+    }).toList();
   }
 
   /// Prefill values for the "Recreate filesystem?" prompt. Defaults come from
@@ -779,6 +803,7 @@ class SanitizationController extends ChangeNotifier {
   void _resetFilesystemRecreationState() {
     _filesystemRecreation = null;
     _filesystemRecreationError = null;
+    _filesystemRecreationUnavailableReason = null;
     _isFormattingFilesystem = false;
     _formatPromptDismissed = false;
     _verifiedFormatReceipts.clear();
@@ -789,6 +814,125 @@ class SanitizationController extends ChangeNotifier {
       final file = File(path);
       if (file.existsSync()) file.deleteSync();
     } catch (_) {}
+  }
+
+  /// Phase F: validate a receipt minted by `zt_engine verify` for this exact
+  /// target before it can earn the "Recreate filesystem?" prompt.
+  ///
+  /// Returns null when the file exists, parses, and binds to the target on
+  /// every axis the engine also enforces: canonical path (symlink-resolved,
+  /// falling back to the raw path when the node cannot be resolved), device
+  /// serial, partition scope/number, and partition-table fingerprint
+  /// (compared only when both sides carry one — whole-disk receipts are
+  /// minted without a fingerprint and must never mismatch on it).
+  /// Otherwise a user-facing reason for refusing the format.
+  @visibleForTesting
+  static String? validateVerifiedWipeReceipt({
+    required String targetPath,
+    required File receiptFile,
+    required String deviceSerial,
+    required bool isPartitionScope,
+    int? partitionNumber,
+    required String expectedFingerprint,
+  }) {
+    if (!receiptFile.existsSync()) {
+      return 'Filesystem recreation unavailable: the verification receipt '
+          'was not written by the engine.';
+    }
+
+    Map<String, dynamic>? stamp;
+    try {
+      final decoded = jsonDecode(receiptFile.readAsStringSync());
+      if (decoded is Map<String, dynamic>) stamp = decoded;
+    } catch (_) {}
+    if (stamp == null) {
+      return 'Filesystem recreation unavailable: the verification receipt '
+          'is not valid JSON.';
+    }
+
+    final actualPath = stamp['canonical_path'] as String?;
+    if (actualPath == null || actualPath.isEmpty) {
+      return 'Filesystem recreation unavailable: the verification receipt '
+          'has no canonical path.';
+    }
+    // Symlink resolution, fail-closed: if the target node cannot be
+    // resolved (device removed), compare against the raw path — never a
+    // crash, and still a mismatch when the receipt names another target.
+    String expectedPath;
+    try {
+      expectedPath = File(targetPath).resolveSymbolicLinksSync();
+    } catch (_) {
+      expectedPath = targetPath;
+    }
+    if (actualPath != expectedPath) {
+      return 'Filesystem recreation unavailable: the verification receipt '
+          'is for $actualPath, not $targetPath.';
+    }
+
+    final actualSerial = stamp['device_serial'] as String?;
+    if (actualSerial != deviceSerial) {
+      return 'Filesystem recreation unavailable: the verification receipt '
+          'is for a different device (serial mismatch).';
+    }
+
+    final actualScope = stamp['scope'] as String?;
+    if (isPartitionScope) {
+      final actualPart = stamp['partition_number'];
+      if (actualScope != 'partial' ||
+          actualPart is! int ||
+          actualPart != partitionNumber) {
+        return 'Filesystem recreation unavailable: the verification receipt '
+            'is for a different partition.';
+      }
+    } else if (actualScope != 'full' || stamp['partition_number'] != null) {
+      return 'Filesystem recreation unavailable: the verification receipt '
+          'is for a partition, not this whole device.';
+    }
+
+    final actualFingerprint = stamp['partition_table_fingerprint'];
+    if (actualFingerprint != null &&
+        expectedFingerprint.isNotEmpty &&
+        '$actualFingerprint' != expectedFingerprint) {
+      return 'Filesystem recreation unavailable: the verification receipt '
+          'was minted for a different partition table.';
+    }
+
+    return null;
+  }
+
+  /// Offers the format step only for a receipt that really exists and binds
+  /// to this exact target. Returns null when the receipt was accepted into
+  /// [_verifiedFormatReceipts]; otherwise the reason shown in place of the
+  /// prompt (and logged as a warning by the caller).
+  String? _recordVerifiedWipeReceipt({
+    required SanitizationJob job,
+    required String targetPath,
+    required PartitionInfo? target,
+    required File receiptFile,
+    required RealVerificationReport verifyReport,
+  }) {
+    // Exit 4: verification passed but the engine itself refused to mint the
+    // receipt — surface its typed reason verbatim.
+    if (verifyReport.exitCode == 4) {
+      final detail = verifyReport.stderr.trim();
+      return detail.isNotEmpty
+          ? 'Filesystem recreation unavailable: $detail'
+          : 'Filesystem recreation unavailable: the engine could not save '
+              'the verification receipt.';
+    }
+    final expectedFingerprint = job.device.partitionTableFingerprint ??
+        PartitionTableService.computeFingerprint(job.device.partitions);
+    final reason = validateVerifiedWipeReceipt(
+      targetPath: targetPath,
+      receiptFile: receiptFile,
+      deviceSerial: job.device.serialNumber,
+      isPartitionScope: target != null,
+      partitionNumber: target?.partitionNumber,
+      expectedFingerprint: expectedFingerprint,
+    );
+    if (reason != null) return reason;
+    _verifiedFormatReceipts[targetPath] = receiptFile.path;
+    return null;
   }
 
   /// Recreate a filesystem on a target that was wiped and verified in this
@@ -1644,7 +1788,24 @@ class SanitizationController extends ChangeNotifier {
             allVerifiesPassed = allVerifiesPassed && verifyReport.pass;
             verifyReports.add(verifyReport);
             if (verifyReport.pass) {
-              _verifiedFormatReceipts[targetPath] = receiptFile.path;
+              // Phase F: the receipt earns the format prompt only when the
+              // file exists and binds to this exact target — otherwise the
+              // prompt is withheld, the reason is surfaced, and a warning
+              // lands in the job log.
+              final reason = _recordVerifiedWipeReceipt(
+                job: job,
+                targetPath: targetPath,
+                target: target,
+                receiptFile: receiptFile,
+                verifyReport: verifyReport,
+              );
+              if (reason != null) {
+                _filesystemRecreationUnavailableReason = reason;
+                _addLog('WARNING: $reason');
+              } else {
+                _filesystemRecreationUnavailableReason = null;
+              }
+              notifyListeners();
             }
           }
         } // end per-target wipe loop (B4)

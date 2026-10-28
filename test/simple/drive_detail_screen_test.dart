@@ -373,8 +373,15 @@ void main() {
     final job = completedPartitionJob();
     controller.setMockJob(job);
     controller.setMockCompletedCertificate(passedCertificate(job));
+    // Phase F receipt hardening: the prompt is gated on the receipt file
+    // really existing, so this test now seeds a real file (it previously
+    // seeded a nonexistent path and asserted the prompt anyway).
+    final receiptFile = File('${dir.path}/verified_wipe.json');
+    receiptFile.writeAsStringSync(
+      '{"canonical_path": "${wipedPartition.devicePath}"}',
+    );
     controller.setMockVerifiedFormatReceipts({
-      wipedPartition.devicePath: '${dir.path}/verified_wipe.json',
+      wipedPartition.devicePath: receiptFile.path,
     });
 
     final router = createDriveRouter();

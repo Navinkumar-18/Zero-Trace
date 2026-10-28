@@ -60,6 +60,12 @@ pub enum ExecuteError {
     /// Phase F: partition-table creation/format cannot proceed for this target.
     #[error("Filesystem recreation failed: {0}")]
     FilesystemRecreationFailed(String),
+    /// Phase F: a passing `verify` was asked for a verified-wipe receipt
+    /// (the app's per-job state file) but the stamp could not be built or
+    /// persisted. The CLI exits non-zero (4) so the app never offers a
+    /// format it cannot honor.
+    #[error("Verified-wipe receipt failed: {0}")]
+    VerifiedWipeReceiptFailed(String),
 }
 
 // ---------------------------------------------------------------------------

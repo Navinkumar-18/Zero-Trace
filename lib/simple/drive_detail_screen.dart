@@ -539,6 +539,13 @@ class DriveDetailScreen extends StatelessWidget {
                       controller.showFilesystemRecreationPrompt) ...[
                     _buildFilesystemRecreationPrompt(context, controller),
                     const SizedBox(height: 20),
+                  ] else if (isJobForThisDevice &&
+                      controller.filesystemRecreationUnavailableReason !=
+                          null) ...[
+                    // Phase F: verification passed but the receipt could not
+                    // be honored — say why instead of showing nothing.
+                    _buildFilesystemRecreationUnavailable(controller),
+                    const SizedBox(height: 20),
                   ],
                   const SizedBox(height: 4),
 
@@ -802,6 +809,43 @@ class DriveDetailScreen extends StatelessWidget {
     if (confirmed == true) {
       await controller.cancelCurrentJob();
     }
+  }
+
+  /// Phase F: shown when verification passed but the format step cannot be
+  /// offered (receipt missing, mismatched, or refused by the engine) — the
+  /// reason replaces the prompt instead of leaving a silent gap.
+  Widget _buildFilesystemRecreationUnavailable(
+    SanitizationController controller,
+  ) {
+    return Container(
+      key: const Key('filesystem-recreation-unavailable'),
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppTheme.surfaceCard,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppTheme.surfaceBorder),
+      ),
+      child: Row(
+        children: [
+          const Icon(
+            Icons.info_outline,
+            size: 18,
+            color: AppTheme.accentGold,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              controller.filesystemRecreationUnavailableReason ?? '',
+              style: const TextStyle(
+                color: AppTheme.textSecondary,
+                fontSize: 12,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   /// Phase F: persistent prompt card. The format action itself is OFF by

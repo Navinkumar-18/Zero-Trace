@@ -13,7 +13,20 @@ use zt_engine::execute::{
     AtaSanitizeAction, EngineMethod, FsContext, OverwritePattern, PartitionTargetParams,
     ProgressEvent, SanitizeAction,
 };
+use zt_engine::types::ExecuteError;
 use zt_engine::verify::{verify_device, verify_device_scoped};
+
+/// Phase F: a non-passing `verify` (operation failed = exit 2, engine error
+/// = exit 3) must never leave a receipt behind — a stale file at the
+/// requested path would otherwise be adopted by the separate `format`
+/// process as fresh proof.
+fn delete_requested_receipt() {
+    if let Ok(path) = env::var("ZT_VERIFIED_WIPE_RECEIPT") {
+        if !path.is_empty() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
 
 fn is_partition_device(device: &str) -> bool {
     let name = device.strip_prefix("/dev/").unwrap_or(device);
@@ -365,32 +378,39 @@ pub async fn run() {
                         println!("VERIFY_REPORT:{}", json);
                     }
                     if !report.pass {
+                        delete_requested_receipt();
                         process::exit(2);
                     }
                     // Phase F: only when the caller asks for a receipt (the
                     // app sets this to its per-job state file) — never write
                     // into a user's home during ordinary verify runs.
+                    //
+                    // The verification above PASSED, but if the receipt
+                    // cannot be minted or persisted the format promise must
+                    // not survive: print the typed error and exit 4 so the
+                    // app surfaces the reason instead of offering a format
+                    // it cannot honor.
                     if let Ok(receipt_path) = env::var("ZT_VERIFIED_WIPE_RECEIPT") {
                         let backend = LinuxBackend::system();
-                        match verified_wipe_stamp_for_path(&backend, device, serial) {
-                            Ok(stamp) => {
-                                if let Err(e) =
-                                    write_verified_wipe_receipt(Path::new(&receipt_path), &stamp)
-                                {
-                                    eprintln!(
-                                        "Warning: could not write verification receipt: {}",
-                                        e
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("Warning: could not build verification receipt: {:?}", e);
-                            }
+                        let minted = verified_wipe_stamp_for_path(&backend, device, serial)
+                            .map_err(|err| {
+                                ExecuteError::VerifiedWipeReceiptFailed(format!(
+                                    "cannot stamp verification receipt: {}",
+                                    err
+                                ))
+                            })
+                            .and_then(|stamp| {
+                                write_verified_wipe_receipt(Path::new(&receipt_path), &stamp)
+                            });
+                        if let Err(err) = minted {
+                            eprintln!("{}", err);
+                            process::exit(4);
                         }
                     }
                 }
                 Err(err) => {
                     eprintln!("Error executing verify: {:?}", err);
+                    delete_requested_receipt();
                     process::exit(3);
                 }
             }

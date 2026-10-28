@@ -124,6 +124,17 @@ Rules for agents:
   additionally gated behind `--features loopdev_tests`; manual command:
   `sudo env "PATH=$PATH" cargo test --features loopdev_tests --test
   loopdev_isolation_test -- --ignored --nocapture`.
+- **Engine CLI exit codes (Phase F receipt contract):** `0` success; `1` CLI
+  usage/argument error; `2` operation ran but failed (sanitize/verify/format
+  report with `success:false`/`pass:false`); `3` guard refusal or execution
+  error; `4` **only from `verify`**: the verification passed and
+  `VERIFY_REPORT:` was printed, but the requested verified-wipe receipt
+  (`ZT_VERIFIED_WIPE_RECEIPT`) could not be stamped or persisted — the error
+  is typed (`ExecuteError::VerifiedWipeReceiptFailed`). Dart parses
+  `VERIFY_REPORT` on exits 0 and 4 only, withholds the format prompt on 4,
+  and surfaces the engine's stderr as the reason; `verify` exits 2 and 3
+  delete any pre-existing file at the requested receipt path so a stale
+  receipt can never authorize a format.
 - **Goldens** (`tests/fixtures/golden/*`,
   `test/fixtures/certificate_payload_v4_golden.json`) are characterization
   baselines: they may only change for an intentional, reviewed protocol
