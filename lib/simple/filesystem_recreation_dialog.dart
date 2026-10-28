@@ -121,7 +121,8 @@ class _FilesystemRecreationDialogState
             Text(
               _isWholeDevice
                   ? 'Target: whole device — a new ${widget.defaults.tableType?.toUpperCase() ?? 'GPT'} '
-                        'table with one partition will be created.'
+                        'table with ONE partition will be created. The original '
+                        'partition layout is not restored.'
                   : 'Target: the wiped partition.',
               style: const TextStyle(
                 color: AppTheme.textSecondary,

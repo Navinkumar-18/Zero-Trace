@@ -536,6 +536,13 @@ class DriveDetailScreen extends StatelessWidget {
                     _buildFilesystemRecreationRecord(controller),
                     const SizedBox(height: 20),
                   ] else if (isJobForThisDevice &&
+                      controller.driveLeftBlank) ...[
+                    // Phase G: the operator chose "Leave blank" before the
+                    // wipe, or the automatic restore failed. Offer a manual
+                    // restore without touching the recorded wipe result.
+                    _buildDriveBlankNotice(context, controller),
+                    const SizedBox(height: 20),
+                  ] else if (isJobForThisDevice &&
                       controller.showFilesystemRecreationPrompt) ...[
                     _buildFilesystemRecreationPrompt(context, controller),
                     const SizedBox(height: 20),
@@ -926,6 +933,81 @@ class DriveDetailScreen extends StatelessWidget {
                 child: const Text('Not now', style: TextStyle(fontSize: 12)),
               ),
             ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Phase G: the drive is blank after a completed, verified wipe because the
+  /// operator chose "Leave blank" or an automatic restore failed. The manual
+  /// restore goes through the existing dialog and never changes the wipe
+  /// result.
+  Widget _buildDriveBlankNotice(
+    BuildContext context,
+    SanitizationController controller,
+  ) {
+    final job = controller.currentJob;
+    final wholeDevice = job != null && !job.isPartitionScope;
+    return Container(
+      key: const Key('drive-blank-notice'),
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppTheme.accentGold.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: AppTheme.accentGold.withValues(alpha: 0.35)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Row(
+            children: [
+              Icon(Icons.usb_off, color: AppTheme.accentGold, size: 20),
+              SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Drive is blank',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 15,
+                    color: AppTheme.textPrimary,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          const Text(
+            "Drive is blank and won't appear in your file manager.",
+            key: Key('drive-blank-message'),
+            style: TextStyle(color: AppTheme.textSecondary, fontSize: 12),
+          ),
+          if (wholeDevice) ...[
+            const SizedBox(height: 6),
+            const Text(
+              'A restore creates a new partition table with ONE partition. '
+              'The original partition layout is not restored.',
+              key: Key('drive-blank-layout-note'),
+              style: TextStyle(color: AppTheme.textMuted, fontSize: 11),
+            ),
+          ],
+          if (controller.filesystemRecreationError != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              controller.filesystemRecreationError!,
+              key: const Key('drive-blank-error'),
+              style: const TextStyle(color: AppTheme.accentRose, fontSize: 11),
+            ),
+          ],
+          const SizedBox(height: 10),
+          ElevatedButton.icon(
+            key: const Key('drive-blank-restore-now'),
+            onPressed: controller.canRecreateFilesystem
+                ? () => FilesystemRecreationDialog.show(context, controller)
+                : null,
+            icon: const Icon(Icons.settings_backup_restore, size: 16),
+            label: const Text('Restore now', style: TextStyle(fontSize: 12)),
           ),
         ],
       ),

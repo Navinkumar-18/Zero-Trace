@@ -57,8 +57,42 @@ class SanitizationController extends ChangeNotifier {
   String? _filesystemRecreationError;
   String? _filesystemRecreationUnavailableReason;
 
+  // Phase G: the pre-wipe "After wiping" choice. Captured from the
+  // WipeAuthorization so nothing is asked again after the wipe.
+  bool _restoreChoiceKnown = false;
+  bool _restoreAfterWipe = false;
+  bool _autoRestoreFailed = false;
+  String? _restoreFsType;
+  String? _restoreLabel;
+
   bool get isFormattingFilesystem => _isFormattingFilesystem;
   String? get filesystemRecreationError => _filesystemRecreationError;
+
+  /// Last successfully confirmed filesystem/label pair (never an "enabled"
+  /// flag). Used to prefill the pre-wipe restore choice.
+  FilesystemRecreationPreference get formatPreference => _formatPreference;
+
+  /// True when the operator chose "Restore as an empty drive" before this
+  /// job's wipe.
+  bool get restoreAfterWipe => _restoreChoiceKnown && _restoreAfterWipe;
+
+  /// True when the automatic post-verification restore failed or was skipped
+  /// because no valid verified-wipe receipt existed. The wipe result is never
+  /// changed by this.
+  bool get autoRestoreFailed => _autoRestoreFailed;
+
+  /// True when the completed job left the drive without a filesystem, so it
+  /// will not appear in the file manager until it is formatted again. False
+  /// when no pre-wipe choice was recorded (legacy/mock jobs), so the Phase-F
+  /// prompt keeps its historic behaviour.
+  bool get driveLeftBlank {
+    final job = _currentJob;
+    if (job == null || !_restoreChoiceKnown) return false;
+    if (!job.wipeCompleted || job.status != JobStatus.completed) return false;
+    if (_completedCertificate?.evidence.verifiedPassed != true) return false;
+    if (_filesystemRecreation != null) return false;
+    return !_restoreAfterWipe || _autoRestoreFailed;
+  }
 
   /// Why the optional "Recreate filesystem?" prompt is NOT offered after this
   /// job's wipe even though verification passed: the engine did not write the
@@ -233,6 +267,13 @@ class SanitizationController extends ChangeNotifier {
 
     // Pin serial + size at selection
     _selectedDevice = device;
+
+    // Phase G: carry the single pre-wipe "After wiping" decision through the
+    // whole job. Captured here, before any destructive step runs.
+    _restoreChoiceKnown = true;
+    _restoreAfterWipe = authorization.restoreFilesystem;
+    _restoreFsType = authorization.restoreFsType;
+    _restoreLabel = authorization.restoreLabel;
 
     final sensitivity = intent.mappedSensitivity;
     final disposalPath = intent.mappedDisposalPath;
@@ -715,6 +756,7 @@ class SanitizationController extends ChangeNotifier {
     _currentJob = null;
     _completedCertificate = null;
     _resetFilesystemRecreationState();
+    _clearRestoreChoice();
     _updateJobRecommendation();
     notifyListeners();
   }
@@ -806,7 +848,18 @@ class SanitizationController extends ChangeNotifier {
     _filesystemRecreationUnavailableReason = null;
     _isFormattingFilesystem = false;
     _formatPromptDismissed = false;
+    _autoRestoreFailed = false;
     _verifiedFormatReceipts.clear();
+  }
+
+  /// Phase G: forget the pre-wipe "After wiping" decision once its job is no
+  /// longer on screen.
+  void _clearRestoreChoice() {
+    _restoreChoiceKnown = false;
+    _restoreAfterWipe = false;
+    _autoRestoreFailed = false;
+    _restoreFsType = null;
+    _restoreLabel = null;
   }
 
   void _deleteReceiptBestEffort(String path) {
@@ -1119,6 +1172,63 @@ class SanitizationController extends ChangeNotifier {
     }
   }
 
+  /// Phase G: run the pre-wipe "Restore as an empty drive" choice after a
+  /// verified wipe. Every Phase-F guard stays in force:
+  ///  * the verified-wipe receipt must still exist and bind to this target
+  ///    ([canRecreateFilesystem]);
+  ///  * the receipt is consumed one-shot by a successful format;
+  ///  * receipt expiry remains the engine's call (an expired/refused receipt
+  ///    fails the format, never silently succeeds);
+  ///  * a whole-device restore reuses the identity already confirmed in the
+  ///    dialog — the operator is never asked for the serial twice;
+  ///  * a restore failure never changes the recorded wipe result.
+  Future<void> _maybeAutoRestoreFilesystem() async {
+    if (!_restoreChoiceKnown || !_restoreAfterWipe) return;
+
+    final job = _currentJob;
+    if (job == null) return;
+
+    if (!canRecreateFilesystem) {
+      _autoRestoreFailed = true;
+      _filesystemRecreationError =
+          _filesystemRecreationUnavailableReason ??
+          'Automatic restore skipped: no valid verified-wipe receipt.';
+      _addLog('RESTORE: skipped — ${_filesystemRecreationError!}');
+      notifyListeners();
+      return;
+    }
+
+    final defaults = filesystemRecreationDefaults;
+    final fs = _restoreFsType ?? defaults?.fsType ?? 'vfat';
+    final label = _restoreLabel ?? defaults?.label ?? job.device.name;
+    _addLog('RESTORE: recreating $fs after the verified wipe...');
+
+    try {
+      final record = await recreateFilesystem(
+        fsType: fs,
+        label: label,
+        // The device identity was already confirmed once, in the dialog.
+        confirmationToken: job.device.serialNumber,
+        tableType: defaults?.tableType,
+      );
+
+      if (record == null) {
+        _autoRestoreFailed = true;
+        _addLog(
+          'WARNING: Automatic restore failed: '
+          '${_filesystemRecreationError ?? "unknown error"}',
+        );
+      } else {
+        _addLog('RESTORE: drive restored as ${record.fsType.toUpperCase()}.');
+      }
+    } catch (e) {
+      _autoRestoreFailed = true;
+      _filesystemRecreationError = 'Automatic restore failed: $e';
+      _addLog('WARNING: Automatic restore failed: $e');
+    }
+    notifyListeners();
+  }
+
   // Getters
   List<DeviceProfile> get devices => _devices;
   DeviceProfile? get selectedDevice => _selectedDevice;
@@ -1394,6 +1504,7 @@ class SanitizationController extends ChangeNotifier {
     _currentJob = null;
     _completedCertificate = null;
     _lastPolicyResult = null;
+    _clearRestoreChoice();
     notifyListeners();
   }
 
@@ -1980,6 +2091,11 @@ class SanitizationController extends ChangeNotifier {
           _addLog('WARNING: Audit log write failed: $auditErr');
         }
 
+        // Phase G: run the single pre-wipe "After wiping" decision now that
+        // the wipe result, certificate and audit entry are all recorded. A
+        // restore failure never changes the wipe verdict.
+        await _maybeAutoRestoreFilesystem();
+
         await _jobStateFile.clearActiveJob();
         notifyListeners();
       } catch (e) {
@@ -2514,6 +2630,23 @@ class SanitizationController extends ChangeNotifier {
     _verifiedFormatReceipts
       ..clear()
       ..addAll(receipts);
+    notifyListeners();
+  }
+
+  /// Phase G: seeds the pre-wipe "After wiping" decision so widget tests can
+  /// exercise the blank-drive notice without running a real wipe.
+  @visibleForTesting
+  void setMockRestoreChoice({
+    required bool restoreFilesystem,
+    bool autoRestoreFailed = false,
+    String? fsType,
+    String? label,
+  }) {
+    _restoreChoiceKnown = true;
+    _restoreAfterWipe = restoreFilesystem;
+    _autoRestoreFailed = autoRestoreFailed;
+    _restoreFsType = fsType;
+    _restoreLabel = label;
     notifyListeners();
   }
 }

@@ -6,6 +6,7 @@ import '../models/partition_info.dart';
 import '../models/sanitization_job.dart';
 import '../models/sanitization_support_level.dart';
 import '../services/classification_service.dart';
+import '../services/filesystem_recreation_preference.dart';
 import '../services/sanitization_controller.dart';
 import '../widgets/theme.dart';
 
@@ -22,12 +23,30 @@ class WipeAuthorization {
   /// so this records which typed confirmation produced the authorization.
   final String typedConfirmation;
 
+  /// Phase G: the single pre-wipe "After wiping" decision.
+  ///
+  /// `true`  → recreate an empty filesystem automatically after a verified
+  ///           wipe (the captured [restoreFsType]/[restoreLabel] are used).
+  /// `false` → leave the drive blank; the UI then offers "Restore now".
+  final bool restoreFilesystem;
+
+  /// Filesystem captured from the original volume before the wipe (normalized
+  /// to one the engine supports), or the remembered preference, or `vfat`.
+  final String? restoreFsType;
+
+  /// Original volume label captured before the wipe, or the remembered
+  /// preference. The engine sanitizes it again before formatting.
+  final String? restoreLabel;
+
   WipeAuthorization._({
     required this.authorizedAt,
     required this.deviceSerial,
     required this.intent,
     required this.typedConfirmation,
     this.overrideMethod,
+    this.restoreFilesystem = false,
+    this.restoreFsType,
+    this.restoreLabel,
   });
 
   /// Factory for testing fixtures only.
@@ -37,6 +56,9 @@ class WipeAuthorization {
     DisposalIntent intent = DisposalIntent.reuseMyself,
     SanitizationMethod? overrideMethod,
     String typedConfirmation = '',
+    bool restoreFilesystem = false,
+    String? restoreFsType,
+    String? restoreLabel,
   }) {
     return WipeAuthorization._(
       authorizedAt: DateTime.now(),
@@ -44,6 +66,9 @@ class WipeAuthorization {
       intent: intent,
       typedConfirmation: typedConfirmation,
       overrideMethod: overrideMethod,
+      restoreFilesystem: restoreFilesystem,
+      restoreFsType: restoreFsType,
+      restoreLabel: restoreLabel,
     );
   }
 }
@@ -86,6 +111,11 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
   DisposalIntent _intent = DisposalIntent.reuseMyself;
   final TextEditingController _serialController = TextEditingController();
   bool _isMatch = false;
+
+  /// Phase G: one pre-wipe decision about the drive's post-wipe state.
+  /// Defaults to restoring removable media (the common "make it usable
+  /// again" case) and to leaving internal/system-adjacent media blank.
+  late bool _restoreFilesystem;
 
   /// Normalization applied to both the typed input and the expected token:
   /// case-insensitive, whitespace-insensitive.
@@ -151,6 +181,7 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
   @override
   void initState() {
     super.initState();
+    _restoreFilesystem = widget.device.isRemovable;
     _serialController.addListener(_onTextChanged);
   }
 
@@ -177,6 +208,25 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
     final isFlash = widget.device.mediaTechnology == MediaTechnology.flash;
     final isUnknown = widget.device.mediaTechnology == MediaTechnology.unknown;
     final isClearOnly = supportLevel == SanitizationSupportLevel.clearOnly;
+
+    // Phase G: capture the original filesystem + label now, before the wipe,
+    // so the restore needs no second prompt afterwards. Partition scope uses
+    // the selected partition; whole-device uses the first partition. Both
+    // fall back to the remembered preference, then to vfat.
+    final restoreTarget = selectedParts.isNotEmpty
+        ? selectedParts.first
+        : (widget.device.partitions.isNotEmpty
+              ? widget.device.partitions.first
+              : null);
+    final restoreFsType =
+        normalizeFilesystemType(restoreTarget?.fsType) ??
+        controller.formatPreference.fsType ??
+        'vfat';
+    final restoreLabel = _captureRestoreLabel(
+      restoreTarget,
+      controller.formatPreference,
+      wholeDevice: selectedParts.isEmpty,
+    );
 
     return Dialog(
       backgroundColor: AppTheme.surfaceDark,
@@ -459,6 +509,9 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                             intent: _intent,
                             typedConfirmation: _serialController.text,
                             overrideMethod: SanitizationMethod.singlePassOverwrite,
+                            restoreFilesystem: _restoreFilesystem,
+                            restoreFsType: restoreFsType,
+                            restoreLabel: restoreLabel,
                           );
                           Navigator.of(context).pop(ConfirmWipeResult(
                             intent: _intent,
@@ -479,6 +532,66 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                   ),
                 ),
               ],
+
+              const SizedBox(height: 16),
+
+              // Phase G: ONE question about the drive's post-wipe state,
+              // asked before the wipe so the restore can happen automatically.
+              const Text('After wiping:',
+                  style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: AppTheme.textPrimary)),
+              const SizedBox(height: 4),
+              RadioGroup<bool>(
+                groupValue: _restoreFilesystem,
+                onChanged: (value) {
+                  if (value != null) {
+                    setState(() => _restoreFilesystem = value);
+                  }
+                },
+                child: Column(
+                  children: [
+                    RadioListTile<bool>(
+                      key: const Key('after-wipe-restore'),
+                      value: true,
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      activeColor: AppTheme.simplePrimary,
+                      title: const Text(
+                        'Restore as an empty drive',
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: AppTheme.textPrimary,
+                        ),
+                      ),
+                      subtitle: Text(
+                        'Recreates a ${restoreFsType.toUpperCase()} filesystem'
+                        '${restoreLabel.isNotEmpty ? ' labelled $restoreLabel' : ''} '
+                        'after the wipe is verified.',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: AppTheme.textMuted,
+                        ),
+                      ),
+                    ),
+                    RadioListTile<bool>(
+                      key: const Key('after-wipe-leave-blank'),
+                      value: false,
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      activeColor: AppTheme.simplePrimary,
+                      title: const Text(
+                        "Leave blank (won't appear in file manager until formatted)",
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: AppTheme.textPrimary,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
 
               const SizedBox(height: 16),
 
@@ -579,6 +692,9 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                                 deviceSerial: widget.device.serialNumber,
                                 intent: _intent,
                                 typedConfirmation: _serialController.text,
+                                restoreFilesystem: _restoreFilesystem,
+                                restoreFsType: restoreFsType,
+                                restoreLabel: restoreLabel,
                               );
                               Navigator.of(context).pop(ConfirmWipeResult(
                                 intent: _intent,
@@ -604,6 +720,21 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
         ),
       ),
     );
+  }
+
+  /// Phase G: the volume label to hand to the automatic restore. The
+  /// partition's own label wins, then the remembered preference, then a
+  /// stable default (device name for whole-device, `ZT_VOLUME` otherwise).
+  String _captureRestoreLabel(
+    PartitionInfo? target,
+    FilesystemRecreationPreference preference, {
+    required bool wholeDevice,
+  }) {
+    final partLabel = target?.label.sanitized.trim() ?? '';
+    if (partLabel.isNotEmpty) return partLabel;
+    final remembered = preference.label?.trim() ?? '';
+    if (remembered.isNotEmpty) return remembered;
+    return wholeDevice ? widget.device.name : 'ZT_VOLUME';
   }
 
   String _methodDisplayText(SanitizationMethod method, bool isDestroy) {

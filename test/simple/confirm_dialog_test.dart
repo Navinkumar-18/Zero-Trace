@@ -472,5 +472,154 @@ void main() {
       expect(tester.widget<ElevatedButton>(wipeButtonFinder).onPressed, isNotNull);
     });
   });
+
+  group('Phase G: pre-wipe "After wiping" choice', () {
+    const dataPartition = PartitionInfo(
+      partitionNumber: 1,
+      name: 'sdb1',
+      devicePath: '/dev/sdb1',
+      startSector: 2048,
+      sizeSectors: 1000000,
+      sizeBytes: 512000000,
+      label: UntrustedText('DATA'),
+      fsType: 'ext4',
+    );
+
+    const partitionDevice = DeviceProfile(
+      id: 'sdb',
+      name: 'SanDisk Cruzer Blade',
+      serialNumber: '4C530000151121111494',
+      mediaType: MediaType.usbFlash,
+      busType: 'USB',
+      capacityBytes: 16000000000,
+      isRemovable: true,
+      partitions: [dataPartition],
+      partitionTableType: 'gpt',
+    );
+
+    Future<Future<ConfirmWipeResult?> Function()> pumpHost(
+      WidgetTester tester,
+      SanitizationController controller,
+      DeviceProfile device,
+    ) async {
+      tester.view.physicalSize = const Size(1920, 1080);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      ConfirmWipeResult? result;
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SanitizationController>.value(
+          value: controller,
+          child: MaterialApp(
+            home: Builder(
+              builder: (context) => Scaffold(
+                body: Center(
+                  child: ElevatedButton(
+                    onPressed: () async {
+                      result = await SimpleConfirmDialog.show(context, device);
+                    },
+                    child: const Text('open dialog'),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      return () async => result;
+    }
+
+    testWidgets('removable media defaults to "Restore as an empty drive" and '
+        'captures the first partition fs/label', (tester) async {
+      final controller = SanitizationController(enableAutoPolling: false);
+      addTearDown(controller.dispose);
+      controller.setMockDevices([partitionDevice]);
+
+      final readResult = await pumpHost(tester, controller, partitionDevice);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('open dialog'));
+      await tester.pumpAndSettle();
+
+      final group = tester.widget<RadioGroup<bool>>(
+        find.byType(RadioGroup<bool>),
+      );
+      expect(group.groupValue, isTrue);
+
+      await tester.enterText(find.byType(TextField), '1494');
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(ElevatedButton, 'SECURE WIPE'));
+      await tester.pumpAndSettle();
+
+      final result = await readResult();
+      expect(result, isNotNull);
+      expect(result!.authorization.restoreFilesystem, isTrue);
+      expect(result.authorization.restoreFsType, 'ext4');
+      expect(result.authorization.restoreLabel, 'DATA');
+    });
+
+    testWidgets('"Leave blank" is carried on the authorization', (tester) async {
+      final controller = SanitizationController(enableAutoPolling: false);
+      addTearDown(controller.dispose);
+      controller.setMockDevices([partitionDevice]);
+
+      final readResult = await pumpHost(tester, controller, partitionDevice);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('open dialog'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byKey(const Key('after-wipe-leave-blank')));
+      await tester.pumpAndSettle();
+      expect(
+        tester
+            .widget<RadioGroup<bool>>(find.byType(RadioGroup<bool>))
+            .groupValue,
+        isFalse,
+      );
+
+      await tester.enterText(find.byType(TextField), '1494');
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(ElevatedButton, 'SECURE WIPE'));
+      await tester.pumpAndSettle();
+
+      final result = await readResult();
+      expect(result, isNotNull);
+      expect(result!.authorization.restoreFilesystem, isFalse);
+      // The captured values stay recorded even when the choice is "blank".
+      expect(result.authorization.restoreFsType, 'ext4');
+      expect(result.authorization.restoreLabel, 'DATA');
+    });
+
+    testWidgets('non-removable media defaults to "Leave blank"', (tester) async {
+      const internalSsd = DeviceProfile(
+        id: 'sda',
+        name: 'Internal SATA SSD',
+        serialNumber: 'ABCDEF123456',
+        mediaType: MediaType.sataSsd,
+        busType: 'SATA',
+        capacityBytes: 512000000000,
+        isRemovable: false,
+        supportsAtaSanitize: true,
+      );
+
+      final controller = SanitizationController(enableAutoPolling: false);
+      addTearDown(controller.dispose);
+      controller.setMockDevices([internalSsd]);
+
+      await pumpHost(tester, controller, internalSsd);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('open dialog'));
+      await tester.pumpAndSettle();
+
+      expect(
+        tester
+            .widget<RadioGroup<bool>>(find.byType(RadioGroup<bool>))
+            .groupValue,
+        isFalse,
+      );
+    });
+  });
 }
 
