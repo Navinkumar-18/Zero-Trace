@@ -149,6 +149,38 @@ pub(crate) mod discovery {
         Ok(parsed)
     }
 
+    /// D-a piece 2: a boot/system volume may span several disks; every member
+    /// disk must be protected. Unlike `decide_volume_extents` (partition
+    /// mapping needs exactly one extent), multi-extent volumes are valid here.
+    /// An unreadable, empty or malformed probe is a typed error, never an
+    /// empty disk set.
+    pub(crate) fn decide_boot_volume_disks(
+        ioctl_ok: bool,
+        win32_error: u32,
+        parsed: Option<Result<ParsedVolumeExtents, ParseError>>,
+    ) -> Result<Vec<u32>, BackendError> {
+        if !ioctl_ok {
+            return Err(BackendError::Io(format!(
+                "Volume disk-extent probe failed (Win32 error {})",
+                win32_error
+            )));
+        }
+        let parsed = parsed.ok_or_else(|| {
+            BackendError::Io("Volume disk-extent probe returned no buffer".to_string())
+        })?;
+        let parsed = parsed
+            .map_err(|e| BackendError::Io(format!("Malformed volume disk extents: {}", e)))?;
+        if parsed.extents.is_empty() {
+            return Err(BackendError::Unavailable(
+                "Volume reported no disk extents".to_string(),
+            ));
+        }
+        let mut disks: Vec<u32> = parsed.extents.iter().map(|e| e.disk_number).collect();
+        disks.sort_unstable();
+        disks.dedup();
+        Ok(disks)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -286,6 +318,31 @@ pub(crate) mod discovery {
             let parsed = decide_volume_extents(true, 0, Some(Ok(extents(1, false)))).unwrap();
             assert_eq!(parsed.extents.len(), 1);
         }
+
+        // -------------------------------------------------------------------
+        // D-a piece 2: boot/system volume -> disk set.
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn boot_volume_multi_disk_extents_map_to_every_member_disk() {
+            let disks = decide_boot_volume_disks(true, 0, Some(Ok(extents(2, true)))).unwrap();
+            assert_eq!(disks, vec![0, 1]);
+        }
+
+        #[test]
+        fn boot_volume_extent_failures_are_typed_not_empty() {
+            let ioctl = decide_boot_volume_disks(false, 5, None).unwrap_err();
+            assert!(matches!(ioctl, BackendError::Io(_)));
+
+            let malformed =
+                decide_boot_volume_disks(true, 0, Some(Err(ParseError("short".to_string()))))
+                    .unwrap_err();
+            assert!(matches!(malformed, BackendError::Io(_)));
+
+            let empty = decide_boot_volume_disks(true, 0, Some(Ok(extents(0, false)))).unwrap_err();
+            assert!(matches!(empty, BackendError::Unavailable(_)));
+            assert!(empty.to_string().contains("no disk extents"));
+        }
     }
 }
 
@@ -299,35 +356,49 @@ mod windows_impl {
     use std::path::PathBuf;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES,
-        ERROR_PATH_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_ENVVAR_NOT_FOUND, ERROR_FILE_NOT_FOUND,
+        ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetVolumeInformationW,
-        GetVolumePathNamesForVolumeNameW, FILE_FLAGS_AND_ATTRIBUTES, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
+        GetVolumeNameForVolumeMountPointW, GetVolumePathNamesForVolumeNameW,
+        FILE_FLAGS_AND_ATTRIBUTES, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
     };
+    use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
     use windows_sys::Win32::System::Ioctl::{
         PropertyStandardQuery, StorageDeviceProperty, StorageDeviceSeekPenaltyProperty,
         IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
         IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_PROPERTY_QUERY,
     };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
+    };
+    use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows_sys::Win32::System::IO::DeviceIoControl;
 
     use crate::backend::windows_parse::{
-        parse_disk_geometry_ex, parse_drive_layout_ex, parse_seek_penalty_descriptor,
-        parse_storage_device_descriptor, parse_volume_disk_extents,
+        crash_dump_volume_roots, hibernation_volume_roots, pagefile_volume_roots,
+        parse_disk_geometry_ex, parse_drive_layout_ex, parse_reg_dword, parse_reg_multi_sz,
+        parse_reg_sz, parse_seek_penalty_descriptor, parse_storage_device_descriptor,
+        parse_volume_disk_extents, windows_volume_root,
     };
     use crate::backend::{
-        BackendCapabilities, BackendError, BlockBackend, DeviceGeometry, DeviceInfo,
-        ExclusiveHandle, MountState, PartitionFacts, Relation, StatFact,
+        BackendCapabilities, BackendError, BlockBackend, DeviceGeometry, DeviceInfo, DiskSetFact,
+        ElevationFact, ExclusiveHandle, MountState, PartitionFacts, Relation, StatFact,
+        WindowsBootFacts,
     };
     use crate::guard::ValidatedTarget;
     use crate::types::{BootEnvironment, ExecuteError};
 
     use super::discovery::{
-        decide_drive_open, decide_find_next, decide_geometry_probe, decide_volume_extents,
-        volume_open_error, FindNextOutcome, OpenFailure,
+        decide_boot_volume_disks, decide_drive_open, decide_find_next, decide_geometry_probe,
+        decide_volume_extents, volume_open_error, FindNextOutcome, OpenFailure,
     };
 
     /// Scoped RAII handle wrapper ensuring `CloseHandle` is always called.
@@ -706,6 +777,10 @@ mod windows_impl {
             ))
         }
 
+        fn windows_boot_facts(&self) -> Result<Option<WindowsBootFacts>, BackendError> {
+            collect_boot_facts().map(Some)
+        }
+
         fn canonicalize_path(&self, path: &str, _dry_run: bool) -> Result<String, ExecuteError> {
             Ok(path.to_string())
         }
@@ -849,6 +924,450 @@ mod windows_impl {
                 "partition-table re-read on Windows",
             ))
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // D-a piece 2: boot/system facts (read-only)
+    // -----------------------------------------------------------------------
+
+    const PAGEFILE_KEY: &str =
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management";
+    const POWER_KEY: &str = r"SYSTEM\CurrentControlSet\Control\Power";
+    const CRASH_KEY: &str = r"SYSTEM\CurrentControlSet\Control\CrashControl";
+
+    /// RAII wrapper for a registry key handle.
+    struct ScopedRegKey(HKEY);
+
+    impl Drop for ScopedRegKey {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    RegCloseKey(self.0);
+                }
+            }
+        }
+    }
+
+    /// Reads a registry value as raw bytes. `Ok(None)` = value or key absent;
+    /// every other failure is a typed error (the guard treats it as an
+    /// unreadable boot fact and refuses).
+    fn read_registry_value(subkey: &str, value: &str) -> Result<Option<Vec<u8>>, BackendError> {
+        let subkey_w = to_wide_null(subkey);
+        let mut key: HKEY = std::ptr::null_mut();
+        let rc =
+            unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey_w.as_ptr(), 0, KEY_READ, &mut key) };
+        if rc != ERROR_SUCCESS {
+            if rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND {
+                return Ok(None);
+            }
+            return Err(BackendError::Unavailable(format!(
+                "Cannot open registry key {} (Win32 error {})",
+                subkey, rc
+            )));
+        }
+        let key = ScopedRegKey(key);
+
+        let value_w = to_wide_null(value);
+        let mut buf = vec![0u8; 65536];
+        let mut len = buf.len() as u32;
+        let rc = unsafe {
+            RegQueryValueExW(
+                key.0,
+                value_w.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                buf.as_mut_ptr(),
+                &mut len,
+            )
+        };
+        if rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND {
+            return Ok(None);
+        }
+        if rc != ERROR_SUCCESS {
+            return Err(BackendError::Unavailable(format!(
+                "Cannot read registry value {}\\{} (Win32 error {})",
+                subkey, value, rc
+            )));
+        }
+        if len as usize > buf.len() {
+            return Err(BackendError::Unavailable(format!(
+                "Registry value {}\\{} is larger than the read buffer",
+                subkey, value
+            )));
+        }
+        buf.truncate(len as usize);
+        Ok(Some(buf))
+    }
+
+    fn read_registry_string(subkey: &str, value: &str) -> Result<Option<String>, BackendError> {
+        match read_registry_value(subkey, value)? {
+            None => Ok(None),
+            Some(bytes) => parse_reg_sz(&bytes)
+                .map(Some)
+                .map_err(|e| BackendError::Unavailable(e.to_string())),
+        }
+    }
+
+    /// Reads an environment variable. `Ok(None)` = variable not defined.
+    fn get_env_var(name: &str) -> Result<Option<String>, BackendError> {
+        let name_w = to_wide_null(name);
+        let mut buf = vec![0u16; 32768];
+        let len =
+            unsafe { GetEnvironmentVariableW(name_w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+        if len == 0 {
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            if err == ERROR_ENVVAR_NOT_FOUND {
+                return Ok(None);
+            }
+            return Err(BackendError::Unavailable(format!(
+                "Cannot read environment variable {} (Win32 error {})",
+                name, err
+            )));
+        }
+        if len as usize >= buf.len() {
+            return Err(BackendError::Unavailable(format!(
+                "Environment variable {} is larger than the read buffer",
+                name
+            )));
+        }
+        Ok(Some(String::from_utf16_lossy(&buf[..len as usize])))
+    }
+
+    fn get_system_windows_directory() -> Result<String, BackendError> {
+        let mut buf = vec![0u16; 32768];
+        let len = unsafe { GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32) };
+        if len == 0 {
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            return Err(BackendError::Unavailable(format!(
+                "GetSystemWindowsDirectoryW failed (Win32 error {})",
+                err
+            )));
+        }
+        if len as usize >= buf.len() {
+            return Err(BackendError::Unavailable(
+                "Windows system directory is larger than the read buffer".to_string(),
+            ));
+        }
+        Ok(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+
+    fn current_module_path() -> Result<String, BackendError> {
+        let mut buf = vec![0u16; 32768];
+        let len =
+            unsafe { GetModuleFileNameW(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32) };
+        if len == 0 {
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            return Err(BackendError::Unavailable(format!(
+                "GetModuleFileNameW failed (Win32 error {})",
+                err
+            )));
+        }
+        if len as usize >= buf.len() {
+            return Err(BackendError::Unavailable(
+                "Executable path is larger than the read buffer".to_string(),
+            ));
+        }
+        Ok(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+
+    fn parent_windows_path(path: &str) -> Option<&str> {
+        path.rfind('\\').map(|idx| &path[..idx])
+    }
+
+    /// Resolves a volume root to its `\\?\Volume{GUID}\` path.
+    fn volume_guid_path_for_root(root: &str) -> Result<String, BackendError> {
+        let mut normalized = root.trim().to_string();
+        if !normalized.ends_with('\\') {
+            normalized.push('\\');
+        }
+        if normalized.to_ascii_lowercase().starts_with(r"\\?\volume{") {
+            return Ok(normalized);
+        }
+
+        let wide = to_wide_null(&normalized);
+        let mut buf = [0u16; 512];
+        let ok = unsafe {
+            GetVolumeNameForVolumeMountPointW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32)
+        };
+        if ok == 0 {
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            return Err(BackendError::Unavailable(format!(
+                "Cannot resolve the volume for {} (Win32 error {})",
+                root, err
+            )));
+        }
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        if len == 0 {
+            return Err(BackendError::Unavailable(format!(
+                "Empty volume name for {}",
+                root
+            )));
+        }
+        Ok(String::from_utf16_lossy(&buf[..len]))
+    }
+
+    /// All disk numbers a volume spans. A multi-disk volume returns every
+    /// member disk (the guard protects all of them).
+    fn disk_numbers_for_volume_root(root: &str) -> Result<Vec<u32>, BackendError> {
+        let guid = volume_guid_path_for_root(root)?;
+        let volume_path = guid.trim_end_matches('\\');
+        let handle = open_volume_read_only(volume_path)?;
+        let mut extents_buf = vec![0u8; 4096];
+        let mut bytes_returned = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle.get(),
+                IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                std::ptr::null(),
+                0,
+                extents_buf.as_mut_ptr() as *mut _,
+                extents_buf.len() as u32,
+                &mut bytes_returned,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if ok != 0 {
+            let returned = (bytes_returned as usize).min(extents_buf.len());
+            decide_boot_volume_disks(
+                true,
+                0,
+                Some(parse_volume_disk_extents(&extents_buf[..returned])),
+            )
+        } else {
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            decide_boot_volume_disks(false, err, None)
+        }
+    }
+
+    fn disk_set_from_roots(roots: &[String]) -> DiskSetFact {
+        let mut disks = Vec::new();
+        for root in roots {
+            match disk_numbers_for_volume_root(root) {
+                Ok(mut found) => disks.append(&mut found),
+                Err(e) => {
+                    return DiskSetFact::unreadable(format!(
+                        "Cannot map volume {} to a disk: {}",
+                        root, e
+                    ))
+                }
+            }
+        }
+        DiskSetFact::known(disks)
+    }
+
+    fn read_pagefile_disks(system_drive: Option<&str>) -> DiskSetFact {
+        match read_registry_value(PAGEFILE_KEY, "PagingFiles") {
+            Err(e) => DiskSetFact::unreadable(e.to_string()),
+            // No configured paging file value: a known empty set, not an
+            // unreadable fact.
+            Ok(None) => DiskSetFact::known(std::iter::empty::<u32>()),
+            Ok(Some(bytes)) => match parse_reg_multi_sz(&bytes) {
+                Err(e) => DiskSetFact::unreadable(e.to_string()),
+                Ok(entries) => match pagefile_volume_roots(&entries, system_drive.unwrap_or("")) {
+                    Err(e) => DiskSetFact::unreadable(e.to_string()),
+                    Ok(roots) => disk_set_from_roots(&roots),
+                },
+            },
+        }
+    }
+
+    fn read_hibernation_disks(system_drive: Option<&str>) -> DiskSetFact {
+        match read_registry_value(POWER_KEY, "HibernateEnabled") {
+            Err(e) => DiskSetFact::unreadable(e.to_string()),
+            // TODO-VERIFY: a missing HibernateEnabled value is reported as
+            // unreadable rather than assumed "disabled" (fail closed).
+            Ok(None) => DiskSetFact::unreadable(
+                "HibernateEnabled registry value is missing; cannot determine whether hiberfil.sys exists"
+                    .to_string(),
+            ),
+            Ok(Some(bytes)) => match parse_reg_dword(&bytes) {
+                Err(e) => DiskSetFact::unreadable(e.to_string()),
+                Ok(0) => DiskSetFact::known(std::iter::empty::<u32>()),
+                Ok(enabled) => match system_drive {
+                    Some(drive) => disk_set_from_roots(&hibernation_volume_roots(enabled, drive)),
+                    None => DiskSetFact::unreadable(
+                        "Cannot resolve the system drive for the hibernation file".to_string(),
+                    ),
+                },
+            },
+        }
+    }
+
+    fn read_crashdump_disks(system_root: Option<&str>, system_drive: Option<&str>) -> DiskSetFact {
+        let enabled = match read_registry_value(CRASH_KEY, "CrashDumpEnabled") {
+            Err(e) => return DiskSetFact::unreadable(e.to_string()),
+            // TODO-VERIFY: missing CrashDumpEnabled is treated as unreadable
+            // (fail closed) instead of guessing Windows' default.
+            Ok(None) => {
+                return DiskSetFact::unreadable(
+                    "CrashDumpEnabled registry value is missing; cannot determine the crash-dump target"
+                        .to_string(),
+                )
+            }
+            Ok(Some(bytes)) => match parse_reg_dword(&bytes) {
+                Ok(value) => value,
+                Err(e) => return DiskSetFact::unreadable(e.to_string()),
+            },
+        };
+        if enabled == 0 {
+            return DiskSetFact::known(std::iter::empty::<u32>());
+        }
+
+        let dump_file = match read_registry_string(CRASH_KEY, "DumpFile") {
+            Ok(value) => value,
+            Err(e) => return DiskSetFact::unreadable(e.to_string()),
+        };
+        let minidump_dir = match read_registry_string(CRASH_KEY, "MinidumpDir") {
+            Ok(value) => value,
+            Err(e) => return DiskSetFact::unreadable(e.to_string()),
+        };
+
+        match crash_dump_volume_roots(
+            enabled,
+            dump_file.as_deref(),
+            minidump_dir.as_deref(),
+            system_root.unwrap_or(""),
+            system_drive.unwrap_or(""),
+        ) {
+            Err(e) => DiskSetFact::unreadable(e.to_string()),
+            Ok(roots) => disk_set_from_roots(&roots),
+        }
+    }
+
+    fn read_app_disks() -> DiskSetFact {
+        let exe = match current_module_path() {
+            Ok(path) => path,
+            Err(e) => {
+                return DiskSetFact::unreadable(format!(
+                    "Cannot read the Zero Trace executable path: {}",
+                    e
+                ))
+            }
+        };
+        let mut paths = vec![exe.clone()];
+
+        // TODO-VERIFY: the Flutter/Dart side chooses the application data
+        // directory. `%LOCALAPPDATA%\ZeroTrace` is the expected default; when
+        // it is unavailable we fall back to the executable's own directory.
+        match get_env_var("LOCALAPPDATA") {
+            Ok(Some(local)) if !local.trim().is_empty() => {
+                paths.push(format!("{}\\ZeroTrace", local.trim_end_matches('\\')));
+            }
+            Ok(_) => {
+                if let Some(dir) = parent_windows_path(&exe) {
+                    paths.push(dir.to_string());
+                }
+            }
+            Err(e) => {
+                return DiskSetFact::unreadable(format!(
+                    "Cannot read LOCALAPPDATA for the Zero Trace data directory: {}",
+                    e
+                ))
+            }
+        }
+
+        let mut roots = Vec::new();
+        for path in &paths {
+            match windows_volume_root(path) {
+                Some(root) => roots.push(root),
+                None => {
+                    return DiskSetFact::unreadable(format!(
+                        "Cannot resolve the volume for Zero Trace path '{}'",
+                        path
+                    ))
+                }
+            }
+        }
+        disk_set_from_roots(&roots)
+    }
+
+    /// `TOKEN_QUERY` only; reads `TokenElevation` from the current process.
+    fn read_elevation() -> Result<bool, BackendError> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+        if ok == 0 {
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            return Err(BackendError::Unavailable(format!(
+                "OpenProcessToken failed (Win32 error {})",
+                err
+            )));
+        }
+        let token = ScopedHandle::new(token)
+            .ok_or_else(|| BackendError::Io("Invalid process token handle".to_string()))?;
+
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut returned = 0u32;
+        let ok = unsafe {
+            GetTokenInformation(
+                token.get(),
+                TokenElevation,
+                &mut elevation as *mut _ as *mut _,
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut returned,
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            return Err(BackendError::Unavailable(format!(
+                "GetTokenInformation(TokenElevation) failed (Win32 error {})",
+                err
+            )));
+        }
+        Ok(elevation.TokenIsElevated != 0)
+    }
+
+    /// Reads every boot/system fact. Any field that cannot be read stays
+    /// `Unreadable` (with its reason); it is never turned into an empty set.
+    fn collect_boot_facts() -> Result<WindowsBootFacts, BackendError> {
+        let system_dir = get_system_windows_directory();
+        let system_root = system_dir
+            .as_ref()
+            .ok()
+            .and_then(|path| windows_volume_root(path));
+
+        let system_drive = match get_env_var("SystemDrive") {
+            Ok(Some(value)) => windows_volume_root(&value).or_else(|| system_root.clone()),
+            // The environment read failed or the variable is absent: derive
+            // the boot volume from the documented Windows directory instead.
+            Ok(None) | Err(_) => system_root.clone(),
+        };
+
+        let system_disks = match (&system_dir, &system_root) {
+            (Err(e), _) => {
+                DiskSetFact::unreadable(format!("Cannot read the Windows system directory: {}", e))
+            }
+            (Ok(_), None) => DiskSetFact::unreadable(
+                "Cannot resolve the volume of the Windows system directory".to_string(),
+            ),
+            (Ok(_), Some(root)) => disk_set_from_roots(std::slice::from_ref(root)),
+        };
+
+        let boot_disks = match &system_drive {
+            Some(drive) => disk_set_from_roots(std::slice::from_ref(drive)),
+            None => DiskSetFact::unreadable(
+                "Cannot resolve the Windows boot volume (SystemDrive)".to_string(),
+            ),
+        };
+
+        let pagefile_disks = read_pagefile_disks(system_drive.as_deref());
+        let hibernation_disks = read_hibernation_disks(system_drive.as_deref());
+        let crashdump_disks = read_crashdump_disks(system_root.as_deref(), system_drive.as_deref());
+        let app_disks = read_app_disks();
+        let elevated = match read_elevation() {
+            Ok(value) => ElevationFact::Known(value),
+            Err(e) => ElevationFact::Unreadable(e.to_string()),
+        };
+
+        Ok(WindowsBootFacts {
+            system_disks,
+            boot_disks,
+            pagefile_disks,
+            hibernation_disks,
+            crashdump_disks,
+            app_disks,
+            elevated,
+        })
     }
 
     #[derive(Debug, Clone)]

@@ -28,6 +28,8 @@ fn main() {
 #[cfg(not(target_os = "linux"))]
 fn run_windows_facts() {
     use std::collections::HashMap;
+    use zt_engine::backend::WindowsBootFacts;
+
     let backend = zt_engine::backend::current_backend();
     let devices = match backend.enumerate_devices() {
         Ok(devs) => devs,
@@ -50,15 +52,58 @@ fn run_windows_facts() {
         }
     }
 
+    // D-a piece 2: boot/system facts and the shared per-disk refusal reason.
+    let boot_facts = match backend.windows_boot_facts() {
+        Ok(facts) => facts,
+        Err(e) => {
+            eprintln!("Error reading Windows boot facts: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    #[derive(serde::Serialize)]
+    struct DiskRefusal {
+        disk_number: u32,
+        device: String,
+        refusal_reason: Option<String>,
+    }
+
+    let mut disk_refusals = Vec::new();
+    if let Some(facts) = &boot_facts {
+        for dev in &devices {
+            let Some(disk_number) = zt_engine::guard::windows_disk_number(&dev.name) else {
+                continue;
+            };
+            disk_refusals.push(DiskRefusal {
+                disk_number,
+                device: dev.name.clone(),
+                refusal_reason: zt_engine::guard::windows_boot_facts_disk_refusal(
+                    facts,
+                    disk_number,
+                ),
+            });
+        }
+        disk_refusals.sort_by_key(|r| r.disk_number);
+    }
+    let elevation_refusal = boot_facts
+        .as_ref()
+        .and_then(zt_engine::guard::windows_elevation_refusal);
+
     #[derive(serde::Serialize)]
     struct WindowsFactsOutput<'a> {
         devices: &'a [zt_engine::backend::DeviceInfo],
         partitions: &'a HashMap<String, Vec<zt_engine::backend::PartitionFacts>>,
+        boot_facts: Option<&'a WindowsBootFacts>,
+        elevation_refusal: Option<String>,
+        disk_refusals: &'a [DiskRefusal],
     }
 
     let output = WindowsFactsOutput {
         devices: &devices,
         partitions: &partitions,
+        boot_facts: boot_facts.as_ref(),
+        elevation_refusal,
+        disk_refusals: &disk_refusals,
     };
 
     match serde_json::to_string_pretty(&output) {

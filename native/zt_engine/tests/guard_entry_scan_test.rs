@@ -548,3 +548,65 @@ fn windows_backend_strictly_read_only_in_this_pass() {
         violations.join("\n")
     );
 }
+
+/// D-a piece 2: no write-class Win32/registry constant or API may appear in
+/// ANY `windows*.rs` file (both the implementation and the pure parsers).
+#[test]
+fn windows_files_have_no_write_class_constants() {
+    const FORBIDDEN: &[&str] = &[
+        // File/device access rights.
+        "GENERIC_WRITE",
+        "GENERIC_ALL",
+        "FILE_WRITE_DATA",
+        "FILE_WRITE_ATTRIBUTES",
+        "FILE_WRITE_EA",
+        "FILE_APPEND_DATA",
+        // Write/lock/dismount/format primitives.
+        "WriteFile",
+        "WriteFileEx",
+        "FSCTL_LOCK_VOLUME",
+        "FSCTL_DISMOUNT_VOLUME",
+        "FSCTL_DELETE_USN_JOURNAL",
+        "IOCTL_DISK_SET_",
+        "IOCTL_DISK_CREATE_",
+        "IOCTL_DISK_DELETE_",
+        "IOCTL_DISK_FORMAT_",
+        "IOCTL_DISK_WRITE_",
+        // Registry write access/APIs.
+        "KEY_SET_VALUE",
+        "KEY_CREATE_SUB_KEY",
+        "KEY_CREATE_LINK",
+        "RegSetValueEx",
+        "RegCreateKey",
+        "RegDeleteKey",
+        "RegDeleteValue",
+    ];
+
+    let mut violations = Vec::new();
+    for file in ["windows.rs", "windows_parse.rs"] {
+        let path = format!("{}/src/backend/{}", env!("CARGO_MANIFEST_DIR"), file);
+        let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path, e));
+        for (idx, line) in src.split('\n').enumerate() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*') {
+                continue;
+            }
+            for &forbidden in FORBIDDEN {
+                if line.contains(forbidden) {
+                    violations.push(format!(
+                        "src/backend/{}:{}: forbidden write-class symbol '{}'",
+                        file,
+                        idx + 1,
+                        forbidden
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Windows fact files must contain no write-class constants/APIs:\n{}",
+        violations.join("\n")
+    );
+}

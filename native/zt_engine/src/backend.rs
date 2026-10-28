@@ -198,6 +198,104 @@ pub struct PartitionFacts {
     pub label: Option<String>,
 }
 
+/// A set of Windows disk numbers reported by a backend.
+///
+/// D-a piece 2: this is a **fact**, not a decision. `Known` always carries a
+/// sorted, duplicate-free snapshot (a volume that spans several disks lists
+/// every member); `Unreadable` is an exists-but-unreadable reason that the
+/// shared guard must refuse on. A backend never converts an unreadable fact
+/// into an empty set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiskSetFact {
+    Known(Vec<u32>),
+    Unreadable(String),
+}
+
+impl DiskSetFact {
+    /// Build a `Known` fact with deterministic (sorted, unique) contents.
+    pub fn known<I: IntoIterator<Item = u32>>(disks: I) -> Self {
+        let mut disks: Vec<u32> = disks.into_iter().collect();
+        disks.sort_unstable();
+        disks.dedup();
+        Self::Known(disks)
+    }
+
+    pub fn unreadable(reason: impl Into<String>) -> Self {
+        Self::Unreadable(reason.into())
+    }
+
+    /// Known disks, or `None` when the fact is unreadable.
+    pub fn disks(&self) -> Option<&[u32]> {
+        match self {
+            Self::Known(disks) => Some(disks),
+            Self::Unreadable(_) => None,
+        }
+    }
+
+    pub fn is_unreadable(&self) -> bool {
+        matches!(self, Self::Unreadable(_))
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Known(_) => None,
+            Self::Unreadable(reason) => Some(reason),
+        }
+    }
+}
+
+/// Whether the process token is elevated (`TOKEN_QUERY` + `TokenElevation`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ElevationFact {
+    Known(bool),
+    Unreadable(String),
+}
+
+impl ElevationFact {
+    pub fn is_elevated(&self) -> Option<bool> {
+        match self {
+            Self::Known(value) => Some(*value),
+            Self::Unreadable(_) => None,
+        }
+    }
+
+    pub fn is_unreadable(&self) -> bool {
+        matches!(self, Self::Unreadable(_))
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Known(_) => None,
+            Self::Unreadable(reason) => Some(reason),
+        }
+    }
+}
+
+/// Windows boot/system facts consumed by the shared guard chain (D-a piece 2).
+///
+/// Every field is either a known set of disk numbers or a typed unreadable
+/// reason. A volume spanning multiple disks is represented by every member
+/// disk. The guard refuses a target when it matches any set **or** when any
+/// fact is unreadable; elevation is recorded here because future write paths
+/// require an elevated token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsBootFacts {
+    /// Disk(s) holding `GetSystemWindowsDirectoryW` (the Windows directory).
+    pub system_disks: DiskSetFact,
+    /// Disk(s) holding the boot volume (`%SystemDrive%`).
+    pub boot_disks: DiskSetFact,
+    /// Disk(s) holding active page files from `PagingFiles`.
+    pub pagefile_disks: DiskSetFact,
+    /// Disk(s) holding `hiberfil.sys` when hibernation is enabled.
+    pub hibernation_disks: DiskSetFact,
+    /// Disk(s) holding the configured crash-dump / minidump targets.
+    pub crashdump_disks: DiskSetFact,
+    /// Disk(s) holding this executable and its application data directory.
+    pub app_disks: DiskSetFact,
+    /// Whether the current process token is elevated (`TokenElevation`).
+    pub elevated: ElevationFact,
+}
+
 // ---------------------------------------------------------------------------
 // Exclusive handle (C1: write primitives exist ONLY on a handle, and a
 // handle can only be created from a guard-validated target)
@@ -386,6 +484,13 @@ pub trait BlockBackend {
     /// as used by the unmount flow — independent of the mountinfo chain.
     fn mounts_file(&self) -> String;
     fn boot_environment(&self) -> Result<BootEnvironment, ExecuteError>;
+    /// Windows boot/system facts for the shared disk-refusal policy (D-a
+    /// piece 2). `Ok(None)` means "not applicable on this platform" — only
+    /// `WindowsBackend` returns `Some`. A field that exists but cannot be
+    /// read must be `Unreadable`, never an empty set (the guard fail-closes).
+    fn windows_boot_facts(&self) -> Result<Option<WindowsBootFacts>, BackendError> {
+        Ok(None)
+    }
     fn canonicalize_path(&self, path: &str, dry_run: bool) -> Result<String, ExecuteError>;
     /// `class/block/<name>/<attr_rel>` content (e.g. `partition`, `start`,
     /// `size`, `dev`, `uevent`, `device/serial`, `queue/logical_block_size`).

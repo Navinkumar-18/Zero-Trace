@@ -545,6 +545,247 @@ pub fn compute_windows_partition_fingerprint(partitions: &[ParsedPartition]) -> 
     format!("{:x}", hash)
 }
 
+// ---------------------------------------------------------------------------
+// 8. Boot/system facts (D-a piece 2)
+//
+// The Windows backend reads these values from documented places:
+//   * page files:   HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\
+//                   Memory Management\PagingFiles (REG_MULTI_SZ)
+//   * hibernation:  HKLM\SYSTEM\CurrentControlSet\Control\Power\
+//                   HibernateEnabled (REG_DWORD); hiberfil.sys lives in the
+//                   root of the system volume.
+//   * crash dump:   HKLM\SYSTEM\CurrentControlSet\Control\CrashControl\
+//                   CrashDumpEnabled (REG_DWORD), DumpFile and MinidumpDir
+//                   (REG_SZ/REG_EXPAND_SZ).
+// The pure parsers/decision helpers below stay platform-neutral so their
+// fixtures run on Linux; the Win32 calls live in `backend/windows.rs`.
+// TODO-VERIFY: Microsoft documents the registry value names and types, but
+// the "boot volume" vs "system volume" distinction and the crash-dump default
+// when `CrashDumpEnabled` is absent must be verified on a real Windows host.
+// ---------------------------------------------------------------------------
+
+fn decode_utf16_registry(buf: &[u8]) -> Result<Vec<u16>, ParseError> {
+    if !buf.len().is_multiple_of(2) {
+        return Err(ParseError(format!(
+            "Registry UTF-16 payload has an odd byte length: {}",
+            buf.len()
+        )));
+    }
+    Ok(buf
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect())
+}
+
+/// Decodes a `REG_SZ` payload (UTF-16LE, NUL-terminated). The returned string
+/// stops at the first NUL; a missing terminator is tolerated.
+pub fn parse_reg_sz(buf: &[u8]) -> Result<String, ParseError> {
+    let units = decode_utf16_registry(buf)?;
+    let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+    Ok(String::from_utf16_lossy(&units[..end]))
+}
+
+/// Decodes a `REG_MULTI_SZ` payload into its non-empty UTF-16 strings.
+pub fn parse_reg_multi_sz(buf: &[u8]) -> Result<Vec<String>, ParseError> {
+    let units = decode_utf16_registry(buf)?;
+    let mut out = Vec::new();
+    let mut current: Vec<u16> = Vec::new();
+    for unit in units {
+        if unit == 0 {
+            if !current.is_empty() {
+                out.push(String::from_utf16_lossy(&current));
+                current.clear();
+            }
+        } else {
+            current.push(unit);
+        }
+    }
+    if !current.is_empty() {
+        out.push(String::from_utf16_lossy(&current));
+    }
+    Ok(out)
+}
+
+/// Decodes a `REG_DWORD` payload.
+pub fn parse_reg_dword(buf: &[u8]) -> Result<u32, ParseError> {
+    if buf.len() < 4 {
+        return Err(ParseError(format!(
+            "Registry DWORD payload is too short: {} bytes (need 4)",
+            buf.len()
+        )));
+    }
+    Ok(u32::from_le_bytes(buf[0..4].try_into().unwrap()))
+}
+
+/// Volume root of a Windows path: `C:` for drive-letter paths, or the
+/// `\\?\Volume{...}\` prefix for volume-GUID paths. `None` = not a local
+/// volume path we can resolve (UNC/relative/unknown), which callers must
+/// treat as unreadable rather than as "no disk".
+pub fn windows_volume_root(path: &str) -> Option<String> {
+    let path = path.trim();
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return Some(format!("{}:", path[..1].to_ascii_uppercase()));
+    }
+
+    let lowercase = path.to_ascii_lowercase();
+    if lowercase.starts_with(r"\\?\volume{") {
+        let close = path.find('}')?;
+        return Some(format!("{}\\", &path[..=close]));
+    }
+
+    // `\??\C:\...` is an NT object-manager path; normalize it.
+    if let Some(rest) = path.strip_prefix(r"\??\") {
+        return windows_volume_root(rest);
+    }
+
+    None
+}
+
+/// Expands `%SystemRoot%` / `%WINDIR%` / `%SystemDrive%` in a registry path.
+/// Other variables are left untouched (the caller then fails to resolve the
+/// volume and reports an unreadable fact rather than guessing).
+pub fn expand_system_vars(path: &str, system_root: &str, system_drive: &str) -> String {
+    let mut out = String::new();
+    let mut rest = path;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        if let Some(end) = after.find('%') {
+            let name = &after[..end];
+            let replacement =
+                if name.eq_ignore_ascii_case("systemroot") || name.eq_ignore_ascii_case("windir") {
+                    Some(system_root)
+                } else if name.eq_ignore_ascii_case("systemdrive") {
+                    Some(system_drive)
+                } else {
+                    None
+                };
+            if let Some(value) = replacement {
+                out.push_str(value);
+                rest = &after[end + 1..];
+                continue;
+            }
+        }
+        out.push('%');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn first_path_token(spec: &str) -> &str {
+    let spec = spec.trim();
+    if let Some(inner) = spec.strip_prefix('"') {
+        if let Some(end) = inner.find('"') {
+            return &inner[..end];
+        }
+        return inner;
+    }
+    spec.split_whitespace().next().unwrap_or("")
+}
+
+fn sort_dedup_roots(mut roots: Vec<String>) -> Vec<String> {
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Maps the `PagingFiles` registry entries to volume roots.
+///
+/// Each entry is a path plus optional initial/maximum sizes
+/// (`C:\pagefile.sys 0 0`). `?:\pagefile.sys` means "system managed on the
+/// system drive", so it maps to `system_drive`. An entry whose root cannot be
+/// resolved is a parse error (fail closed).
+pub fn pagefile_volume_roots(
+    entries: &[String],
+    system_drive: &str,
+) -> Result<Vec<String>, ParseError> {
+    let mut roots = Vec::new();
+    for entry in entries {
+        let path = first_path_token(entry);
+        if path.is_empty() {
+            continue;
+        }
+        let root = if path.starts_with("?:\\") || path.starts_with("?:/") {
+            windows_volume_root(system_drive).ok_or_else(|| {
+                ParseError(format!(
+                    "Cannot resolve the system drive for page file entry '{}'",
+                    entry
+                ))
+            })?
+        } else {
+            windows_volume_root(path).ok_or_else(|| {
+                ParseError(format!(
+                    "Cannot resolve the volume for page file '{}'",
+                    entry
+                ))
+            })?
+        };
+        roots.push(root);
+    }
+    Ok(sort_dedup_roots(roots))
+}
+
+/// Volume roots that hold the hibernation file. `hiberfil.sys` lives in the
+/// root of the system volume, so an enabled hibernation file maps to the
+/// system drive; disabled hibernation contributes no disk.
+pub fn hibernation_volume_roots(enabled: u32, system_drive: &str) -> Vec<String> {
+    if enabled == 0 {
+        return Vec::new();
+    }
+    windows_volume_root(system_drive)
+        .map(|root| vec![root])
+        .unwrap_or_default()
+}
+
+/// Volume roots that hold the configured crash-dump and minidump targets.
+///
+/// `CrashDumpEnabled == 0` contributes no disk. Otherwise both configured
+/// paths are mapped; when neither is configured, Windows' documented default
+/// `%SystemRoot%\MEMORY.DMP` is used (TODO-VERIFY on real Windows). A
+/// configured path whose volume cannot be resolved is a parse error.
+pub fn crash_dump_volume_roots(
+    enabled: u32,
+    dump_file: Option<&str>,
+    minidump_dir: Option<&str>,
+    system_root: &str,
+    system_drive: &str,
+) -> Result<Vec<String>, ParseError> {
+    if enabled == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut roots = Vec::new();
+    let mut saw_configured = false;
+    for configured in [dump_file, minidump_dir].into_iter().flatten() {
+        if configured.trim().is_empty() {
+            continue;
+        }
+        saw_configured = true;
+        let expanded = expand_system_vars(configured, system_root, system_drive);
+        let root = windows_volume_root(&expanded).ok_or_else(|| {
+            ParseError(format!(
+                "Cannot resolve the volume for crash-dump target '{}'",
+                configured
+            ))
+        })?;
+        roots.push(root);
+    }
+
+    if !saw_configured {
+        let root = windows_volume_root(system_root).ok_or_else(|| {
+            ParseError(format!(
+                "Cannot resolve the system volume '{}' for the default crash dump",
+                system_root
+            ))
+        })?;
+        roots.push(root);
+    }
+
+    Ok(sort_dedup_roots(roots))
+}
+
 // ===========================================================================
 // Tests (Runnable on Linux and all platforms)
 // ===========================================================================
@@ -929,5 +1170,142 @@ mod tests {
             fp,
             "8c4efb1b4866d0b332ebef624e1ba8cff76427c143b08a4f1199e6ee81279580"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // D-a piece 2: boot/system fact parsers and decision helpers.
+    // -----------------------------------------------------------------------
+
+    fn utf16_bytes(values: &[&str]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in values {
+            for unit in value.encode_utf16() {
+                out.extend_from_slice(&unit.to_le_bytes());
+            }
+            out.extend_from_slice(&0u16.to_le_bytes());
+        }
+        if values.is_empty() {
+            out.extend_from_slice(&0u16.to_le_bytes());
+        }
+        out
+    }
+
+    #[test]
+    fn test_parse_reg_multi_sz_pagefile_fixture() {
+        let payload = utf16_bytes(&[r"C:\pagefile.sys 0 0", r"D:\pagefile.sys 0 0"]);
+        let values = parse_reg_multi_sz(&payload).unwrap();
+        assert_eq!(values, vec!["C:\\pagefile.sys 0 0", "D:\\pagefile.sys 0 0"]);
+    }
+
+    #[test]
+    fn test_parse_reg_multi_sz_odd_length_and_empty_are_typed() {
+        assert!(parse_reg_multi_sz(&[0u8; 3]).is_err());
+        let empty = parse_reg_multi_sz(&utf16_bytes(&[])).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn test_parse_reg_sz_and_dword_fixtures() {
+        let sz = utf16_bytes(&[r"C:\Windows"]);
+        assert_eq!(parse_reg_sz(&sz).unwrap(), r"C:\Windows");
+        let dword = 7u32.to_le_bytes();
+        assert_eq!(parse_reg_dword(&dword).unwrap(), 7);
+        assert!(parse_reg_dword(&[1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn test_windows_volume_root_paths() {
+        assert_eq!(
+            windows_volume_root(r"c:\Windows\System32").as_deref(),
+            Some("C:")
+        );
+        assert_eq!(
+            windows_volume_root(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\Windows")
+                .as_deref(),
+            Some(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\")
+        );
+        assert_eq!(windows_volume_root(r"\??\D:\data").as_deref(), Some("D:"));
+        assert_eq!(windows_volume_root(r"\\server\share\file"), None);
+        assert_eq!(windows_volume_root("relative\\path"), None);
+    }
+
+    #[test]
+    fn test_expand_system_vars_only_expands_known_variables() {
+        assert_eq!(
+            expand_system_vars(r"%SystemRoot%\MEMORY.DMP", r"C:\Windows", "C:"),
+            r"C:\Windows\MEMORY.DMP"
+        );
+        assert_eq!(
+            expand_system_vars(r"%systemdrive%\hiberfil.sys", r"C:\Windows", "C:"),
+            r"C:\hiberfil.sys"
+        );
+        assert_eq!(
+            expand_system_vars(r"%UNKNOWN%\%SystemDrive%\x", r"C:\Windows", "C:"),
+            r"%UNKNOWN%\C:\x"
+        );
+    }
+
+    #[test]
+    fn test_pagefile_volume_roots_handles_system_managed_entries() {
+        let entries = vec![
+            r"C:\pagefile.sys 0 0".to_string(),
+            r"?:\pagefile.sys".to_string(),
+            r#""D:\pagefile.sys" 1024 2048"#.to_string(),
+        ];
+        let roots = pagefile_volume_roots(&entries, "C:").unwrap();
+        assert_eq!(roots, vec!["C:".to_string(), "D:".to_string()]);
+    }
+
+    #[test]
+    fn test_pagefile_volume_roots_unknown_path_is_typed() {
+        let entries = vec![r"\\server\share\pagefile.sys 0 0".to_string()];
+        assert!(pagefile_volume_roots(&entries, "C:").is_err());
+    }
+
+    #[test]
+    fn test_hibernation_volume_roots() {
+        assert_eq!(hibernation_volume_roots(1, "c:"), vec!["C:".to_string()]);
+        assert!(hibernation_volume_roots(0, "C:").is_empty());
+    }
+
+    #[test]
+    fn test_crash_dump_volume_roots_fixtures() {
+        // Enabled with a configured DumpFile on another volume.
+        let roots =
+            crash_dump_volume_roots(2, Some(r"D:\dumps\MEMORY.DMP"), None, r"C:\Windows", "C:")
+                .unwrap();
+        assert_eq!(roots, vec!["D:".to_string()]);
+
+        // Enabled with %SystemRoot% expansion.
+        let roots = crash_dump_volume_roots(
+            7,
+            Some(r"%SystemRoot%\MEMORY.DMP"),
+            None,
+            r"C:\Windows",
+            "C:",
+        )
+        .unwrap();
+        assert_eq!(roots, vec!["C:".to_string()]);
+
+        // Enabled but unconfigured: Windows' default lives on the system volume.
+        let roots = crash_dump_volume_roots(7, None, None, r"C:\Windows", "C:").unwrap();
+        assert_eq!(roots, vec!["C:".to_string()]);
+
+        // Disabled contributes no disk.
+        assert!(
+            crash_dump_volume_roots(0, Some(r"D:\dump.dmp"), None, r"C:\Windows", "C:")
+                .unwrap()
+                .is_empty()
+        );
+
+        // Configured but unresolvable is a typed error, never silently empty.
+        assert!(crash_dump_volume_roots(
+            2,
+            Some(r"\\server\share\dump.dmp"),
+            None,
+            r"C:\Windows",
+            "C:"
+        )
+        .is_err());
     }
 }

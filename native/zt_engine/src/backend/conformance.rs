@@ -346,6 +346,30 @@ pub fn stubs_refuse_everything(backend: &dyn BlockBackend) -> Result<(), String>
     Ok(())
 }
 
+/// D-a piece 2: the shared Windows policy must refuse `device` with a message
+/// containing `expected`.
+pub fn windows_refuses_disk(
+    backend: &dyn BlockBackend,
+    device: &str,
+    expected: &str,
+) -> Result<(), String> {
+    match guard::check_windows_boot_disk_protection(backend, device) {
+        Err(ExecuteError::BootDiskProtection(msg)) if msg.contains(expected) => Ok(()),
+        other => Err(format!(
+            "expected Windows BootDiskProtection containing '{}', got {:?}",
+            expected, other
+        )),
+    }
+}
+
+/// D-a piece 2: a disk named by no boot evidence and an elevated process must
+/// pass the Windows policy.
+pub fn windows_allows_disk(backend: &dyn BlockBackend, device: &str) -> Result<(), String> {
+    guard::check_windows_boot_disk_protection(backend, device)
+        .map(|_| ())
+        .map_err(|e| format!("disk should be allowed, got: {}", e))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -579,6 +603,131 @@ mod tests {
             format!("{:?}", res_a.err().map(|e| e.to_string())),
             format!("{:?}", res_b.err().map(|e| e.to_string())),
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // D-a piece 2: Windows boot facts → shared disk refusal.
+    // -----------------------------------------------------------------------
+
+    use crate::backend::{DiskSetFact, ElevationFact, WindowsBootFacts};
+
+    fn windows_facts() -> WindowsBootFacts {
+        WindowsBootFacts {
+            system_disks: DiskSetFact::known(std::iter::empty::<u32>()),
+            boot_disks: DiskSetFact::known(std::iter::empty::<u32>()),
+            pagefile_disks: DiskSetFact::known(std::iter::empty::<u32>()),
+            hibernation_disks: DiskSetFact::known(std::iter::empty::<u32>()),
+            crashdump_disks: DiskSetFact::known(std::iter::empty::<u32>()),
+            app_disks: DiskSetFact::known(std::iter::empty::<u32>()),
+            elevated: ElevationFact::Known(true),
+        }
+    }
+
+    #[test]
+    fn conformance_windows_refuses_system_disk() {
+        let mut facts = windows_facts();
+        facts.system_disks = DiskSetFact::known([0]);
+        let b = fixture().with_windows_boot_facts(facts);
+        windows_refuses_disk(
+            &b,
+            r"\\.\PhysicalDrive0",
+            "Windows is running from this disk. Use the Zero Trace live USB",
+        )
+        .expect("system disk must be refused");
+    }
+
+    #[test]
+    fn conformance_windows_refuses_pagefile_on_second_disk() {
+        let mut facts = windows_facts();
+        facts.system_disks = DiskSetFact::known([0]);
+        facts.pagefile_disks = DiskSetFact::known([1]);
+        let b = fixture().with_windows_boot_facts(facts);
+        windows_refuses_disk(&b, r"\\.\PhysicalDrive1", "page file")
+            .expect("page-file disk must be refused");
+        windows_refuses_disk(
+            &b,
+            r"\\.\PhysicalDrive0",
+            "Windows is running from this disk",
+        )
+        .expect("system disk must still be refused");
+    }
+
+    #[test]
+    fn conformance_windows_refuses_hibernation_disk() {
+        let mut facts = windows_facts();
+        facts.hibernation_disks = DiskSetFact::known([2]);
+        let b = fixture().with_windows_boot_facts(facts);
+        windows_refuses_disk(&b, r"\\.\PhysicalDrive2", "hibernation file")
+            .expect("hibernation disk must be refused");
+    }
+
+    #[test]
+    fn conformance_windows_refuses_crashdump_disk() {
+        let mut facts = windows_facts();
+        facts.crashdump_disks = DiskSetFact::known([3]);
+        let b = fixture().with_windows_boot_facts(facts);
+        windows_refuses_disk(&b, r"\\.\PhysicalDrive3", "crash-dump")
+            .expect("crash-dump disk must be refused");
+    }
+
+    #[test]
+    fn conformance_windows_refuses_disk_holding_the_app_on_usb() {
+        let mut facts = windows_facts();
+        facts.app_disks = DiskSetFact::known([4]);
+        let b = fixture().with_windows_boot_facts(facts);
+        windows_refuses_disk(&b, r"\\.\PhysicalDrive4", "Zero Trace application")
+            .expect("the running app's own USB stick must be refused");
+    }
+
+    #[test]
+    fn conformance_windows_unreadable_fact_refuses_every_disk() {
+        let mut facts = windows_facts();
+        facts.pagefile_disks = DiskSetFact::unreadable("registry access denied");
+        let b = fixture().with_windows_boot_facts(facts);
+        windows_refuses_disk(&b, r"\\.\PhysicalDrive9", "Cannot read")
+            .expect("an unreadable fact must fail closed for every disk");
+    }
+
+    #[test]
+    fn conformance_windows_refuses_when_not_elevated() {
+        let mut facts = windows_facts();
+        facts.elevated = ElevationFact::Known(false);
+        let b = fixture().with_windows_boot_facts(facts);
+        windows_refuses_disk(&b, r"\\.\PhysicalDrive5", "not running elevated")
+            .expect("future writes require an elevated token");
+    }
+
+    #[test]
+    fn conformance_windows_multi_disk_volume_protects_every_member() {
+        let mut facts = windows_facts();
+        facts.system_disks = DiskSetFact::known([1, 2]);
+        let b = fixture().with_windows_boot_facts(facts);
+        windows_refuses_disk(
+            &b,
+            r"\\.\PhysicalDrive1",
+            "Windows is running from this disk",
+        )
+        .expect("first member disk must be refused");
+        windows_refuses_disk(
+            &b,
+            r"\\.\PhysicalDrive2",
+            "Windows is running from this disk",
+        )
+        .expect("second member disk must be refused");
+    }
+
+    #[test]
+    fn conformance_windows_happy_path_allows_a_free_disk() {
+        let b = fixture().with_windows_boot_facts(windows_facts());
+        windows_allows_disk(&b, r"\\.\PhysicalDrive7").expect("free disk must be allowed");
+    }
+
+    #[test]
+    fn conformance_non_windows_backend_has_no_windows_policy() {
+        // No injected facts → the Windows policy is not applicable and must
+        // not invent a refusal for a Linux/mock target.
+        windows_allows_disk(&fixture(), r"\\.\PhysicalDrive7")
+            .expect("non-Windows backend must not apply Windows boot facts");
     }
 }
 

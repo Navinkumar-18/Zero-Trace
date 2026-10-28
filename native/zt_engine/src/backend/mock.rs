@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::backend::{
     BackendCapabilities, BackendError, BlockBackend, ExclusiveHandle, HandleReader, MountState,
-    PartitionFacts, Relation, StatFact,
+    PartitionFacts, Relation, StatFact, WindowsBootFacts,
 };
 use crate::guard::ValidatedTarget;
 use crate::types::{BlockWriter, BootEnvironment, ExecuteError};
@@ -42,6 +42,9 @@ pub struct MockBackend {
     mounts: String,
     swaps: String,
     boot_env: BootEnvironment,
+    /// D-a piece 2: injected Windows boot/system facts (fault injection for
+    /// the shared Windows disk-refusal policy). `None` = non-Windows.
+    windows_boot_facts: Option<WindowsBootFacts>,
 
     canonical: HashMap<String, String>,
     attrs: HashMap<String, HashMap<String, String>>,
@@ -96,6 +99,7 @@ impl MockBackend {
             mounts: String::new(),
             swaps: String::new(),
             boot_env: BootEnvironment::Normal,
+            windows_boot_facts: None,
             canonical: HashMap::new(),
             attrs: HashMap::new(),
             unreadable: HashSet::new(),
@@ -147,6 +151,13 @@ impl MockBackend {
 
     pub fn with_boot_env(mut self, env: BootEnvironment) -> Self {
         self.boot_env = env;
+        self
+    }
+
+    /// D-a piece 2: inject Windows boot/system facts — the shared guard must
+    /// decide identically from these facts regardless of platform.
+    pub fn with_windows_boot_facts(mut self, facts: WindowsBootFacts) -> Self {
+        self.windows_boot_facts = Some(facts);
         self
     }
 
@@ -507,6 +518,10 @@ impl BlockBackend for MockBackend {
 
     fn boot_environment(&self) -> Result<BootEnvironment, ExecuteError> {
         Ok(self.boot_env)
+    }
+
+    fn windows_boot_facts(&self) -> Result<Option<WindowsBootFacts>, BackendError> {
+        Ok(self.windows_boot_facts.clone())
     }
 
     fn canonicalize_path(&self, path: &str, dry_run: bool) -> Result<String, ExecuteError> {

@@ -57,7 +57,7 @@ decision lives in the shared guard chain (`native/zt_engine/src/guard.rs`).
 | Platform | Engine backend | Device discovery | UI actions | Status |
 | :--- | :--- | :--- | :--- | :--- |
 | **Linux** (x86_64) | `LinuxBackend` — real sysfs/proc facts, O_EXCL exclusive access, raw I/O | `lsblk` via `LinuxPlatformBackend` | Fully enabled | **Supported** — the only shipping platform; all tests run here |
-| **Windows** (x86_64-pc-windows-gnu / x86_64-pc-windows-msvc) | `WindowsBackend` — read-only Win32 facts (drive geometry, partition layout, storage descriptors, single-disk volume extents); every write/wipe action returns `Unsupported` and all capabilities are false | Read-only scan of `PhysicalDrive0..63` plus volume enumeration; fails closed on access-denied, unreadable volumes, failed/short geometry probes and non-`ERROR_NO_MORE_FILES` enumeration errors | Disabled with the reason *"Not available on this platform"* | **Read-only facts only** — no write, lock, dismount, discard or format path; system-disk (`C:`) refusal arrives in a later piece; CI `cargo check` on both Windows targets |
+| **Windows** (x86_64-pc-windows-gnu / x86_64-pc-windows-msvc) | `WindowsBackend` — read-only Win32 facts (drive geometry, partition layout, storage descriptors, single-disk volume extents, boot/system facts); every write/wipe action returns `Unsupported` and all capabilities are false | Read-only scan of `PhysicalDrive0..63` plus volume enumeration; fails closed on access-denied, unreadable volumes, failed/short geometry probes and non-`ERROR_NO_MORE_FILES` enumeration errors | Disabled with the reason *"Not available on this platform"* | **Read-only facts only** — no write, lock, dismount, discard or format path; the shared guard now refuses the system/boot disk, page-file, hibernation, crash-dump and app disks from those facts; CI `cargo check` on both Windows targets |
 | **Android** (aarch64-linux-android) | `UnsupportedBackend` stub — returns `Unsupported`, zero capability flags | Returns an empty list | Disabled with the reason *"Not available on this platform"* | Compile-only stub; gated by CI `cargo check` |
 | **Anything else** | `UnsupportedBackend` stub (fail closed) | Returns an empty list | Disabled with the reason *"Not available on this platform*" | Refused |
 
@@ -68,11 +68,15 @@ Notes:
   platforms are denied at compile time, not just at runtime.
 - The Windows backend is a facts-only probe in this pass: on Windows the
   engine answers `zt_engine windows-facts` with read-only device/partition
-  JSON, and every other command exits 2. It never requests write access,
-  never locks, dismounts, discards or formats, and never reports
-  `size_bytes = 0` for a failed probe — discovery errors are returned
-  instead of skipped. The Dart `WindowsPlatformBackend` and the `C:` /
-  system-disk refusal are deliberately out of scope for this piece.
+  JSON, the collected boot/system facts (`system_disks`, `boot_disks`,
+  `pagefile_disks`, `hibernation_disks`, `crashdump_disks`, `app_disks`,
+  `elevated`) and the shared guard's per-disk `refusal_reason`. It never
+  requests write access, never locks, dismounts, discards or formats, and
+  never reports `size_bytes = 0` for a failed probe — discovery errors are
+  returned instead of skipped. Any boot fact that cannot be read is reported
+  as `Unreadable` and refuses every disk; an unelevated process is also
+  refused. The Dart `WindowsPlatformBackend` remains out of scope for this
+  piece; every other engine command on Windows still exits 2.
 - `DETECT_REPORT` output carries additive `platform` and `capabilities`
   fields; v4 certificates carry signed `platform`/`backend` fields only when
   present, so all older certificates verify byte-identically.
@@ -117,6 +121,33 @@ cd native/zt_engine
 cargo test
 cargo build --release
 ```
+
+### Windows validation (manual, on a real Windows host)
+
+The Windows backend cannot be exercised on the Linux development host. Cross-
+compile it here, then run the facts command on the Windows machine and compare
+`boot_facts` / `disk_refusals` with Disk Management:
+
+```bash
+# On Linux (cross-compile checks only)
+cd native/zt_engine
+cargo check --all-targets --target x86_64-pc-windows-gnu
+cargo check --all-targets --target x86_64-pc-windows-msvc
+cargo build --release --target x86_64-pc-windows-gnu
+
+# On Windows, from an elevated PowerShell in the built target directory
+.\zt_engine.exe windows-facts > windows-facts-elevated.json
+
+# And from a normal (non-elevated) PowerShell
+.\zt_engine.exe windows-facts > windows-facts-normal.json
+```
+
+Expected: `boot_facts` lists the disks holding the Windows directory, boot
+volume, page files, hibernation file, crash-dump target and the Zero Trace
+executable/data directory; `disk_refusals` names the reason for every protected
+disk; `elevation_refusal` is `null` only in the elevated run. Any field that
+cannot be read appears as `Unreadable` with its reason, never as an empty set.
+The command is read-only; it never opens a disk or volume for writing.
 
 ### Manual Loop-Image Isolation Tests (root only)
 

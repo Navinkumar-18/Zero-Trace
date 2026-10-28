@@ -19,7 +19,7 @@ One shared guard chain + one UI; platform-specific disk access sits behind the
 | Shared types + `ValidatedTarget` (private constructor) | `src/types.rs`, `src/guard.rs` | every target |
 | `BlockBackend` trait, `current_backend()`, capabilities | `src/backend.rs` | every target |
 | `LinuxBackend` (the only real backend; owns all raw device opens/ioctls incl. `DirectBlockWriter` and the read/write primitives) | `src/backend/linux.rs` | Linux |
-| `WindowsBackend` — read-only facts only (geometry, drive layout, storage descriptors, single-disk volume extents); all capabilities false, every write/wipe action `Unsupported` | `src/backend/windows.rs` + `src/backend/windows_parse.rs` | Windows; the pure parse/decision modules also build under `cfg(test)` on every host |
+| `WindowsBackend` — read-only facts only (geometry, drive layout, storage descriptors, single-disk volume extents, boot/system facts incl. system/boot/pagefile/hibernation/crash-dump/app disks + elevation); all capabilities false, every write/wipe action `Unsupported` | `src/backend/windows.rs` + `src/backend/windows_parse.rs` | Windows; the pure parse/decision modules also build under `cfg(test)` on every host |
 | Android/unknown stubs (`Unsupported`, caps all false) | `src/backend/{unsupported,android}.rs` | every target |
 | `MockBackend` + shared conformance suite | `src/backend/{mock,conformance}.rs` | every target |
 | Engine modules (`detect`, `execute`, `partitions`, `verify`, `main`) | `src/` | Linux only (`#[cfg(target_os = "linux")]`); other targets get a stub `main` that exits 2 |
@@ -58,29 +58,42 @@ Rules for agents:
   `(device, token, serial)` signatures remain only as compatibility adapters
   that mint a target first. Partition table/partition probes and the
   read-only Windows probe also route through the backend.
-- **Windows is facts-only (Phase D):** `WindowsBackend` opens every disk and
-  volume with `dwDesiredAccess = 0` or `FILE_READ_ATTRIBUTES` only; no write,
-  lock, dismount, discard or format path exists, `capabilities()` is all-false
-  and every action returns `Unsupported`. Discovery fails closed: only
-  `ERROR_FILE_NOT_FOUND` / `ERROR_PATH_NOT_FOUND` mean an absent
+- **Windows is facts-only (Phases D-a 1 + 2):** `WindowsBackend` opens every
+  disk and volume with `dwDesiredAccess = 0` or `FILE_READ_ATTRIBUTES` only; no
+  write, lock, dismount, discard or format path exists, `capabilities()` is
+  all-false and every action returns `Unsupported`. Discovery fails closed:
+  only `ERROR_FILE_NOT_FOUND` / `ERROR_PATH_NOT_FOUND` mean an absent
   `PhysicalDriveN`; access-denied, unreadable volumes, non-
   `ERROR_NO_MORE_FILES` `FindNextVolumeW` errors, failed/short/malformed/zero
   geometry probes and empty/multi-extent volume probes are typed errors, never
-  a silent skip and never `size_bytes = 0`. The `C:` / system-disk refusal and
-  the Dart Windows platform backend arrive later and must not be assumed
-  present. Parser fixtures and discovery decisions run on Linux through
+  a silent skip and never `size_bytes = 0`. Phase D-a piece 2 adds read-only
+  boot facts (`GetSystemWindowsDirectoryW`, `%SystemDrive%`, `PagingFiles`,
+  `HibernateEnabled`, `CrashControl`, `GetModuleFileNameW` + `%LOCALAPPDATA%`,
+  `TokenElevation` with `TOKEN_QUERY` only); multi-disk volumes map to every
+  member disk and any unreadable fact stays `Unreadable` (never an empty set).
+  The shared `guard::check_windows_boot_disk_protection` /
+  `check_windows_boot_facts_for_disk` refuses system/boot/pagefile/
+  hibernation/crash-dump/app disks and unelevated processes; existing Linux
+  guard rules are unchanged. The Dart Windows platform backend arrives later.
+  Parser fixtures and discovery/boot decisions run on Linux through
   `#[cfg(any(target_os = "windows", test))]`; no test touches a real device.
-- **Static scan (Phase C2b + P2):** `tests/guard_entry_scan_test.rs`
+- **Static scan (Phase C2b + P2 + D-a 2):** `tests/guard_entry_scan_test.rs`
   (`no_direct_device_opens_or_ioctls_outside_backend`) fails the build if
   any source outside `src/backend/` uses `libc::open`/`libc::ioctl` or
   opens device paths with std; `destructive_tools_require_backend_or_
   validated_target` fails on shell construction, unresolved
   `Command::new(...)` outside `src/backend/`, or a destructive tool literal
   (`hdparm`, `nvme`, `sedutil-cli`, `blkdiscard`, `smartctl`, `mmc`, …)
-  outside a function taking `&ValidatedTarget`. The only `libc::open`
-  exception is the checkpoint temp-file creation
-  (`write_checkpoint_file_in_dir`, `O_CREAT|O_EXCL|O_NOFOLLOW` on a plain
-  file, never a device); the std-open exception list is empty.
+  outside a function taking `&ValidatedTarget`; `win32_device_apis_only_in_
+  backend` keeps `CreateFileW`/`DeviceIoControl` inside `backend/`; and
+  `windows_files_have_no_write_class_constants` rejects every write-class
+  Win32/registry constant or API (`GENERIC_WRITE`, `FILE_WRITE_*`, `WriteFile`,
+  `FSCTL_LOCK_VOLUME`, `FSCTL_DISMOUNT_VOLUME`, `IOCTL_DISK_SET_*`,
+  `KEY_SET_VALUE`, `RegSetValueEx`, …) in **both** `windows.rs` and
+  `windows_parse.rs`. The only `libc::open` exception is the checkpoint
+  temp-file creation (`write_checkpoint_file_in_dir`,
+  `O_CREAT|O_EXCL|O_NOFOLLOW` on a plain file, never a device); the std-open
+  exception list is empty.
 - **Display rules (Phase P1):** partition titles are filesystem-based
   (`FAT32 volume`, `exFAT volume`, `NTFS volume`, `ext4 volume`, size);
   `Windows volume (NTFS, size)` appears only when the read-only probe found
@@ -122,8 +135,8 @@ Rules for agents:
   checkpoints may gain fields only when present (old fixtures must verify or
   parse byte-identically).
 
-Reference test counts after Phase D (Phase C baseline: Dart 434 / Rust
-197 + 2 ignored): `flutter test` → 455 passing; `cargo test` → 252
+Reference test counts after Phase D-a piece 2 (Phase D baseline: Dart 455 /
+Rust 252 + 5 ignored): `flutter test` → 455 passing; `cargo test` → 274
 passing, 5 ignored, 0 failed (includes the `compile_fail` doc test; the
 five ignored are the two legacy loop-device writer tests
 (`native_writer_test`, `partition_scope_test`) plus the three loop-image

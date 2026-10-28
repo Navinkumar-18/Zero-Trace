@@ -26,7 +26,9 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use crate::backend::{BackendError, BlockBackend, Relation};
+use crate::backend::{
+    BackendError, BlockBackend, DiskSetFact, ElevationFact, Relation, WindowsBootFacts,
+};
 use crate::types::{
     dev_major, dev_minor, is_mount_unmountable_allowlisted, parse_major_minor, BootEnvironment,
     ExecuteError, GuardIdentity, PartitionTargetParams, ValidatedPartitionTarget,
@@ -614,6 +616,127 @@ pub fn check_boot_disk_protection(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// D-a piece 2: Windows boot/system disk refusal (shared policy)
+// ---------------------------------------------------------------------------
+
+/// Parses a Windows physical-drive path (`\\.\PhysicalDriveN` or
+/// `PhysicalDriveN`) into its disk number.
+pub fn windows_disk_number(device: &str) -> Option<u32> {
+    let name = device.trim();
+    let name = name.strip_prefix(r"\\.\").unwrap_or(name);
+    let name = name.strip_prefix(r"\??\").unwrap_or(name);
+    let digits = name.strip_prefix("PhysicalDrive")?;
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Pure per-disk refusal reason from Windows boot facts. `None` = this disk is
+/// not named by any evidence. An unreadable fact refuses **every** disk
+/// (fail closed), never only the disks that happen to be known.
+pub fn windows_boot_facts_disk_refusal(facts: &WindowsBootFacts, disk: u32) -> Option<String> {
+    let fields = [
+        ("system disk", &facts.system_disks),
+        ("boot volume", &facts.boot_disks),
+        ("page-file", &facts.pagefile_disks),
+        ("hibernation file", &facts.hibernation_disks),
+        ("crash-dump", &facts.crashdump_disks),
+        ("Zero Trace application", &facts.app_disks),
+    ];
+    for (label, fact) in fields {
+        if let Some(reason) = fact.reason() {
+            return Some(format!(
+                "Cannot read the Windows {} fact ({}): refusing destructive operation (fail closed)",
+                label, reason
+            ));
+        }
+    }
+
+    let evidence: &[(&DiskSetFact, &str)] = &[
+        (
+            &facts.system_disks,
+            "Windows is running from this disk. Use the Zero Trace live USB",
+        ),
+        (
+            &facts.boot_disks,
+            "This disk holds the Windows boot volume. Use the Zero Trace live USB",
+        ),
+        (
+            &facts.pagefile_disks,
+            "This disk holds an active Windows page file. Disable or move the page file before wiping",
+        ),
+        (
+            &facts.hibernation_disks,
+            "This disk holds the Windows hibernation file. Disable hibernation before wiping",
+        ),
+        (
+            &facts.crashdump_disks,
+            "This disk holds the Windows crash-dump target. Change the dump target before wiping",
+        ),
+        (
+            &facts.app_disks,
+            "This disk holds the running Zero Trace application. Start Zero Trace from removable media instead",
+        ),
+    ];
+    for (fact, message) in evidence {
+        if fact.disks().is_some_and(|disks| disks.contains(&disk)) {
+            return Some(format!(
+                "{} (disk {}): refusing destructive operation",
+                message, disk
+            ));
+        }
+    }
+    None
+}
+
+/// Pure elevation refusal (unreadable token fact or an unelevated process).
+pub fn windows_elevation_refusal(facts: &WindowsBootFacts) -> Option<String> {
+    match &facts.elevated {
+        ElevationFact::Known(true) => None,
+        ElevationFact::Known(false) => Some(
+            "Zero Trace is not running elevated: refusing destructive operation".to_string(),
+        ),
+        ElevationFact::Unreadable(reason) => Some(format!(
+            "Cannot read the Windows elevation fact ({}): refusing destructive operation (fail closed)",
+            reason
+        )),
+    }
+}
+
+/// Pure Windows disk decision: unknown/unreadable evidence and an unelevated
+/// process both refuse. Used by the backend-independent conformance suite and
+/// by the `windows-facts` output.
+pub fn check_windows_boot_facts_for_disk(
+    facts: &WindowsBootFacts,
+    disk: u32,
+) -> Result<(), ExecuteError> {
+    if let Some(reason) = windows_boot_facts_disk_refusal(facts, disk) {
+        return Err(ExecuteError::BootDiskProtection(reason));
+    }
+    if let Some(reason) = windows_elevation_refusal(facts) {
+        return Err(ExecuteError::BootDiskProtection(reason));
+    }
+    Ok(())
+}
+
+/// Shared Windows boot-disk protection over backend facts. `Ok(())` on
+/// non-Windows backends (which report no Windows boot facts); on Windows a
+/// failed fact read or a non-physical-drive path is a refusal, never a pass.
+pub fn check_windows_boot_disk_protection(
+    backend: &dyn BlockBackend,
+    device: &str,
+) -> Result<(), ExecuteError> {
+    let Some(facts) = backend.windows_boot_facts().map_err(scan_read_err)? else {
+        return Ok(());
+    };
+    let disk = windows_disk_number(device).ok_or_else(|| {
+        ExecuteError::UnsupportedOperation(format!("Not a Windows physical-drive path: {}", device))
+    })?;
+    check_windows_boot_facts_for_disk(&facts, disk)
 }
 
 /// O_EXCL probe + immediate re-check (the pre-command revalidation).
