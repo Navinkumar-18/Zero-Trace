@@ -5,6 +5,7 @@ import 'package:printing/printing.dart';
 
 import '../models/certificate.dart';
 import '../services/certificate_service.dart';
+import '../services/failure_report_wording.dart';
 import '../services/sanitization_controller.dart';
 import '../widgets/theme.dart';
 import 'error_messages.dart';
@@ -44,6 +45,7 @@ class SimpleCertificateDialog extends StatelessWidget {
     final passed = cert.evidence.verifiedPassed;
     final isSimulated = cert.executionMode == 'simulated';
     final isFailed = cert.result == 'FAILED';
+    final verificationRan = FailureReportWording.verificationRan(cert);
     final isFlash = cert.mediaType.toLowerCase().contains('flash') ||
         cert.mediaType.toLowerCase().contains('nvme') ||
         cert.mediaType.toLowerCase().contains('sd') ||
@@ -203,9 +205,9 @@ class SimpleCertificateDialog extends StatelessWidget {
 
                     if (cert.partitionsWiped != null && cert.partitionsWiped!.isNotEmpty) ...[
                       const SizedBox(height: 8),
-                      const Text(
-                        'Target Partitions Overwritten:',
-                        style: TextStyle(
+                      Text(
+                        FailureReportWording.partitionHeading(cert),
+                        style: const TextStyle(
                           fontSize: 12,
                           fontWeight: FontWeight.bold,
                           color: AppTheme.textPrimary,
@@ -233,13 +235,20 @@ class SimpleCertificateDialog extends StatelessWidget {
                       ),
                     ),
                     const SizedBox(height: 6),
-                    _row('Samples Checked:', '${cert.verificationSampleCount ?? cert.evidence.sampleOffsets.length} sectors'),
-                    _row('Entropy Score:', cert.verificationEntropyScore != null
-                        ? cert.verificationEntropyScore!.toStringAsFixed(4)
-                        : 'N/A'),
-                    _row('Evidence Hash:', cert.evidence.evidenceHash.isNotEmpty
-                        ? cert.evidence.evidenceHash
-                        : 'N/A'),
+                    if (verificationRan) ...[
+                      _row('Samples Checked:', '${cert.verificationSampleCount ?? cert.evidence.sampleOffsets.length} sectors'),
+                      _row('Entropy Score:', cert.verificationEntropyScore != null
+                          ? cert.verificationEntropyScore!.toStringAsFixed(4)
+                          : 'N/A'),
+                      _row('Evidence Hash:', cert.evidence.evidenceHash),
+                    ] else
+                      const Text(
+                        FailureReportWording.verificationNotRun,
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: AppTheme.textPrimary,
+                        ),
+                      ),
                     if (cert.evidence.limitations.isNotEmpty)
                       _row('Limitations / Scope:', cert.evidence.limitations),
 

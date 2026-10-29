@@ -452,7 +452,19 @@ class SanitizationController extends ChangeNotifier {
     List<PartitionAuditOutcome>? outcomes,
   }) async {
     try {
-      final evidence = _verificationService.verify(job, isSuccess: false);
+      // A failed run has not verified anything: keep the failure report honest
+      // instead of fabricating 50 dirty samples and a hash.
+      final evidence = VerificationEvidence(
+        statusCode: 1,
+        controllerConfirmation: 'VERIFICATION: Not run (wipe did not complete)',
+        sampleOffsets: const [],
+        sampleHashes: const {},
+        evidenceHash: '',
+        limitations: _verificationService.getTailoredLimitations(
+          job.recommendedMethod,
+        ),
+        verifiedPassed: false,
+      );
       final report = _certificateService.generateCertificate(
         job: job,
         evidence: evidence,

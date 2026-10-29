@@ -43,7 +43,14 @@ String describeEngineFailure(int exitCode, String rawReason) {
   final base =
       _baseMessages[exitCode] ?? 'The engine failed with exit code $exitCode.';
   final reason = cleanEngineReason(rawReason);
-  return reason.isEmpty ? base : '$base $reason';
+  if (reason.isNotEmpty) return '$base $reason';
+  // Exit 3 covers guard refusals and execution errors. When the engine gave no
+  // stderr, say that explicitly instead of implying the exit code is the whole
+  // story; the History entry keeps the full record.
+  if (exitCode == 3) {
+    return '$base The engine gave no reason; see History.';
+  }
+  return base;
 }
 
 /// Strip the CLI/Debug wrappers the engine uses for machine logs, leaving the

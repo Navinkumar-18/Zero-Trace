@@ -11,6 +11,7 @@ import '../models/device_profile.dart';
 import '../models/partition_info.dart';
 import '../models/sanitization_job.dart';
 import '../models/sanitization_support_level.dart';
+import 'failure_report_wording.dart';
 import 'platform_backend.dart';
 
 class CertificateService {
@@ -291,7 +292,11 @@ class CertificateService {
         'ZT-CERT-${now.millisecondsSinceEpoch.toString().substring(5)}';
 
     final String resultStr = evidence.verifiedPassed ? 'SUCCESS' : 'FAILED';
-    final String verificationSummary = evidence.verifiedPassed
+    final bool hasVerificationEvidence =
+        FailureReportWording.hasUsableEvidence(evidence);
+    final String verificationSummary = !hasVerificationEvidence
+        ? FailureReportWording.verificationNotRun
+        : evidence.verifiedPassed
         ? '${verificationSampleCount ?? 50}/${verificationSampleCount ?? 50} Sector Samples Passed Zero Readback Verification (${evidence.evidenceHash.substring(0, min(12, evidence.evidenceHash.length))}...)'
         : 'Sample Verification Failed - Non-Zero Data Detected at Target Offsets';
 
@@ -891,7 +896,9 @@ class CertificateService {
                   if (cert.partitionsWiped != null &&
                       cert.partitionsWiped!.isNotEmpty)
                     [
-                      'Partitions Wiped',
+                      FailureReportWording.partitionHeading(
+                        cert,
+                      ).replaceFirst(RegExp(r':$'), ''),
                       cert.partitionsWiped!
                           .map(
                             (p) =>
@@ -961,31 +968,40 @@ class CertificateService {
                 child: pw.Column(
                   crossAxisAlignment: pw.CrossAxisAlignment.start,
                   children: [
-                    pw.Text(
-                      'Verification Summary: ${cert.verificationSummary}',
-                      style: pw.TextStyle(
-                        fontSize: 8.5,
-                        fontWeight: pw.FontWeight.bold,
+                    if (FailureReportWording.verificationRan(cert)) ...[
+                      pw.Text(
+                        'Verification Summary: ${cert.verificationSummary}',
+                        style: pw.TextStyle(
+                          fontSize: 8.5,
+                          fontWeight: pw.FontWeight.bold,
+                        ),
                       ),
-                    ),
-                    pw.SizedBox(height: 3),
-                    pw.Text(
-                      'Master Evidence Hash: ${cert.evidence.evidenceHash}',
-                      style: const pw.TextStyle(
-                        fontSize: 8,
-                        color: PdfColors.grey800,
-                      ),
-                    ),
-                    if (cert.verificationEntropyScore != null) ...[
                       pw.SizedBox(height: 3),
                       pw.Text(
-                        'Shannon Entropy Score: ${cert.verificationEntropyScore!.toStringAsFixed(4)}',
+                        'Master Evidence Hash: ${cert.evidence.evidenceHash}',
                         style: const pw.TextStyle(
                           fontSize: 8,
                           color: PdfColors.grey800,
                         ),
                       ),
-                    ],
+                      if (cert.verificationEntropyScore != null) ...[
+                        pw.SizedBox(height: 3),
+                        pw.Text(
+                          'Shannon Entropy Score: ${cert.verificationEntropyScore!.toStringAsFixed(4)}',
+                          style: const pw.TextStyle(
+                            fontSize: 8,
+                            color: PdfColors.grey800,
+                          ),
+                        ),
+                      ],
+                    ] else
+                      pw.Text(
+                        FailureReportWording.verificationNotRun,
+                        style: pw.TextStyle(
+                          fontSize: 8.5,
+                          fontWeight: pw.FontWeight.bold,
+                        ),
+                      ),
                     pw.SizedBox(height: 3),
                     if (cert.stepsExecuted != null &&
                         cert.stepsExecuted!.isNotEmpty) ...[
