@@ -318,9 +318,9 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                         color: AppTheme.accentRose, size: 28),
                   ),
                   const SizedBox(width: 14),
-                  const Expanded(
-                    child: Text('Wipe All Data?',
-                        style: TextStyle(
+                  Expanded(
+                    child: Text(_titleForScope(selectedParts),
+                        style: const TextStyle(
                             fontSize: 20,
                             fontWeight: FontWeight.bold,
                             color: AppTheme.textPrimary)),
@@ -836,6 +836,15 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
           ? 'Estimate: ~12 to 48+ hours'
           : 'Estimate: ~4 to 16+ hours';
     }
+  }
+
+  /// Phase P4-fix: the title names exactly what will be wiped — the device
+  /// for whole-disk scope, the partition (or partition count) when
+  /// partitions are selected, instead of the ambiguous "Wipe All Data?".
+  String _titleForScope(List<PartitionInfo> selectedParts) {
+    if (selectedParts.isEmpty) return 'Wipe ${widget.device.name}?';
+    if (selectedParts.length == 1) return 'Wipe ${selectedParts.first.name}?';
+    return 'Wipe ${selectedParts.length} partitions?';
   }
 
   Widget _infoRow(String label, String value) {

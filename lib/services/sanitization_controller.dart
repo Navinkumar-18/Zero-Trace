@@ -13,6 +13,7 @@ import 'certificate_service.dart';
 import 'classification_service.dart';
 import 'device_intelligence_service.dart';
 import 'device_simulator.dart';
+import 'engine_failure_message.dart';
 import 'policy_layer.dart';
 import 'partition_table_service.dart';
 import 'platform_backend.dart';
@@ -436,6 +437,65 @@ class SanitizationController extends ChangeNotifier {
           bytesWiped: success ? p.sizeBytes : 0,
         ),
     ];
+  }
+
+  /// Phase P4-fix: a failed run must leave a `wipe_failed` audit entry (and a
+  /// History row) carrying the readable reason — including runs that returned
+  /// a non-zero engine report instead of throwing.
+  Future<void> _appendFailureAudit({
+    required SanitizationJob job,
+    required String reason,
+    required bool simulated,
+    required String method,
+    required String devicePath,
+    required String fingerprintHash,
+    List<PartitionAuditOutcome>? outcomes,
+  }) async {
+    try {
+      final evidence = _verificationService.verify(job, isSuccess: false);
+      final report = _certificateService.generateCertificate(
+        job: job,
+        evidence: evidence,
+        executionMode: simulated ? 'simulated' : 'real',
+        bootEnvironment: LiveBootDetector.detect().name,
+      );
+      _completedCertificate = report;
+      final (_, reportSha) = await _auditLogService.saveFailureReport(report);
+      await _auditLogService.appendEntry(
+        AuditLogEntry(
+          timestamp: DateTime.now().toIso8601String(),
+          jobId: job.jobId,
+          deviceSerial: job.device.serialNumber,
+          devicePath: devicePath,
+          deviceName: job.device.name,
+          scope: job.isPartitionScope ? 'partial' : 'full',
+          method: method,
+          methodClass: _deriveMethodClass(job.effectiveMethod),
+          standardReference: job.standardReference,
+          nistCategory: job.effectiveNistCategoryDisplayName,
+          outcome: 'wipe_failed',
+          success: false,
+          verificationPassed: false,
+          failureReason: reason,
+          certificateId: report.certificateId,
+          certificateSha256: reportSha,
+          fingerprintHash: fingerprintHash,
+          entropyScore: 0.0,
+          sampleCount: 0,
+          commandLog: List<String>.from(job.logs),
+          isSimulated: simulated,
+          partitions: _buildPartitionOutcomes(
+            job,
+            false,
+            override: (outcomes != null && outcomes.isNotEmpty)
+                ? outcomes
+                : null,
+          ),
+        ),
+      );
+    } catch (auditErr) {
+      _addLog('WARNING: Failure audit write failed: $auditErr');
+    }
   }
 
   Future<void> _checkForOrphansOnStartup() async {
@@ -1978,20 +2038,24 @@ class SanitizationController extends ChangeNotifier {
           lastReport = report;
 
           if (!report.success) {
+            final failure = describeEngineFailure(
+              report.exitCode,
+              report.stderr,
+            );
             job.status = JobStatus.failed;
             job.endTime = DateTime.now();
             if (report.exitCode == 130) {
               job.currentStageDescription =
-                  'Sanitization Cancelled: Partially Wiped';
+                  'Sanitization Cancelled: Partially Wiped. $failure';
               _addLog(
                 'CANCEL: Sanitization cancelled by user. Partially wiped.',
               );
             } else {
-              job.currentStageDescription =
-                  'Sanitization Failed: ${report.stderr}';
+              job.currentStageDescription = failure;
               _addLog(
                 'ERROR: Sanitization command failed with code ${report.exitCode}',
               );
+              _addLog('ERROR: $failure');
               _addLog('ERROR Details: ${report.stderr}');
             }
             if (target != null) {
@@ -2001,6 +2065,19 @@ class SanitizationController extends ChangeNotifier {
             }
             _addLog(
               'ERROR: Wipe stopped; $wipedTargets/${targets.length} target(s) completed.',
+            );
+            await _appendFailureAudit(
+              job: job,
+              reason: failure,
+              simulated: false,
+              method: job.recommendedMethod.displayName,
+              devicePath: job.isPartitionScope
+                  ? job.targetPartition!.devicePath
+                  : (job.device.id.startsWith('real_')
+                        ? '/dev/${job.device.id.substring(5)}'
+                        : '/dev/null'),
+              fingerprintHash: 'EXECUTION_FAILED',
+              outcomes: outcomes,
             );
             await _jobStateFile.clearActiveJob();
             notifyListeners();
@@ -2275,52 +2352,19 @@ class SanitizationController extends ChangeNotifier {
         job.currentStageDescription = 'Execution Error: $e';
         _addLog('ERROR: $e');
 
-        try {
-          final evidence = _verificationService.verify(job, isSuccess: false);
-          final report = _certificateService.generateCertificate(
-            job: job,
-            evidence: evidence,
-            executionMode: 'real',
-            bootEnvironment: LiveBootDetector.detect().name,
-          );
-          _completedCertificate = report;
-          final (_, reportSha) = await _auditLogService.saveFailureReport(
-            report,
-          );
-          await _auditLogService.appendEntry(
-            AuditLogEntry(
-              timestamp: DateTime.now().toIso8601String(),
-              jobId: job.jobId,
-              deviceSerial: job.device.serialNumber,
-              devicePath: job.isPartitionScope
-                  ? job.targetPartition!.devicePath
-                  : (job.device.id.startsWith('real_')
-                        ? '/dev/${job.device.id.substring(5)}'
-                        : '/dev/null'),
-              deviceName: job.device.name,
-              scope: job.isPartitionScope ? 'partial' : 'full',
-              method: job.recommendedMethod.displayName,
-              methodClass: _deriveMethodClass(job.effectiveMethod),
-              standardReference: job.standardReference,
-              nistCategory: job.effectiveNistCategoryDisplayName,
-              outcome: 'wipe_failed',
-              success: false,
-              verificationPassed: false,
-              certificateId: report.certificateId,
-              certificateSha256: reportSha,
-              fingerprintHash: 'EXECUTION_FAILED',
-              entropyScore: 0.0,
-              sampleCount: 0,
-              commandLog: List<String>.from(job.logs),
-              isSimulated: false,
-              partitions: _buildPartitionOutcomes(
-                job,
-                false,
-                override: outcomes.isNotEmpty ? outcomes : null,
-              ),
-            ),
-          );
-        } catch (_) {}
+        await _appendFailureAudit(
+          job: job,
+          reason: job.currentStageDescription,
+          simulated: false,
+          method: job.recommendedMethod.displayName,
+          devicePath: job.isPartitionScope
+              ? job.targetPartition!.devicePath
+              : (job.device.id.startsWith('real_')
+                    ? '/dev/${job.device.id.substring(5)}'
+                    : '/dev/null'),
+          fingerprintHash: 'EXECUTION_FAILED',
+          outcomes: outcomes,
+        );
 
         await _jobStateFile.clearActiveJob();
         notifyListeners();
@@ -2384,43 +2428,14 @@ class SanitizationController extends ChangeNotifier {
         'ERROR: Controller returned STATUS_ERR_TIMEOUT (Simulated Failure Injected)',
       );
 
-      final evidence = _verificationService.verify(job, isSuccess: false);
-      _completedCertificate = _certificateService.generateCertificate(
+      await _appendFailureAudit(
         job: job,
-        evidence: evidence,
-        executionMode: 'simulated',
-        bootEnvironment: LiveBootDetector.detect().name,
+        reason: job.currentStageDescription,
+        simulated: true,
+        method: job.effectiveMethod.displayName,
+        devicePath: '/dev/sdb',
+        fingerprintHash: 'SIMULATED_FAILURE',
       );
-      try {
-        final (_, reportSha) = await _auditLogService.saveFailureReport(
-          _completedCertificate!,
-        );
-        await _auditLogService.appendEntry(
-          AuditLogEntry(
-            timestamp: DateTime.now().toIso8601String(),
-            jobId: job.jobId,
-            deviceSerial: job.device.serialNumber,
-            devicePath: '/dev/sdb',
-            deviceName: job.device.name,
-            scope: job.isPartitionScope ? 'partial' : 'full',
-            method: job.effectiveMethod.displayName,
-            methodClass: _deriveMethodClass(job.effectiveMethod),
-            standardReference: job.standardReference,
-            nistCategory: job.effectiveNistCategoryDisplayName,
-            outcome: 'wipe_failed',
-            success: false,
-            verificationPassed: false,
-            certificateId: _completedCertificate!.certificateId,
-            certificateSha256: reportSha,
-            fingerprintHash: 'SIMULATED_FAILURE',
-            entropyScore: 0.0,
-            sampleCount: 0,
-            commandLog: List<String>.from(job.logs),
-            isSimulated: true,
-            partitions: _buildPartitionOutcomes(job, false),
-          ),
-        );
-      } catch (_) {}
 
       await _jobStateFile.clearActiveJob();
       notifyListeners();

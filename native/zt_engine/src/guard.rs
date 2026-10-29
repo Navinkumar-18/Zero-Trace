@@ -996,11 +996,13 @@ pub fn unmount_target_partition_and_holders(
 
     for holder in &holders {
         let holder_dev = format!("/dev/{}", holder);
+        let mut holder_mount_point: Option<String> = None;
         let mut is_mounted = false;
         for line in mounts_content.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if !parts.is_empty() && (parts[0] == holder_dev || parts[0].ends_with(holder)) {
                 is_mounted = true;
+                holder_mount_point = parts.get(1).map(|m| (*m).to_string());
                 break;
             }
         }
@@ -1014,19 +1016,27 @@ pub fn unmount_target_partition_and_holders(
             stdout_accum.push_str(&stdout);
             stderr_accum.push_str(&stderr);
             if code != 0 {
+                // P4-fix: name the blocking mount point and state that the
+                // forced unmount was attempted (and why it failed).
                 return Err(ExecuteError::CommandFailed(format!(
-                    "Target partition {} is held by active holder '{}' which cannot be unmounted",
-                    target_partition, holder_dev
+                    "Target partition {} is held by active holder '{}' which cannot be \
+                     unmounted (mounted at {}; forced unmount attempted and failed: {})",
+                    target_partition,
+                    holder_dev,
+                    holder_mount_point.as_deref().unwrap_or("unknown mount point"),
+                    unmount_failure_detail(&stderr),
                 )));
             }
         }
     }
 
     let mut is_target_mounted = false;
+    let mut target_mount_point: Option<String> = None;
     for line in mounts_content.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if !parts.is_empty() && (parts[0] == target_partition || parts[0] == target_canonical) {
             is_target_mounted = true;
+            target_mount_point = parts.get(1).map(|m| (*m).to_string());
             break;
         }
     }
@@ -1041,14 +1051,31 @@ pub fn unmount_target_partition_and_holders(
         stdout_accum.push_str(&stdout);
         stderr_accum.push_str(&stderr);
         if code != 0 {
+            // P4-fix: report the unmount-attempt status and the mount point
+            // that is still holding the partition.
             return Err(ExecuteError::CommandFailed(format!(
-                "Failed to unmount partition {}: {}",
-                target_partition, stderr
+                "Failed to unmount partition {}: {} (forced unmount attempted and failed; \
+                 still mounted at {})",
+                target_partition,
+                unmount_failure_detail(&stderr),
+                target_mount_point.as_deref().unwrap_or("unknown mount point"),
             )));
         }
     }
 
     Ok((stdout_accum, stderr_accum))
+}
+
+/// Human-readable detail for a failed forced-unmount attempt — `umount` can
+/// exit non-zero without printing anything, which must not yield an empty
+/// parenthetical in the refusal message.
+fn unmount_failure_detail(stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        "umount exited non-zero without a message".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Executes a command through the backend, preserving the historic
@@ -1459,11 +1486,15 @@ pub fn revalidate_target_identity(
 // Phase F: post-wipe filesystem recreation guards
 // ---------------------------------------------------------------------------
 
-/// `(source, optional major:minor)` pair from the mount/swap state.
-type MountedSourceFact = (String, Option<(u32, u32)>);
+/// `(source, optional major:minor, optional mount point)` fact from the
+/// mount/swap state. The mount point (when known) names the blocking mount
+/// in refusals so the operator knows exactly what to unmount. Swap has no
+/// mount point.
+type MountedSourceFact = (String, Option<(u32, u32)>, Option<String>);
 
-/// Source/dev pairs currently mounted or active as swap. Mountinfo fields:
-/// `... major:minor ... - fstype source superopts`.
+/// Source/dev/mount-point facts currently mounted or active as swap.
+/// Mountinfo fields: `... major:minor root mount_point options ... - fstype
+/// source superopts`; `/proc/mounts` fields: `source mount_point fstype …`.
 fn mounted_source_facts(
     backend: &dyn BlockBackend,
 ) -> Result<Vec<MountedSourceFact>, ExecuteError> {
@@ -1476,20 +1507,23 @@ fn mounted_source_facts(
             continue;
         }
         let dev = parse_major_minor(parts[2]);
+        let mount_point = Some(parts[4].to_string());
         if let Some(sep) = parts.iter().position(|p| *p == "-") {
             if let Some(source) = parts.get(sep + 2) {
-                out.push(((*source).to_string(), dev));
+                out.push(((*source).to_string(), dev, mount_point));
             }
         }
     }
     for line in state.mounts.lines() {
-        if let Some(source) = line.split_whitespace().next() {
-            out.push((source.to_string(), None));
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if let Some(source) = parts.first() {
+            let mount_point = parts.get(1).map(|m| (*m).to_string());
+            out.push((source.to_string(), None, mount_point));
         }
     }
     for line in state.swaps.lines().skip(1) {
         if let Some(source) = line.split_whitespace().next() {
-            out.push((source.to_string(), None));
+            out.push((source.to_string(), None, None));
         }
     }
     Ok(out)
@@ -1534,18 +1568,28 @@ pub fn assert_target_not_mounted(
     let id = target.guard_identity();
     let target_dev = (id.major, id.minor);
 
-    for (source, dev) in sources {
+    for (source, dev, mount_point) in sources {
         let source_name = source.rsplit('/').next().unwrap_or(&source);
         let by_name = names
             .iter()
             .any(|n| n == source_name || source == format!("/dev/{}", n));
         let by_dev = dev == Some(target_dev);
         if by_name || by_dev {
-            return Err(ExecuteError::TargetMounted(format!(
-                "{} is mounted/active as '{}'",
-                target.canonical_path(),
-                source
-            )));
+            // P4-fix: name the blocking mount point so the operator knows
+            // exactly what must be unmounted first. Swap has no mount point.
+            return Err(ExecuteError::TargetMounted(match mount_point {
+                Some(mp) => format!(
+                    "{} is mounted/active as '{}' (mounted at {})",
+                    target.canonical_path(),
+                    source,
+                    mp
+                ),
+                None => format!(
+                    "{} is mounted/active as '{}'",
+                    target.canonical_path(),
+                    source
+                ),
+            }));
         }
     }
     Ok(())

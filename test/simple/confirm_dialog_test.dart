@@ -44,7 +44,7 @@ void main() {
     await tester.pumpAndSettle();
 
     // Dialog title and drive info
-    expect(find.text('Wipe All Data?'), findsOneWidget);
+    expect(find.text('Wipe SanDisk Cruzer Blade?'), findsOneWidget);
     expect(find.text('SanDisk Cruzer Blade'), findsOneWidget);
     expect(find.text('4C530000151121111494'), findsOneWidget);
 

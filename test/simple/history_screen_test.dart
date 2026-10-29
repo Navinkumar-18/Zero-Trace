@@ -32,6 +32,7 @@ void main() {
     String? deviceName,
     bool isSimulated = false,
     String? outcome = 'completed',
+    String? failureReason,
   }) {
     return AuditLogEntry(
       timestamp: '2026-10-10T12:00:00Z',
@@ -49,6 +50,7 @@ void main() {
       sampleCount: 50,
       commandLog: const ['Unmounting device', 'Executing erase'],
       isSimulated: isSimulated,
+      failureReason: failureReason,
     );
   }
 
@@ -153,5 +155,28 @@ void main() {
     await pumpHistory(tester);
 
     expect(find.byKey(const Key('history-integrity-broken')), findsOneWidget);
+  });
+
+  testWidgets('a failed entry shows the readable engine failure reason',
+      (tester) async {
+    // Phase P4-fix: `wipe_failed` entries carry the typed engine reason
+    // (including the blocking mount point) and the card must show it.
+    await service.appendEntry(
+      entry(
+        jobId: 'JOB-FAIL',
+        deviceName: 'Broken Drive',
+        outcome: 'wipe_failed',
+        failureReason:
+            "The wipe or verification failed (exit 2). /dev/sdb1 is "
+            "mounted/active as '/dev/sdb1' (mounted at /mnt/data)",
+      ),
+    );
+
+    await pumpHistory(tester);
+
+    expect(find.byKey(const ValueKey('history-entry-JOB-FAIL')), findsOneWidget);
+    expect(find.text('WIPE FAILED'), findsOneWidget);
+    expect(find.text('Failure'), findsOneWidget);
+    expect(find.textContaining('/mnt/data'), findsOneWidget);
   });
 }

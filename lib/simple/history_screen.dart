@@ -486,6 +486,16 @@ class _HistoryScreenState extends State<HistoryScreen> {
                     ),
                   ],
                 ),
+                // P4-fix: a failed run must state its readable engine reason
+                // right on the History card.
+                if (entry.failureReason != null &&
+                    entry.failureReason!.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  _field(
+                    'Failure',
+                    UntrustedText(entry.failureReason!).sanitized,
+                  ),
+                ],
                 if (entry.partitions != null && entry.partitions!.isNotEmpty) ...[
                   const SizedBox(height: 12),
                   const Text(

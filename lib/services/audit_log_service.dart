@@ -79,6 +79,11 @@ class AuditLogEntry {
   final bool? verificationPassed; // null in legacy
   final List<PartitionAuditOutcome>? partitions;
 
+  /// Phase P4-fix: readable engine failure reason for `wipe_failed` /
+  /// `verify_failed` entries. Absent (null) everywhere else, so existing
+  /// entries keep their exact canonical bytes and hash chain.
+  final String? failureReason;
+
   /// Phase F: optional separate format-step record. Absent for wipe-only
   /// entries, so existing log entries keep their exact canonical bytes.
   final FilesystemRecreationRecord? filesystemRecreation;
@@ -113,6 +118,7 @@ class AuditLogEntry {
     this.isSimulated = false,
     this.verificationPassed,
     this.partitions,
+    this.failureReason,
     this.filesystemRecreation,
     this.isLegacy = false,
     this.previousHash,
@@ -149,6 +155,7 @@ class AuditLogEntry {
     if (partitions != null) {
       map['partitions'] = partitions!.map((p) => p.toJson()).toList();
     }
+    if (failureReason != null) map['failureReason'] = failureReason;
     if (filesystemRecreation != null) {
       map['filesystemRecreation'] = filesystemRecreation!.toJson();
     }
@@ -185,6 +192,7 @@ class AuditLogEntry {
     if (partitions != null) {
       map['partitions'] = partitions!.map((p) => p.toJson()).toList();
     }
+    if (failureReason != null) map['failureReason'] = failureReason;
     if (filesystemRecreation != null) {
       map['filesystemRecreation'] = filesystemRecreation!.toJson();
     }
@@ -235,6 +243,7 @@ class AuditLogEntry {
       verificationPassed:
           json['verificationPassed'] as bool?, // null in legacy -> renders "—"
       partitions: partitions,
+      failureReason: json['failureReason'] as String?,
       filesystemRecreation: filesystemRecreation,
       isLegacy: !json.containsKey('isSimulated'),
       previousHash: json['previousHash'] as String?,
@@ -268,6 +277,7 @@ class AuditLogEntry {
       isSimulated: isSimulated,
       verificationPassed: verificationPassed,
       partitions: partitions,
+      failureReason: failureReason,
       filesystemRecreation: filesystemRecreation,
       isLegacy: isLegacy,
       previousHash: previousHash,

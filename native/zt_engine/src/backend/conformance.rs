@@ -271,6 +271,58 @@ pub fn busy_unmount_refused(backend: &dyn BlockBackend, partition_dev: &str) -> 
     }
 }
 
+/// P4-fix: the busy-unmount refusal must name the holder's blocking mount
+/// point and state that the forced unmount was attempted and failed —
+/// "cannot be unmounted" alone leaves the operator guessing.
+pub fn busy_unmount_names_mount_point(
+    backend: &dyn BlockBackend,
+    partition_dev: &str,
+    expected_mount_point: &str,
+) -> Result<(), String> {
+    let mut log = Vec::new();
+    match guard::unmount_target_partition_and_holders(backend, partition_dev, false, &mut log) {
+        Err(ExecuteError::CommandFailed(msg)) => {
+            if msg.contains("cannot be unmounted")
+                && msg.contains(expected_mount_point)
+                && msg.contains("forced unmount attempted and failed")
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "busy-unmount refusal must name '{}' and the unmount attempt: {}",
+                    expected_mount_point, msg
+                ))
+            }
+        }
+        other => Err(format!("expected busy-unmount refusal, got {:?}", other)),
+    }
+}
+
+/// P4-fix: a mounted-target refusal must name the blocking mount point so
+/// the operator knows exactly what to unmount before retrying.
+pub fn mounted_target_names_mount_point(
+    backend: &dyn BlockBackend,
+    target: &crate::guard::ValidatedTarget,
+    expected_mount_point: &str,
+) -> Result<(), String> {
+    match guard::assert_target_not_mounted(backend, target) {
+        Err(ExecuteError::TargetMounted(msg)) => {
+            if msg.contains("mounted/active as") && msg.contains(expected_mount_point) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "mounted-target refusal must name '{}': {}",
+                    expected_mount_point, msg
+                ))
+            }
+        }
+        other => Err(format!(
+            "expected TargetMounted, got {:?}",
+            other.map(|_| ())
+        )),
+    }
+}
+
 /// Busy O_EXCL probe surfaces the historic retry message.
 pub fn exclusive_busy_reported(backend: &dyn BlockBackend, device: &str) -> Result<(), String> {
     match guard::verify_exclusive_access_and_recheck(backend, device, false) {
@@ -558,6 +610,64 @@ mod tests {
             b.with_holder("sdb1", "dm-0")
         };
         busy_unmount_refused(&b, "/dev/sdb1").expect("busy holder must abort");
+    }
+
+    #[test]
+    fn conformance_busy_unmount_names_mount_point() {
+        // P4-fix: the refusal names the holder's mount point and the failed
+        // unmount attempt, not just "cannot be unmounted".
+        let b = fixture()
+            .with_mounts("/dev/dm-0 /mnt/secret_vol ext4 rw 0 0\n")
+            .with_holder("sdb1", "dm-0")
+            .with_exec_result("umount -f /dev/dm-0", "", "target is busy", 1);
+        busy_unmount_names_mount_point(&b, "/dev/sdb1", "/mnt/secret_vol")
+            .expect("busy-unmount refusal must name the mount point");
+    }
+
+    #[test]
+    fn conformance_target_unmount_failure_names_mount_point() {
+        // P4-fix: when the target itself is mounted and the forced unmount
+        // fails, the refusal reports the attempt and the mount point.
+        let b = fixture()
+            .with_mounts("/dev/sdb1 /mnt/data ext4 rw 0 0\n")
+            .with_exec_result(
+                "umount -f /dev/sdb1",
+                "",
+                "umount: /dev/sdb1: target is busy.",
+                1,
+            );
+        let mut log = Vec::new();
+        let err = guard::unmount_target_partition_and_holders(&b, "/dev/sdb1", false, &mut log)
+            .expect_err("a failed forced unmount must refuse");
+        match err {
+            ExecuteError::CommandFailed(msg) => {
+                assert!(
+                    msg.contains("Failed to unmount partition /dev/sdb1"),
+                    "got {}",
+                    msg
+                );
+                assert!(msg.contains("/mnt/data"), "got {}", msg);
+                assert!(msg.contains("forced unmount attempted and failed"), "got {}", msg);
+                assert!(msg.contains("target is busy"), "got {}", msg);
+            }
+            other => panic!("expected CommandFailed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn conformance_mounted_target_names_mount_point() {
+        // P4-fix: a mounted partition refused before format must name the
+        // blocking mount point in the TargetMounted error.
+        let mut b = fixture();
+        let params = partition_params(&b, "/dev/sdb1", 1, 2048, 4096).expect("params");
+        let vt = guard::validate_partition_target(&b, "/dev/sdb1", &params, false, SERIAL)
+            .expect("validated partition target");
+        b.mutate_mountinfo(
+            "25 30 8:0 / / rw,relatime shared:1 - ext4 /dev/sda rw\n\
+             26 30 16:1 / /mnt/data rw,relatime shared:1 - ext4 /dev/sdb1 rw\n",
+        );
+        mounted_target_names_mount_point(&b, &vt, "/mnt/data")
+            .expect("mounted-target refusal must name the mount point");
     }
 
     #[test]
