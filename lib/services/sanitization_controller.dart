@@ -65,6 +65,11 @@ class SanitizationController extends ChangeNotifier {
   String? _restoreFsType;
   String? _restoreLabel;
 
+  /// Phase G: per-partition captured fs/label (keyed by device path) and the
+  /// outcome of each partition's automatic restore attempt.
+  Map<String, FilesystemRestoreSpec> _restoreSpecsByPartition = const {};
+  final List<PartitionRestoreOutcome> _partitionRestoreOutcomes = [];
+
   bool get isFormattingFilesystem => _isFormattingFilesystem;
   String? get filesystemRecreationError => _filesystemRecreationError;
 
@@ -81,17 +86,35 @@ class SanitizationController extends ChangeNotifier {
   /// changed by this.
   bool get autoRestoreFailed => _autoRestoreFailed;
 
-  /// True when the completed job left the drive without a filesystem, so it
-  /// will not appear in the file manager until it is formatted again. False
-  /// when no pre-wipe choice was recorded (legacy/mock jobs), so the Phase-F
-  /// prompt keeps its historic behaviour.
+  /// Phase G: every per-partition restore attempt, in wipe order.
+  List<PartitionRestoreOutcome> get partitionRestoreOutcomes =>
+      List.unmodifiable(_partitionRestoreOutcomes);
+
+  /// Partitions whose filesystem could not be restored (missing/refused
+  /// receipt or a failed format). Each is left blank and may be retried.
+  List<PartitionRestoreOutcome> get failedPartitionRestores =>
+      _partitionRestoreOutcomes.where((o) => o.failed).toList(growable: false);
+
+  /// Partitions that were successfully restored in this job.
+  List<PartitionRestoreOutcome> get successfulPartitionRestores =>
+      _partitionRestoreOutcomes.where((o) => o.success).toList(growable: false);
+
+  bool get hasPartitionRestoreFailures =>
+      _partitionRestoreOutcomes.any((o) => o.failed);
+
+  /// True when the completed job left the drive (or at least one wiped
+  /// partition) without a filesystem, so it will not appear in the file
+  /// manager until it is formatted again. False when no pre-wipe choice was
+  /// recorded (legacy/mock jobs), so the Phase-F prompt keeps its historic
+  /// behaviour.
   bool get driveLeftBlank {
     final job = _currentJob;
     if (job == null || !_restoreChoiceKnown) return false;
     if (!job.wipeCompleted || job.status != JobStatus.completed) return false;
     if (_completedCertificate?.evidence.verifiedPassed != true) return false;
-    if (_filesystemRecreation != null) return false;
-    return !_restoreAfterWipe || _autoRestoreFailed;
+    if (!_restoreAfterWipe) return _filesystemRecreation == null;
+    if (job.isPartitionScope) return hasPartitionRestoreFailures;
+    return _autoRestoreFailed && _filesystemRecreation == null;
   }
 
   /// Why the optional "Recreate filesystem?" prompt is NOT offered after this
@@ -120,6 +143,27 @@ class SanitizationController extends ChangeNotifier {
   bool _hasLiveReceipt(SanitizationJob job) {
     if (job.isPartitionScope) return filesystemRecreationTargets.isNotEmpty;
     final receipt = _verifiedFormatReceipts[_deviceNode(job.device)];
+    return receipt != null && File(receipt).existsSync();
+  }
+
+  /// Phase G: per-partition eligibility for a manual "Restore now".
+  ///
+  /// Unlike [canRecreateFilesystem] this stays true after another partition
+  /// was restored, because every partition has its own one-shot receipt.
+  bool canRecreatePartition(PartitionInfo partition) {
+    final job = _currentJob;
+    return job != null && _canRecreatePartitionTarget(job, partition);
+  }
+
+  bool _canRecreatePartitionTarget(
+    SanitizationJob job,
+    PartitionInfo partition,
+  ) {
+    if (_isFormattingFilesystem) return false;
+    if (!job.isPartitionScope) return false;
+    if (!job.wipeCompleted || job.status != JobStatus.completed) return false;
+    if (_completedCertificate?.evidence.verifiedPassed != true) return false;
+    final receipt = _verifiedFormatReceipts[partition.devicePath];
     return receipt != null && File(receipt).existsSync();
   }
 
@@ -274,6 +318,7 @@ class SanitizationController extends ChangeNotifier {
     _restoreAfterWipe = authorization.restoreFilesystem;
     _restoreFsType = authorization.restoreFsType;
     _restoreLabel = authorization.restoreLabel;
+    _restoreSpecsByPartition = Map.of(authorization.partitionRestoreSpecs);
 
     final sensitivity = intent.mappedSensitivity;
     final disposalPath = intent.mappedDisposalPath;
@@ -794,21 +839,51 @@ class SanitizationController extends ChangeNotifier {
     if (job.isPartitionScope) {
       final targets = filesystemRecreationTargets;
       if (targets.isEmpty) return null;
-      final part = targets.first;
-      final fs =
-          normalizeFilesystemType(part.fsType) ??
-          _formatPreference.fsType ??
-          'vfat';
-      final rawLabel = part.label.sanitized.isNotEmpty
-          ? part.label.sanitized
-          : (_formatPreference.label ?? 'ZT_VOLUME');
-      return FilesystemRecreationDefaults(
-        fsType: fs,
-        label: _safeVolumeLabel(rawLabel),
-        scope: 'partial',
+      return _partitionDefaults(
+        targets.first,
+        spec: _restoreSpecsByPartition[targets.first.devicePath],
       );
     }
+    return _wholeDeviceDefaults(job);
+  }
 
+  /// Phase G: prefill values for restoring one specific wiped partition.
+  /// Used by the per-partition "Restore now" action in the blank-drive notice.
+  FilesystemRecreationDefaults? filesystemRecreationDefaultsFor(
+    PartitionInfo partition,
+  ) {
+    final job = _currentJob;
+    if (job == null || !_canRecreatePartitionTarget(job, partition)) {
+      return null;
+    }
+    return _partitionDefaults(
+      partition,
+      spec: _restoreSpecsByPartition[partition.devicePath],
+    );
+  }
+
+  FilesystemRecreationDefaults _partitionDefaults(
+    PartitionInfo part, {
+    FilesystemRestoreSpec? spec,
+  }) {
+    final fs =
+        spec?.fsType ??
+        normalizeFilesystemType(part.fsType) ??
+        _formatPreference.fsType ??
+        'vfat';
+    final rawLabel = spec != null && spec.label.isNotEmpty
+        ? spec.label
+        : part.label.sanitized.isNotEmpty
+        ? part.label.sanitized
+        : (_formatPreference.label ?? 'ZT_VOLUME');
+    return FilesystemRecreationDefaults(
+      fsType: fs,
+      label: _safeVolumeLabel(rawLabel),
+      scope: 'partial',
+    );
+  }
+
+  FilesystemRecreationDefaults _wholeDeviceDefaults(SanitizationJob job) {
     final fs =
         normalizeFilesystemType(job.device.fsType) ??
         _formatPreference.fsType ??
@@ -849,6 +924,7 @@ class SanitizationController extends ChangeNotifier {
     _isFormattingFilesystem = false;
     _formatPromptDismissed = false;
     _autoRestoreFailed = false;
+    _partitionRestoreOutcomes.clear();
     _verifiedFormatReceipts.clear();
   }
 
@@ -860,6 +936,8 @@ class SanitizationController extends ChangeNotifier {
     _autoRestoreFailed = false;
     _restoreFsType = null;
     _restoreLabel = null;
+    _restoreSpecsByPartition = const {};
+    _partitionRestoreOutcomes.clear();
   }
 
   void _deleteReceiptBestEffort(String path) {
@@ -1003,7 +1081,15 @@ class SanitizationController extends ChangeNotifier {
     PartitionInfo? targetPartition,
     bool dryRun = false,
   }) async {
-    if (!canRecreateFilesystem) {
+    final job = _currentJob;
+    // Phase G: a specific partition stays eligible after another partition
+    // was restored — each partition has its own one-shot receipt. Every other
+    // path keeps the historic single-shot [canRecreateFilesystem] gate.
+    final perPartitionAllowed =
+        job != null &&
+        targetPartition != null &&
+        _canRecreatePartitionTarget(job, targetPartition);
+    if (job == null || (!canRecreateFilesystem && !perPartitionAllowed)) {
       _filesystemRecreationError =
           'A filesystem can only be recreated after a wipe and verification '
           'completed successfully in this job.';
@@ -1011,7 +1097,6 @@ class SanitizationController extends ChangeNotifier {
       return null;
     }
 
-    final job = _currentJob!;
     final fs = fsType.trim().toLowerCase();
     if (!supportedFilesystemTypes.contains(fs)) {
       _filesystemRecreationError =
@@ -1160,8 +1245,12 @@ class SanitizationController extends ChangeNotifier {
         '${partition?.devicePath ?? _deviceNode(job.device)} — '
         'wipe result unchanged.',
       );
-      _verifiedFormatReceipts.clear();
+      // One-shot per target: consume only this target's receipt (other
+      // partitions keep theirs for their own restore).
+      final consumedKey = partition?.devicePath ?? _deviceNode(job.device);
+      _verifiedFormatReceipts.remove(consumedKey);
       _deleteReceiptBestEffort(receiptPath);
+      _recordPartitionRestoreSuccess(partition, record);
       return record;
     } catch (e) {
       _filesystemRecreationError = 'Filesystem recreation failed: $e';
@@ -1174,20 +1263,87 @@ class SanitizationController extends ChangeNotifier {
 
   /// Phase G: run the pre-wipe "Restore as an empty drive" choice after a
   /// verified wipe. Every Phase-F guard stays in force:
-  ///  * the verified-wipe receipt must still exist and bind to this target
-  ///    ([canRecreateFilesystem]);
-  ///  * the receipt is consumed one-shot by a successful format;
+  ///  * the verified-wipe receipt must still exist and bind to each target;
+  ///  * every receipt is consumed one-shot by a successful format;
   ///  * receipt expiry remains the engine's call (an expired/refused receipt
   ///    fails the format, never silently succeeds);
   ///  * a whole-device restore reuses the identity already confirmed in the
   ///    dialog — the operator is never asked for the serial twice;
-  ///  * a restore failure never changes the recorded wipe result.
+  ///  * partition scope restores EVERY wiped partition sequentially, each with
+  ///    its own captured fs/label and receipt; one failure never stops the
+  ///    rest and never changes the recorded wipe result.
   Future<void> _maybeAutoRestoreFilesystem() async {
     if (!_restoreChoiceKnown || !_restoreAfterWipe) return;
 
     final job = _currentJob;
     if (job == null) return;
+    // Never format without a completed wipe and passing verification; the
+    // per-target receipt checks add the remaining proof.
+    if (!job.wipeCompleted || job.status != JobStatus.completed) return;
+    if (_completedCertificate?.evidence.verifiedPassed != true) return;
 
+    if (!job.isPartitionScope) {
+      await _autoRestoreWholeDevice(job);
+      return;
+    }
+
+    final targets = job.targetPartitions.isEmpty
+        ? <PartitionInfo>[job.targetPartition!]
+        : job.targetPartitions;
+    if (targets.isEmpty) return;
+
+    for (final part in targets) {
+      final receipt = _verifiedFormatReceipts[part.devicePath];
+      if (receipt == null || !File(receipt).existsSync()) {
+        const reason =
+            'No verified-wipe receipt for this partition; refusing to format.';
+        _partitionRestoreOutcomes.add(
+          PartitionRestoreOutcome(partition: part, error: reason),
+        );
+        _addLog('RESTORE: ${part.name} skipped — no verified-wipe receipt.');
+        continue;
+      }
+
+      final spec = _restoreSpecsByPartition[part.devicePath];
+      final defaults = _partitionDefaults(part, spec: spec);
+      final fs = spec?.fsType ?? _restoreFsType ?? defaults.fsType;
+      final label = spec?.label ?? _restoreLabel ?? defaults.label;
+      _addLog('RESTORE: recreating $fs on ${part.name}...');
+
+      FilesystemRecreationRecord? record;
+      try {
+        record = await recreateFilesystem(
+          fsType: fs,
+          label: label,
+          targetPartition: part,
+          // The identity was already confirmed once, in the dialog.
+          confirmationToken: job.device.serialNumber,
+        );
+      } catch (e) {
+        _filesystemRecreationError = 'Automatic restore failed: $e';
+        record = null;
+      }
+
+      if (record == null) {
+        _partitionRestoreOutcomes.add(
+          PartitionRestoreOutcome(
+            partition: part,
+            error:
+                _filesystemRecreationError ??
+                'Filesystem recreation failed.',
+          ),
+        );
+        _addLog(
+          'WARNING: Restore of ${part.name} failed: '
+          '${_filesystemRecreationError ?? "unknown error"}',
+        );
+      }
+      // Success is recorded by recreateFilesystem itself.
+    }
+    notifyListeners();
+  }
+
+  Future<void> _autoRestoreWholeDevice(SanitizationJob job) async {
     if (!canRecreateFilesystem) {
       _autoRestoreFailed = true;
       _filesystemRecreationError =
@@ -1227,6 +1383,21 @@ class SanitizationController extends ChangeNotifier {
       _addLog('WARNING: Automatic restore failed: $e');
     }
     notifyListeners();
+  }
+
+  /// Phase G: keep the per-partition outcome list in sync when a partition is
+  /// restored (automatically or through a manual "Restore now" retry).
+  void _recordPartitionRestoreSuccess(
+    PartitionInfo? partition,
+    FilesystemRecreationRecord record,
+  ) {
+    if (partition == null) return;
+    _partitionRestoreOutcomes.removeWhere(
+      (o) => o.partition.devicePath == partition.devicePath,
+    );
+    _partitionRestoreOutcomes.add(
+      PartitionRestoreOutcome(partition: partition, record: record),
+    );
   }
 
   // Getters
@@ -2647,6 +2818,15 @@ class SanitizationController extends ChangeNotifier {
     _autoRestoreFailed = autoRestoreFailed;
     _restoreFsType = fsType;
     _restoreLabel = label;
+    notifyListeners();
+  }
+
+  /// Phase G: seeds per-partition restore outcomes for widget tests.
+  @visibleForTesting
+  void setMockPartitionRestoreOutcomes(List<PartitionRestoreOutcome> outcomes) {
+    _partitionRestoreOutcomes
+      ..clear()
+      ..addAll(outcomes);
     notifyListeners();
   }
 }

@@ -531,12 +531,14 @@ class DriveDetailScreen extends StatelessWidget {
 
                   // Phase F: optional post-wipe filesystem recreation. Shown
                   // only after this job's wipe AND verification succeeded.
+                  // Phase G: a partial multi-partition restore shows BOTH the
+                  // success summary and the per-partition blank notice.
                   if (isJobForThisDevice &&
                       controller.filesystemRecreation != null) ...[
                     _buildFilesystemRecreationRecord(controller),
                     const SizedBox(height: 20),
-                  ] else if (isJobForThisDevice &&
-                      controller.driveLeftBlank) ...[
+                  ],
+                  if (isJobForThisDevice && controller.driveLeftBlank) ...[
                     // Phase G: the operator chose "Leave blank" before the
                     // wipe, or the automatic restore failed. Offer a manual
                     // restore without touching the recorded wipe result.
@@ -939,16 +941,20 @@ class DriveDetailScreen extends StatelessWidget {
     );
   }
 
-  /// Phase G: the drive is blank after a completed, verified wipe because the
-  /// operator chose "Leave blank" or an automatic restore failed. The manual
-  /// restore goes through the existing dialog and never changes the wipe
-  /// result.
+  /// Phase G: the drive (or some of its partitions) is blank after a
+  /// completed, verified wipe because the operator chose "Leave blank" or an
+  /// automatic restore failed. The manual restore goes through the existing
+  /// dialog and never changes the wipe result.
   Widget _buildDriveBlankNotice(
     BuildContext context,
     SanitizationController controller,
   ) {
     final job = controller.currentJob;
-    final wholeDevice = job != null && !job.isPartitionScope;
+    final wholeDevice = job == null || !job.isPartitionScope;
+    final failures = controller.failedPartitionRestores;
+    final successes = controller.successfulPartitionRestores;
+    final partialFailure =
+        !wholeDevice && failures.isNotEmpty && successes.isNotEmpty;
     return Container(
       key: const Key('drive-blank-notice'),
       width: double.infinity,
@@ -961,14 +967,14 @@ class DriveDetailScreen extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Row(
+          Row(
             children: [
-              Icon(Icons.usb_off, color: AppTheme.accentGold, size: 20),
-              SizedBox(width: 8),
+              const Icon(Icons.usb_off, color: AppTheme.accentGold, size: 20),
+              const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  'Drive is blank',
-                  style: TextStyle(
+                  partialFailure ? 'Some partitions are still blank' : 'Drive is blank',
+                  style: const TextStyle(
                     fontWeight: FontWeight.bold,
                     fontSize: 15,
                     color: AppTheme.textPrimary,
@@ -978,10 +984,15 @@ class DriveDetailScreen extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 8),
-          const Text(
-            "Drive is blank and won't appear in your file manager.",
-            key: Key('drive-blank-message'),
-            style: TextStyle(color: AppTheme.textSecondary, fontSize: 12),
+          Text(
+            partialFailure
+                ? "These partitions are blank and won't appear in your file manager."
+                : "Drive is blank and won't appear in your file manager.",
+            key: const Key('drive-blank-message'),
+            style: const TextStyle(
+              color: AppTheme.textSecondary,
+              fontSize: 12,
+            ),
           ),
           if (wholeDevice) ...[
             const SizedBox(height: 6),
@@ -992,23 +1003,92 @@ class DriveDetailScreen extends StatelessWidget {
               style: TextStyle(color: AppTheme.textMuted, fontSize: 11),
             ),
           ],
-          if (controller.filesystemRecreationError != null) ...[
-            const SizedBox(height: 6),
-            Text(
-              controller.filesystemRecreationError!,
-              key: const Key('drive-blank-error'),
-              style: const TextStyle(color: AppTheme.accentRose, fontSize: 11),
+          if (failures.isEmpty) ...[
+            if (controller.filesystemRecreationError != null) ...[
+              const SizedBox(height: 6),
+              Text(
+                controller.filesystemRecreationError!,
+                key: const Key('drive-blank-error'),
+                style: const TextStyle(
+                  color: AppTheme.accentRose,
+                  fontSize: 11,
+                ),
+              ),
+            ],
+            const SizedBox(height: 10),
+            ElevatedButton.icon(
+              key: const Key('drive-blank-restore-now'),
+              onPressed: controller.canRecreateFilesystem
+                  ? () => FilesystemRecreationDialog.show(context, controller)
+                  : null,
+              icon: const Icon(Icons.settings_backup_restore, size: 16),
+              label: const Text('Restore now', style: TextStyle(fontSize: 12)),
             ),
+          ] else ...[
+            // One failed partition per row: each keeps its own capture and
+            // receipt, so each gets its own Restore now action.
+            for (final outcome in failures) ...[
+              const SizedBox(height: 10),
+              Container(
+                key: Key(
+                  'drive-blank-partition-${outcome.partition.devicePath}',
+                ),
+                width: double.infinity,
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: AppTheme.surfaceCard,
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: AppTheme.surfaceBorder),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      outcome.partition.name,
+                      style: const TextStyle(
+                        color: AppTheme.textPrimary,
+                        fontWeight: FontWeight.w600,
+                        fontSize: 12,
+                      ),
+                    ),
+                    if (outcome.error != null) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        outcome.error!,
+                        style: const TextStyle(
+                          color: AppTheme.accentRose,
+                          fontSize: 11,
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 6),
+                    ElevatedButton.icon(
+                      key: Key(
+                        'drive-blank-restore-${outcome.partition.devicePath}',
+                      ),
+                      onPressed: controller.canRecreatePartition(
+                        outcome.partition,
+                      )
+                          ? () => FilesystemRecreationDialog.show(
+                              context,
+                              controller,
+                              targetPartition: outcome.partition,
+                            )
+                          : null,
+                      icon: const Icon(
+                        Icons.settings_backup_restore,
+                        size: 16,
+                      ),
+                      label: const Text(
+                        'Restore now',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ],
-          const SizedBox(height: 10),
-          ElevatedButton.icon(
-            key: const Key('drive-blank-restore-now'),
-            onPressed: controller.canRecreateFilesystem
-                ? () => FilesystemRecreationDialog.show(context, controller)
-                : null,
-            icon: const Icon(Icons.settings_backup_restore, size: 16),
-            label: const Text('Restore now', style: TextStyle(fontSize: 12)),
-          ),
         ],
       ),
     );
@@ -1016,6 +1096,58 @@ class DriveDetailScreen extends StatelessWidget {
 
   Widget _buildFilesystemRecreationRecord(SanitizationController controller) {
     final record = controller.filesystemRecreation!;
+    final successes = controller.successfulPartitionRestores;
+    // Phase G: a multi-partition restore produces one record per partition;
+    // summarise all of them instead of showing only the last one.
+    if (successes.length > 1) {
+      return Container(
+        key: const Key('filesystem-recreation-records'),
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          color: AppTheme.simpleSuccess.withValues(alpha: 0.08),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: AppTheme.simpleSuccess.withValues(alpha: 0.35),
+          ),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(
+                  Icons.check_circle_outline,
+                  color: AppTheme.simpleSuccess,
+                  size: 18,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    'Filesystems recreated on ${successes.length} partitions',
+                    style: const TextStyle(
+                      color: AppTheme.simpleSuccess,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            for (final outcome in successes)
+              Text(
+                '${outcome.partition.name}: '
+                '${outcome.record!.fsType.toUpperCase()} • '
+                'label ${outcome.record!.label.isEmpty ? '(none)' : outcome.record!.label}',
+                style: const TextStyle(
+                  color: AppTheme.textSecondary,
+                  fontSize: 12,
+                ),
+              ),
+          ],
+        ),
+      );
+    }
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(

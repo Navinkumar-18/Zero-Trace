@@ -497,6 +497,29 @@ void main() {
       partitionTableType: 'gpt',
     );
 
+    const photosPartition = PartitionInfo(
+      partitionNumber: 2,
+      name: 'sdb2',
+      devicePath: '/dev/sdb2',
+      startSector: 1002048,
+      sizeSectors: 1000000,
+      sizeBytes: 512000000,
+      label: UntrustedText('PHOTOS'),
+      fsType: 'vfat',
+    );
+
+    const twoPartitionDevice = DeviceProfile(
+      id: 'sdb',
+      name: 'SanDisk Cruzer Blade',
+      serialNumber: '4C530000151121111494',
+      mediaType: MediaType.usbFlash,
+      busType: 'USB',
+      capacityBytes: 16000000000,
+      isRemovable: true,
+      partitions: [dataPartition, photosPartition],
+      partitionTableType: 'gpt',
+    );
+
     Future<Future<ConfirmWipeResult?> Function()> pumpHost(
       WidgetTester tester,
       SanitizationController controller,
@@ -558,6 +581,35 @@ void main() {
       expect(result!.authorization.restoreFilesystem, isTrue);
       expect(result.authorization.restoreFsType, 'ext4');
       expect(result.authorization.restoreLabel, 'DATA');
+    });
+
+    testWidgets('captures a separate fs/label for every selected partition', (
+      tester,
+    ) async {
+      final controller = SanitizationController(enableAutoPolling: false);
+      addTearDown(controller.dispose);
+      controller.setMockDevices([twoPartitionDevice]);
+      controller.togglePartitionSelection(dataPartition);
+      controller.togglePartitionSelection(photosPartition);
+
+      final readResult = await pumpHost(tester, controller, twoPartitionDevice);
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('open dialog'));
+      await tester.pumpAndSettle();
+
+      await tester.enterText(find.byType(TextField), '1494');
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(ElevatedButton, 'SECURE WIPE'));
+      await tester.pumpAndSettle();
+
+      final result = await readResult();
+      expect(result, isNotNull);
+      final specs = result!.authorization.partitionRestoreSpecs;
+      expect(specs, hasLength(2));
+      expect(specs['/dev/sdb1']!.fsType, 'ext4');
+      expect(specs['/dev/sdb1']!.label, 'DATA');
+      expect(specs['/dev/sdb2']!.fsType, 'vfat');
+      expect(specs['/dev/sdb2']!.label, 'PHOTOS');
     });
 
     testWidgets('"Leave blank" is carried on the authorization', (tester) async {

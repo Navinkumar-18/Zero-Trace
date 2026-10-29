@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../models/device_profile.dart';
+import '../models/filesystem_recreation.dart';
 import '../models/partition_info.dart';
 import '../models/sanitization_job.dart';
 import '../models/sanitization_support_level.dart';
@@ -38,6 +39,11 @@ class WipeAuthorization {
   /// preference. The engine sanitizes it again before formatting.
   final String? restoreLabel;
 
+  /// Phase G: per-partition filesystem/label capture, keyed by the partition's
+  /// device path. Every selected partition keeps its own original fs/label so
+  /// a multi-partition restore never reuses the first partition's values.
+  final Map<String, FilesystemRestoreSpec> partitionRestoreSpecs;
+
   WipeAuthorization._({
     required this.authorizedAt,
     required this.deviceSerial,
@@ -47,6 +53,7 @@ class WipeAuthorization {
     this.restoreFilesystem = false,
     this.restoreFsType,
     this.restoreLabel,
+    this.partitionRestoreSpecs = const {},
   });
 
   /// Factory for testing fixtures only.
@@ -59,6 +66,7 @@ class WipeAuthorization {
     bool restoreFilesystem = false,
     String? restoreFsType,
     String? restoreLabel,
+    Map<String, FilesystemRestoreSpec> partitionRestoreSpecs = const {},
   }) {
     return WipeAuthorization._(
       authorizedAt: DateTime.now(),
@@ -69,6 +77,7 @@ class WipeAuthorization {
       restoreFilesystem: restoreFilesystem,
       restoreFsType: restoreFsType,
       restoreLabel: restoreLabel,
+      partitionRestoreSpecs: partitionRestoreSpecs,
     );
   }
 }
@@ -227,6 +236,28 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
       controller.formatPreference,
       wholeDevice: selectedParts.isEmpty,
     );
+    // Phase G: every selected partition keeps its own captured fs/label; a
+    // multi-partition restore must never reuse the first partition's values.
+    final partitionRestoreSpecs = <String, FilesystemRestoreSpec>{
+      for (final p in selectedParts)
+        p.devicePath: FilesystemRestoreSpec(
+          fsType:
+              normalizeFilesystemType(p.fsType) ??
+              controller.formatPreference.fsType ??
+              'vfat',
+          label: _captureRestoreLabel(
+            p,
+            controller.formatPreference,
+            wholeDevice: false,
+          ),
+        ),
+    };
+    final restoreSummary = selectedParts.length > 1
+        ? 'Recreates a filesystem on each of the ${selectedParts.length} '
+              'selected partitions after the wipe is verified.'
+        : 'Recreates a ${restoreFsType.toUpperCase()} filesystem'
+              "${restoreLabel.isNotEmpty ? ' labelled $restoreLabel' : ''} "
+              'after the wipe is verified.';
 
     return Dialog(
       backgroundColor: AppTheme.surfaceDark,
@@ -512,6 +543,7 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                             restoreFilesystem: _restoreFilesystem,
                             restoreFsType: restoreFsType,
                             restoreLabel: restoreLabel,
+                            partitionRestoreSpecs: partitionRestoreSpecs,
                           );
                           Navigator.of(context).pop(ConfirmWipeResult(
                             intent: _intent,
@@ -566,9 +598,7 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                         ),
                       ),
                       subtitle: Text(
-                        'Recreates a ${restoreFsType.toUpperCase()} filesystem'
-                        '${restoreLabel.isNotEmpty ? ' labelled $restoreLabel' : ''} '
-                        'after the wipe is verified.',
+                        restoreSummary,
                         style: const TextStyle(
                           fontSize: 11,
                           color: AppTheme.textMuted,
@@ -695,6 +725,7 @@ class _SimpleConfirmDialogState extends State<SimpleConfirmDialog> {
                                 restoreFilesystem: _restoreFilesystem,
                                 restoreFsType: restoreFsType,
                                 restoreLabel: restoreLabel,
+                                partitionRestoreSpecs: partitionRestoreSpecs,
                               );
                               Navigator.of(context).pop(ConfirmWipeResult(
                                 intent: _intent,

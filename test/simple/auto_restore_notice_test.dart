@@ -9,6 +9,7 @@ import 'package:provider/provider.dart';
 import 'package:zero_trace/core/app_paths.dart';
 import 'package:zero_trace/models/certificate.dart';
 import 'package:zero_trace/models/device_profile.dart';
+import 'package:zero_trace/models/filesystem_recreation.dart';
 import 'package:zero_trace/models/partition_info.dart';
 import 'package:zero_trace/models/sanitization_job.dart';
 import 'package:zero_trace/models/untrusted_text.dart';
@@ -49,6 +50,50 @@ void main() {
     partitions: [wipedPartition],
     partitionTableType: 'gpt',
   );
+
+  const secondPartition = PartitionInfo(
+    partitionNumber: 2,
+    name: 'sdb2',
+    devicePath: '/dev/sdb2',
+    startSector: 2048000,
+    sizeSectors: 2048000,
+    sizeBytes: 1048576000,
+    label: UntrustedText('PHOTOS'),
+    fsType: 'vfat',
+  );
+
+  const thirdPartition = PartitionInfo(
+    partitionNumber: 3,
+    name: 'sdb3',
+    devicePath: '/dev/sdb3',
+    startSector: 4096000,
+    sizeSectors: 2048000,
+    sizeBytes: 1048576000,
+    label: UntrustedText('ARCHIVE'),
+    fsType: 'exfat',
+  );
+
+  const multiPartitionDevice = DeviceProfile(
+    id: 'sdb',
+    name: 'SanDisk Cruzer Blade',
+    serialNumber: '4C530000151121111494',
+    mediaType: MediaType.usbFlash,
+    busType: 'USB',
+    capacityBytes: 16000000000,
+    isRemovable: true,
+    partitions: [wipedPartition, secondPartition, thirdPartition],
+    partitionTableType: 'gpt',
+  );
+
+  FilesystemRecreationRecord formatRecord(String fs, String label) =>
+      FilesystemRecreationRecord(
+        tool: 'mkfs.$fs',
+        fsType: fs,
+        label: label,
+        time: '2026-01-01T00:00:00Z',
+        sanitizationVerifiedBeforeFormat: true,
+        scope: 'partial',
+      );
 
   SanitizationJob completedJob(DeviceProfile device, {PartitionInfo? part}) =>
       SanitizationJob(
@@ -224,5 +269,158 @@ void main() {
     expect(controller.driveLeftBlank, isFalse);
     expect(find.byKey(const Key('drive-blank-notice')), findsNothing);
     expect(find.text('Recreate filesystem?'), findsOneWidget);
+  });
+
+  Future<SanitizationController> pumpMultiPartitionFailure(
+    WidgetTester tester, {
+    required Set<String> partitionsWithReceipts,
+  }) async {
+    tester.view.physicalSize = const Size(1920, 1080);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final dir = Directory.systemTemp.createTempSync('zt_blank_parts_');
+    addTearDown(() => dir.deleteSync(recursive: true));
+
+    final controller = SanitizationController(
+      appPaths: AppPaths(
+        baseDir: dir,
+        checkpointDir: Directory('${dir.path}/checkpoints'),
+      ),
+      enableAutoPolling: false,
+      deferInitialDiscovery: true,
+    );
+    addTearDown(controller.dispose);
+
+    controller.setMockDevices([multiPartitionDevice]);
+    controller.isSimulated = true;
+
+    final job = SanitizationJob(
+      jobId: 'JOB-DRIVE-BLANK-PARTS',
+      device: multiPartitionDevice,
+      dataSensitivity: DataSensitivity.confidential,
+      deviceCondition: DeviceCondition.functional,
+      disposalPath: DisposalPath.recycling,
+      riskScore: 50,
+      targetCategory: NistCategory.clear,
+      recommendedMethod: SanitizationMethod.singlePassOverwrite,
+      standardReference: 'NIST SP 800-88 Rev. 1 (Clear)',
+      explanationText: 'Wipe completed',
+      targetPartition: wipedPartition,
+      targetPartitions: const [
+        wipedPartition,
+        secondPartition,
+        thirdPartition,
+      ],
+      status: JobStatus.completed,
+      progress: 1.0,
+      currentStageDescription: 'Sanitization & Audit Verification Complete.',
+      wipeCompleted: true,
+    );
+    controller.setMockJob(job);
+    controller.setMockCompletedCertificate(passedCertificate(job));
+
+    controller.setMockVerifiedFormatReceipts({
+      for (final path in partitionsWithReceipts)
+        path: (File('${dir.path}/${path.split('/').last}_receipt.json')
+              ..writeAsStringSync('{"canonical_path": "$path"}'))
+            .path,
+    });
+    controller.setMockRestoreChoice(restoreFilesystem: true);
+    controller.setMockPartitionRestoreOutcomes([
+      PartitionRestoreOutcome(
+        partition: wipedPartition,
+        record: formatRecord('ext4', 'DATA'),
+      ),
+      PartitionRestoreOutcome(
+        partition: secondPartition,
+        error: partitionsWithReceipts.contains(secondPartition.devicePath)
+            ? 'Filesystem recreation failed: engine refused receipt'
+            : 'No verified-wipe receipt for this partition; refusing to format.',
+      ),
+      PartitionRestoreOutcome(
+        partition: thirdPartition,
+        record: formatRecord('exfat', 'ARCHIVE'),
+      ),
+    ]);
+
+    await tester.pumpWidget(subject(controller));
+    await tester.pumpAndSettle();
+    return controller;
+  }
+
+  testWidgets('a partition without a receipt is the only one listed as blank, '
+      'and its Restore now action is disabled', (tester) async {
+    final controller = await pumpMultiPartitionFailure(
+      tester,
+      partitionsWithReceipts: {
+        wipedPartition.devicePath,
+        thirdPartition.devicePath,
+      },
+    );
+
+    expect(controller.driveLeftBlank, isTrue);
+    expect(find.byKey(const Key('drive-blank-notice')), findsOneWidget);
+    expect(find.text('Some partitions are still blank'), findsOneWidget);
+    expect(
+      find.text(
+        "These partitions are blank and won't appear in your file manager.",
+      ),
+      findsOneWidget,
+    );
+
+    // Only the failed partition gets a row; the two restored ones do not.
+    expect(
+      find.byKey(const Key('drive-blank-partition-/dev/sdb2')),
+      findsOneWidget,
+    );
+    expect(
+      find.byKey(const Key('drive-blank-partition-/dev/sdb1')),
+      findsNothing,
+    );
+    expect(
+      find.byKey(const Key('drive-blank-partition-/dev/sdb3')),
+      findsNothing,
+    );
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('drive-blank-partition-/dev/sdb2')),
+        matching: find.text('sdb2'),
+      ),
+      findsOneWidget,
+    );
+
+    // Without a receipt the engine cannot honor a format: the per-partition
+    // action is shown but cannot be tapped.
+    final button = tester.widget<ElevatedButton>(
+      find.byKey(const Key('drive-blank-restore-/dev/sdb2')),
+    );
+    expect(button.onPressed, isNull);
+  });
+
+  testWidgets('a partition whose format was refused keeps an enabled '
+      'per-partition Restore now action', (tester) async {
+    await pumpMultiPartitionFailure(
+      tester,
+      partitionsWithReceipts: {
+        wipedPartition.devicePath,
+        secondPartition.devicePath,
+        thirdPartition.devicePath,
+      },
+    );
+
+    final button = tester.widget<ElevatedButton>(
+      find.byKey(const Key('drive-blank-restore-/dev/sdb2')),
+    );
+    expect(button.onPressed, isNotNull);
+
+    await tester.tap(find.byKey(const Key('drive-blank-restore-/dev/sdb2')));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(FilesystemRecreationDialog), findsOneWidget);
+    expect(find.text('Target: sdb2 (the wiped partition).'), findsOneWidget);
   });
 }

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../models/filesystem_recreation.dart';
+import '../models/partition_info.dart';
 import '../services/filesystem_recreation_preference.dart';
 import '../services/sanitization_controller.dart';
 import '../widgets/theme.dart';
@@ -14,17 +15,25 @@ class FilesystemRecreationDialog extends StatefulWidget {
   final SanitizationController controller;
   final FilesystemRecreationDefaults defaults;
 
+  /// Phase G: when set, the restore targets this exact wiped partition
+  /// (per-partition "Restore now" in the blank-drive notice).
+  final PartitionInfo? targetPartition;
+
   const FilesystemRecreationDialog({
     super.key,
     required this.controller,
     required this.defaults,
+    this.targetPartition,
   });
 
   static Future<void> show(
     BuildContext context,
-    SanitizationController controller,
-  ) {
-    final defaults = controller.filesystemRecreationDefaults;
+    SanitizationController controller, {
+    PartitionInfo? targetPartition,
+  }) {
+    final defaults = targetPartition == null
+        ? controller.filesystemRecreationDefaults
+        : controller.filesystemRecreationDefaultsFor(targetPartition);
     if (defaults == null) return Future<void>.value();
     return showDialog<void>(
       context: context,
@@ -32,6 +41,7 @@ class FilesystemRecreationDialog extends StatefulWidget {
       builder: (ctx) => FilesystemRecreationDialog(
         controller: controller,
         defaults: defaults,
+        targetPartition: targetPartition,
       ),
     );
   }
@@ -78,6 +88,7 @@ class _FilesystemRecreationDialogState
       label: _labelController.text,
       confirmationToken: _confirmationController.text,
       tableType: widget.defaults.tableType,
+      targetPartition: widget.targetPartition,
     );
 
     if (!mounted) return;
@@ -123,6 +134,8 @@ class _FilesystemRecreationDialogState
                   ? 'Target: whole device — a new ${widget.defaults.tableType?.toUpperCase() ?? 'GPT'} '
                         'table with ONE partition will be created. The original '
                         'partition layout is not restored.'
+                  : widget.targetPartition != null
+                  ? 'Target: ${widget.targetPartition!.name} (the wiped partition).'
                   : 'Target: the wiped partition.',
               style: const TextStyle(
                 color: AppTheme.textSecondary,
