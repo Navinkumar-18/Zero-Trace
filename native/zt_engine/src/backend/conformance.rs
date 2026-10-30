@@ -284,7 +284,7 @@ pub fn busy_unmount_names_mount_point(
         Err(ExecuteError::CommandFailed(msg)) => {
             if msg.contains("cannot be unmounted")
                 && msg.contains(expected_mount_point)
-                && msg.contains("forced unmount attempted and failed")
+                && msg.contains("umount attempted and failed")
             {
                 Ok(())
             } else {
@@ -602,7 +602,7 @@ mod tests {
     fn conformance_busy_unmount_refused() {
         let b = fixture()
             .with_mounts("/dev/dm-0 /mnt/data ext4 rw 0 0\n")
-            .with_exec_result("umount -f /dev/dm-0", "", "target is busy", 1);
+            .with_exec_result("umount /dev/dm-0", "", "target is busy", 1);
         // holders: sdb1 → dm-0 (registered via mountinfo? explicit holder map)
         let b = {
             // MockBackend builders don't expose holders yet — register via
@@ -619,7 +619,7 @@ mod tests {
         let b = fixture()
             .with_mounts("/dev/dm-0 /mnt/secret_vol ext4 rw 0 0\n")
             .with_holder("sdb1", "dm-0")
-            .with_exec_result("umount -f /dev/dm-0", "", "target is busy", 1);
+            .with_exec_result("umount /dev/dm-0", "", "target is busy", 1);
         busy_unmount_names_mount_point(&b, "/dev/sdb1", "/mnt/secret_vol")
             .expect("busy-unmount refusal must name the mount point");
     }
@@ -631,14 +631,14 @@ mod tests {
         let b = fixture()
             .with_mounts("/dev/sdb1 /mnt/data ext4 rw 0 0\n")
             .with_exec_result(
-                "umount -f /dev/sdb1",
+                "umount /dev/sdb1",
                 "",
                 "umount: /dev/sdb1: target is busy.",
                 1,
             );
         let mut log = Vec::new();
         let err = guard::unmount_target_partition_and_holders(&b, "/dev/sdb1", false, &mut log)
-            .expect_err("a failed forced unmount must refuse");
+            .expect_err("a failed unmount must refuse");
         match err {
             ExecuteError::CommandFailed(msg) => {
                 assert!(
@@ -647,11 +647,29 @@ mod tests {
                     msg
                 );
                 assert!(msg.contains("/mnt/data"), "got {}", msg);
-                assert!(msg.contains("forced unmount attempted and failed"), "got {}", msg);
+                assert!(msg.contains("umount attempted and failed"), "got {}", msg);
                 assert!(msg.contains("target is busy"), "got {}", msg);
             }
             other => panic!("expected CommandFailed, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn conformance_unmounted_target_with_no_mounted_holders_makes_zero_umount_calls() {
+        let b = fixture();
+        let mut log = Vec::new();
+        let (stdout, stderr) =
+            guard::unmount_target_partition_and_holders(&b, "/dev/sdb1", false, &mut log)
+                .expect("unmounted target with no holders must succeed");
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+        assert!(
+            b.executed_commands()
+                .iter()
+                .all(|cmd| !cmd.starts_with("umount")),
+            "must make zero umount calls, executed: {:?}",
+            b.executed_commands()
+        );
     }
 
     #[test]

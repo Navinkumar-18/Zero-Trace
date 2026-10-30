@@ -286,6 +286,11 @@ class CertificateService {
     // Phase F: optional format-step record (present only when the operator
     // recreated a filesystem after the verified wipe).
     FilesystemRecreationRecord? filesystemRecreation,
+    bool? wipeCompleted,
+    String? failedStage,
+    String? engineStderr,
+    String? targetMountState,
+    String? siblingMountState,
   }) {
     final DateTime now = DateTime.now();
     final String certId =
@@ -450,6 +455,52 @@ class CertificateService {
       platform: issuingBackend.platformName,
       backend: issuingBackend.backendId,
       filesystemRecreation: filesystemRecreation,
+      wipeCompleted: wipeCompleted ?? job.wipeCompleted,
+      failedStage: failedStage ??
+          (resultStr == 'FAILED'
+              ? (filesystemRecreation != null
+                    ? 'format'
+                    : ((wipeCompleted ?? job.wipeCompleted) && !evidence.verifiedPassed
+                          ? 'verify'
+                          : ((engineStderr ?? '').toLowerCase().contains('table re-read') ||
+                                  (engineStderr ?? '').toLowerCase().contains('partition table re-read') ||
+                                  (engineStderr ?? '').toLowerCase().contains('blkrrpart')
+                              ? 'table re-read'
+                              : ((engineStderr ?? '').toLowerCase().contains('umount') ||
+                                      (engineStderr ?? '').toLowerCase().contains('unmount') ||
+                                      job.status == JobStatus.unmounting
+                                  ? 'unmount'
+                                  : (job.logs.any((l) =>
+                                          l.toLowerCase().contains('writing to media') ||
+                                          l.toLowerCase().contains('pass 1 of') ||
+                                          l.toLowerCase().contains('progress: [overwrite]'))
+                                      ? 'overwrite'
+                                      : 'guard')))))
+              : null),
+      engineStderr: engineStderr,
+      targetMountState: targetMountState ??
+          (resultStr == 'FAILED'
+              ? (job.isPartitionScope && job.targetPartition != null
+                    ? '${job.targetPartition!.devicePath}: ${job.targetPartition!.isMounted ? "mounted at ${job.targetPartition!.mountPoint}" : "unmounted"}'
+                    : '${job.device.name}: ${(job.device.mountPoint != null && job.device.mountPoint!.isNotEmpty) ? "mounted at ${job.device.mountPoint}" : "unmounted"}')
+              : null),
+      siblingMountState: siblingMountState ??
+          (resultStr == 'FAILED'
+              ? (job.isPartitionScope
+                    ? (job.device.partitions
+                              .where((p) => p.devicePath != job.targetPartition?.devicePath)
+                              .map((p) =>
+                                  '${p.name}: ${p.isMounted ? "mounted at ${p.mountPoint}" : "unmounted"}')
+                              .join(', ')
+                              .isNotEmpty
+                          ? job.device.partitions
+                              .where((p) => p.devicePath != job.targetPartition?.devicePath)
+                              .map((p) =>
+                                  '${p.name}: ${p.isMounted ? "mounted at ${p.mountPoint}" : "unmounted"}')
+                              .join(', ')
+                          : 'None')
+                    : 'None')
+              : null),
     );
   }
 

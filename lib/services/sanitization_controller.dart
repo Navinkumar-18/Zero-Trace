@@ -450,6 +450,7 @@ class SanitizationController extends ChangeNotifier {
     required String devicePath,
     required String fingerprintHash,
     List<PartitionAuditOutcome>? outcomes,
+    String? rawStderr,
   }) async {
     try {
       // A failed run has not verified anything: keep the failure report honest
@@ -470,6 +471,7 @@ class SanitizationController extends ChangeNotifier {
         evidence: evidence,
         executionMode: simulated ? 'simulated' : 'real',
         bootEnvironment: LiveBootDetector.detect().name,
+        engineStderr: rawStderr,
       );
       _completedCertificate = report;
       final (_, reportSha) = await _auditLogService.saveFailureReport(report);
@@ -2090,6 +2092,7 @@ class SanitizationController extends ChangeNotifier {
                         : '/dev/null'),
               fingerprintHash: 'EXECUTION_FAILED',
               outcomes: outcomes,
+              rawStderr: report.stderr,
             );
             await _jobStateFile.clearActiveJob();
             notifyListeners();

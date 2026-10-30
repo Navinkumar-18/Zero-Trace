@@ -1170,3 +1170,71 @@ fn test_verify_cli_scoped_with_total_device_size_flag() {
         "total_device_bytes must equal total device size"
     );
 }
+
+// =========================================================================
+// 16. Repro (before-phase-u): partition-scope wipe of sdb4 completes its
+//     overwrite while a sibling partition is mounted; the kernel partition-
+//     table re-read then fails (EBUSY). The typed error must surface (CLI
+//     exit 3 via main_linux's generic engine-error exit).
+// =========================================================================
+
+#[tokio::test]
+async fn test_repro_sdb4_wipe_reread_ebusy_after_sibling_mount() {
+    let backend = zt_engine::backend::mock::MockBackend::new()
+        .with_id("repro-mock")
+        .with_mountinfo("25 30 8:0 / / rw,relatime shared:1 - ext4 /dev/sda rw\n")
+        .with_mounts("/dev/sdb1 /mnt/sibling_usb ext4 rw,relatime 0 0\n")
+        .add_block("sdb", 16, 0)
+        .add_partition("sdb1", "sdb", 1, 2048, 4096, 16, 1)
+        .add_partition("sdb4", "sdb", 4, 8192, 4096, 16, 4)
+        .with_device_size(2 * 1024 * 1024)
+        .with_reread_error(
+            "mock: kernel partition-table re-read returned EBUSY while sibling partitions are mounted",
+        );
+
+    let tmp = TempDir::new().unwrap();
+    let ctx = FsContext {
+        proc_root: tmp.path().join("proc"),
+        sys_root: tmp.path().join("sys"),
+        dev_root: tmp.path().join("dev"),
+    };
+
+    let params = zt_engine::backend::conformance::partition_params(
+        &backend,
+        "/dev/sdb4",
+        4,
+        8192,
+        4096,
+    )
+    .expect("partition params for /dev/sdb4");
+    assert_eq!(params.expected_partition_num, 4);
+
+    let (tx, _rx) = mpsc::channel(16);
+    let res = software_overwrite_partition_with(
+        &backend,
+        "/dev/sdb4",
+        1,
+        OverwritePattern::Zeros,
+        "SER123",
+        "SER123",
+        &params,
+        false,
+        tx,
+        &ctx,
+    )
+    .await;
+
+    // Phase-u amendment: the partition-scope wipe itself completed (the
+    // overwrite finished while the sibling was mounted); the failed
+    // (EBUSY) kernel table re-read must now be recorded as a warning in the
+    // report instead of failing the wipe with exit 3.
+    let report = res.expect("partition wipe must complete; failed re-read is a warning");
+    assert!(report.success);
+    assert!(
+        report.command_log.iter().any(|l| l.contains(
+            "kernel partition-table re-read failed after wipe"
+        )),
+        "the failed re-read must be recorded as a warning, command_log: {:?}",
+        report.command_log
+    );
+}

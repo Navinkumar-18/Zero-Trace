@@ -59,7 +59,7 @@ void main() {
       const raw =
           'Error executing sanitize: CommandFailed("Target partition '
           "/dev/sdb1 is held by active holder '/dev/dm-0' which cannot be "
-          'unmounted (mounted at /mnt/secret_vol; forced unmount attempted '
+          'unmounted (mounted at /mnt/secret_vol; umount attempted '
           'and failed: target is busy)")';
       final message = describeEngineFailure(3, raw);
 

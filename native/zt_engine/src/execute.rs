@@ -982,6 +982,35 @@ fn run_format_tool(
     Ok((out, err, code, program))
 }
 
+/// Phase-u amendment: after a **successful** format, ask udev to settle and
+/// emit a change event for the formatted partition node only. The engine never
+/// mounts from the flow (the operator's volume appears via the kernel); a
+/// failing auxiliary udev step is recorded as a warning, never as a format
+/// failure — the format itself already succeeded.
+fn run_udevadm_after_format(
+    backend: &dyn BlockBackend,
+    node: &str,
+    command_log: &mut Vec<String>,
+) -> Result<(), ExecuteError> {
+    if let Err(e) = backend.exec("udevadm", &["settle"]) {
+        command_log.push(format!("[format] warning: udevadm settle failed: {}", e));
+    } else {
+        command_log.push("[format] udevadm settle complete".to_string());
+    }
+    if let Err(e) = backend.exec("udevadm", &["trigger", "--action=change", node]) {
+        command_log.push(format!(
+            "[format] warning: udevadm trigger --action=change {} failed: {}",
+            node, e
+        ));
+    } else {
+        command_log.push(format!(
+            "[format] udevadm trigger --action=change {} complete",
+            node
+        ));
+    }
+    Ok(())
+}
+
 /// F1: recreate a filesystem on an already wiped+verified target.
 ///
 /// The target is re-validated immediately before the tool runs; partition
@@ -1029,6 +1058,12 @@ pub fn recreate_filesystem_with(
                 e
             )),
         }
+
+        // Phase-u amendment: after a successful format, settle udev and emit a
+        // change event for the formatted partition node only. Never mount from
+        // the engine; surface a UI hint that the volume may take a few seconds
+        // to appear.
+        run_udevadm_after_format(backend, &node, &mut command_log)?;
     }
 
     Ok(FilesystemRecreationReport {
@@ -1333,6 +1368,8 @@ pub fn recreate_whole_device_with(
     let (stdout, stderr, code, tool) =
         run_format_tool(backend, target, &node, fs, label, false, &mut command_log)?;
 
+    run_udevadm_after_format(backend, &node, &mut command_log)?;
+
     Ok(FilesystemRecreationReport {
         success: true,
         tool,
@@ -1354,6 +1391,13 @@ pub fn recreate_whole_device_with(
 
 /// F2: after a partition wipe, assert the fingerprint is unchanged and ask
 /// the kernel to re-read the table so the partition appears again.
+///
+/// Phase-u amendment: the fingerprint assertion stays FATAL (any drift means
+/// the wipe did not do what it claimed), but the kernel partition-table re-read
+/// is best-effort — after a partition-scope wipe the table is unchanged, so a
+/// re-read failure (e.g. EBUSY while a sibling partition is still mounted) is
+/// recorded as a warning in the report instead of failing the wipe. This
+/// mirrors the format flow, which already treats the re-read as advisory.
 fn finish_partition_wipe(
     backend: &dyn BlockBackend,
     target: &ValidatedTarget,
@@ -1369,31 +1413,41 @@ fn finish_partition_wipe(
         "[guard] partition table fingerprint unchanged after wipe: {}",
         unchanged
     ));
-    backend.reread_partition_table(target).map_err(|e| {
-        ExecuteError::FilesystemRecreationFailed(format!(
-            "partition table re-read failed after wipe: {}",
+    // Best-effort kernel re-read after a partition-scope wipe: a failure is a
+    // warning recorded in the report (the table itself was never touched), not
+    // a wipe failure — the operator retries the re-read after the blockers go.
+    match backend.reread_partition_table(target) {
+        Ok(()) => report
+            .command_log
+            .push("[guard] kernel partition-table re-read complete".to_string()),
+        Err(e) => report.command_log.push(format!(
+            "[guard] warning: kernel partition-table re-read failed after wipe: {}",
             e
-        ))
-    })?;
-    report
-        .command_log
-        .push("[guard] kernel partition-table re-read complete".to_string());
+        )),
+    }
     Ok(())
 }
 
 /// P2: unmount every mounted partition backing the validated target.
 ///
+/// P2: unmount every mounted partition backing the validated target.
+///
 /// Sources come from the backend's mount facts (so fixture/mock backends are
 /// exercised identically) and `umount` runs with an argv list — the historic
 /// `sh -c "umount -f <device>*"` glob pass is gone: no shell interpolation of
-/// a device path, and no command that can touch a node outside the validated
-/// target's mount set.
+/// a device path, no forced/lazy/recursive flag, plain `umount <mount>` only,
+/// and no command that can touch a node outside the validated target's mount
+/// set.
+///
+/// Phase-u amendment: failures are NOT ignored. The typed error names the
+/// mount point that could not be unmounted and the `umount` stderr, so the
+/// caller stops before the post-unmount exclusive-access probe (EBUSY).
 fn unmount_target_if_mounted(
     backend: &dyn BlockBackend,
     target: &ValidatedTarget,
     dry_run: bool,
     command_log: &mut Vec<String>,
-) -> (String, String) {
+) -> Result<(String, String), ExecuteError> {
     let mut stdout_accum = String::new();
     let mut stderr_accum = String::new();
     let device = target.canonical_path();
@@ -1403,12 +1457,13 @@ fn unmount_target_if_mounted(
             "[DRY RUN] Would check mounts and unmount active partitions on {}",
             device
         ));
-        return (stdout_accum, stderr_accum);
+        return Ok((stdout_accum, stderr_accum));
     }
 
-    // Resolve exact mounted partition paths from the backend's mount facts.
+    // Resolve exact mounted partition paths + mount points from the backend's
+    // mount facts.
     let mounts = backend.mounts_file();
-    let mut mounted_targets = Vec::new();
+    let mut mounted_targets: Vec<(String, Option<String>)> = Vec::new();
     for line in mounts.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if !parts.is_empty() {
@@ -1420,23 +1475,48 @@ fn unmount_target_if_mounted(
                         .next()
                         .is_some_and(|c| c.is_ascii_digit() || c == 'p'))
             {
-                mounted_targets.push(mount_src.to_string());
+                mounted_targets.push((mount_src.to_string(), parts.get(1).map(|m| (*m).to_string())));
             }
         }
     }
 
-    for mount_src in mounted_targets {
+    for (mount_src, mount_point) in mounted_targets {
         command_log.push(format!(
             "[UNMOUNT] Unmounting active filesystem target: {}",
             mount_src
         ));
-        if let Ok((stdout, stderr, _)) = backend.exec("umount", &["-f", &mount_src]) {
-            stdout_accum.push_str(&stdout);
-            stderr_accum.push_str(&stderr);
+        let (stdout, stderr, code) = backend.exec("umount", &[&mount_src]).map_err(|e| {
+            ExecuteError::CommandFailed(format!("Failed to run umount: {}", e))
+        })?;
+        stdout_accum.push_str(&stdout);
+        stderr_accum.push_str(&stderr);
+        if code != 0 {
+            // Phase-u amendment: never ignore a failed unmount — return the
+            // same typed error the guard chain uses, naming the mount point and
+            // the umount stderr, so the caller stops before the post-unmount
+            // exclusive-access probe (EBUSY).
+            return Err(ExecuteError::CommandFailed(format!(
+                "Failed to unmount mounted filesystem target {}: umount attempted and failed \
+                 (mounted at {}; umount stderr: {})",
+                mount_src,
+                mount_point.as_deref().unwrap_or("unknown mount point"),
+                unmount_failure_detail(&stderr),
+            )));
         }
     }
 
-    (stdout_accum, stderr_accum)
+    Ok((stdout_accum, stderr_accum))
+}
+
+/// Human-readable detail for a failed `umount` attempt — `umount` can exit
+/// non-zero without printing anything, which must not yield an empty parenthetical.
+fn unmount_failure_detail(stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        "umount exited non-zero without a message".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1500,7 +1580,8 @@ pub async fn nvme_sanitize_with(
     let device = target.canonical_path();
 
     // Unmount any active partitions on device
-    let (u_out, u_err) = unmount_target_if_mounted(backend, target, dry_run, &mut command_log);
+    let (u_out, u_err) =
+        unmount_target_if_mounted(backend, target, dry_run, &mut command_log)?;
     all_stdout.push_str(&u_out);
     all_stderr.push_str(&u_err);
 
@@ -1688,7 +1769,8 @@ pub async fn ata_secure_erase_with(
     };
 
     // Unmount any active partitions on device
-    let (u_out, u_err) = unmount_target_if_mounted(backend, target, dry_run, &mut command_log);
+    let (u_out, u_err) =
+        unmount_target_if_mounted(backend, target, dry_run, &mut command_log)?;
     all_stdout.push_str(&u_out);
     all_stderr.push_str(&u_err);
 
@@ -1940,7 +2022,8 @@ pub async fn ata_sanitize_with(
     let device = target.canonical_path();
 
     // Unmount any active partitions on device
-    let (u_out, u_err) = unmount_target_if_mounted(backend, target, dry_run, &mut command_log);
+    let (u_out, u_err) =
+        unmount_target_if_mounted(backend, target, dry_run, &mut command_log)?;
     all_stdout.push_str(&u_out);
     all_stderr.push_str(&u_err);
 
@@ -2087,7 +2170,8 @@ pub async fn opal_revert_with(
     let device = target.canonical_path();
 
     // Unmount any active partitions on device
-    let (u_out, u_err) = unmount_target_if_mounted(backend, target, dry_run, &mut command_log);
+    let (u_out, u_err) =
+        unmount_target_if_mounted(backend, target, dry_run, &mut command_log)?;
     all_stdout.push_str(&u_out);
     all_stderr.push_str(&u_err);
 
@@ -2253,7 +2337,8 @@ pub async fn emmc_sanitize_with(
     let device = target.canonical_path();
 
     // Unmount any active partitions on device
-    let (u_out, u_err) = unmount_target_if_mounted(backend, target, dry_run, &mut command_log);
+    let (u_out, u_err) =
+        unmount_target_if_mounted(backend, target, dry_run, &mut command_log)?;
     all_stdout.push_str(&u_out);
     all_stderr.push_str(&u_err);
 
@@ -2654,7 +2739,7 @@ pub async fn discard_erase_ctx(
 
     // 3. Unmount any active partitions on the device
     let (_stdout, _stderr) =
-        unmount_target_if_mounted(&backend, &validated_target, false, &mut command_log);
+        unmount_target_if_mounted(&backend, &validated_target, false, &mut command_log)?;
 
     // 4. Verify exclusive access and re-check boot protection post-unmount
     verify_exclusive_access_and_recheck(device, false, ctx)?;
@@ -3923,7 +4008,7 @@ pub async fn software_overwrite(
 
     // 3. Unmount any active partitions
     let (_stdout, _stderr) =
-        unmount_target_if_mounted(&backend, &validated_target, false, &mut command_log);
+        unmount_target_if_mounted(&backend, &validated_target, false, &mut command_log)?;
 
     // 4. Verify exclusive access and re-check boot protection post-unmount
     verify_exclusive_access_and_recheck(device, false, &FsContext::default())?;
@@ -4222,7 +4307,8 @@ pub async fn software_overwrite_partition(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn software_overwrite_partition_ctx(
+pub async fn software_overwrite_partition_with(
+    backend: &dyn BlockBackend,
     device: &str,
     passes: u8,
     pattern: OverwritePattern,
@@ -4231,22 +4317,22 @@ pub async fn software_overwrite_partition_ctx(
     params: &PartitionTargetParams,
     dry_run: bool,
     tx: mpsc::Sender<ProgressEvent>,
-    ctx: &FsContext,
+    _ctx: &FsContext,
 ) -> Result<ExecutionReport, ExecuteError> {
     let start = Instant::now();
     let mut command_log = Vec::new();
 
     // 1. Authoritative safety check: parent disk and target partition
-    check_boot_disk_protection_ctx(device, dry_run, ctx)?;
+    crate::guard::check_boot_disk_protection(backend, device, dry_run)?;
     verify_confirmation(confirmation_token, device_serial)?;
 
     // 2. Shared partition validation (A6 extraction — byte-for-byte the same
     //    checks as before, now also feeding the discard path). C2a: also
     //    mints the validated target whose open_exclusive is the only
-    //    write-open path.
-    let backend = LinuxBackend::new(ctx.clone());
+    //    write-open path. Backend-injectable so the shared conformance suite
+    //    can run the partition flow against MockBackend.
     let validated_target =
-        crate::guard::validate_partition_target(&backend, device, params, dry_run, device_serial)?;
+        crate::guard::validate_partition_target(backend, device, params, dry_run, device_serial)?;
     let target = validated_target
         .to_legacy_partition_target()
         .ok_or_else(|| {
@@ -4350,14 +4436,14 @@ pub async fn software_overwrite_partition_ctx(
 
     // 7. Targeted unmount: target partition & holders only
     let (_stdout, _stderr) =
-        unmount_target_partition_and_holders(device, false, &mut command_log, ctx)?;
+        crate::guard::unmount_target_partition_and_holders(backend, device, false, &mut command_log)?;
 
     // 8. Verify exclusive access on the partition node
-    verify_exclusive_access_and_recheck(device, false, ctx)?;
+    crate::guard::verify_exclusive_access_and_recheck(backend, device, false)?;
 
     // 9. Open native block writer on the partition node with O_EXCL — only
     //    through the backend on the guard-minted validated target (C2a).
-    let inner_writer = open_validated_writer(&backend, &validated_target)?;
+    let inner_writer = open_validated_writer(backend, &validated_target)?;
     let actual_blk_size = inner_writer.total_size()?;
     if actual_blk_size != verified_size_bytes {
         return Err(ExecuteError::IdentityMismatch(format!(
@@ -4383,8 +4469,35 @@ pub async fn software_overwrite_partition_ctx(
 
     // F2: partition-scope wipe must leave the partition table byte-identical;
     // then ask the kernel to re-read it so the partition node reappears.
-    finish_partition_wipe(&backend, &validated_target, params, &mut report)?;
+    finish_partition_wipe(backend, &validated_target, params, &mut report)?;
     Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn software_overwrite_partition_ctx(
+    device: &str,
+    passes: u8,
+    pattern: OverwritePattern,
+    confirmation_token: &str,
+    device_serial: &str,
+    params: &PartitionTargetParams,
+    dry_run: bool,
+    tx: mpsc::Sender<ProgressEvent>,
+    ctx: &FsContext,
+) -> Result<ExecutionReport, ExecuteError> {
+    software_overwrite_partition_with(
+        &LinuxBackend::new(ctx.clone()),
+        device,
+        passes,
+        pattern,
+        confirmation_token,
+        device_serial,
+        params,
+        dry_run,
+        tx,
+        ctx,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

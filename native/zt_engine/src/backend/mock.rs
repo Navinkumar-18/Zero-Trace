@@ -72,6 +72,8 @@ pub struct MockBackend {
     /// F2: number of kernel partition-table re-read requests (BLKRRPART
     /// equivalent). Tests assert this happened after wipe/format.
     reread_calls: Mutex<usize>,
+    /// Fault injection: make the next/every partition-table re-read fail.
+    reread_error: Option<String>,
 
     /// Shared device image backing handles opened by this backend.
     data: Arc<Mutex<Vec<u8>>>,
@@ -116,6 +118,7 @@ impl MockBackend {
             exec_calls: Arc::new(Mutex::new(Vec::new())),
             exclusive_busy: false,
             reread_calls: Mutex::new(0),
+            reread_error: None,
             data: Arc::new(Mutex::new(Vec::new())),
             write_fault: WriteFault::None,
             logical_block_size: 512,
@@ -282,6 +285,13 @@ impl MockBackend {
     /// Make the O_EXCL probe report a busy device.
     pub fn with_exclusive_busy(mut self) -> Self {
         self.exclusive_busy = true;
+        self
+    }
+
+    /// Make the partition-table re-read fail (e.g. EBUSY while sibling
+    /// partitions are mounted).
+    pub fn with_reread_error(mut self, msg: &str) -> Self {
+        self.reread_error = Some(msg.to_string());
         self
     }
 
@@ -702,6 +712,9 @@ impl BlockBackend for MockBackend {
 
     fn reread_partition_table(&self, _target: &ValidatedTarget) -> Result<(), BackendError> {
         *self.reread_calls.lock().unwrap() += 1;
+        if let Some(msg) = &self.reread_error {
+            return Err(BackendError::Io(msg.clone()));
+        }
         Ok(())
     }
 }

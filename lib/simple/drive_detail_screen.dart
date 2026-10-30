@@ -1193,6 +1193,11 @@ class DriveDetailScreen extends StatelessWidget {
             '${record.sanitizationVerifiedBeforeFormat ? 'yes' : 'no'}',
             style: const TextStyle(color: AppTheme.textMuted, fontSize: 11),
           ),
+          const SizedBox(height: 2),
+          const Text(
+            'The new volume may take a few seconds to appear in your file manager.',
+            style: TextStyle(color: AppTheme.textMuted, fontSize: 11),
+          ),
         ],
       ),
     );

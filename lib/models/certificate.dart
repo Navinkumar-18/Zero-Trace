@@ -187,6 +187,22 @@ class SanitizationCertificate {
   /// verification stays byte-identical.
   final FilesystemRecreationRecord? filesystemRecreation;
 
+  /// True when the disk wipe operation completed successfully, regardless of
+  /// subsequent verification pass/fail status.
+  final bool? wipeCompleted;
+
+  /// Failed stage for in-app diagnostics: guard, unmount, overwrite, table re-read, verify, format.
+  final String? failedStage;
+
+  /// Sanitized engine stderr from the failure report.
+  final String? engineStderr;
+
+  /// Target partition / disk mount status at the time of failure.
+  final String? targetMountState;
+
+  /// Sibling partition mount status at the time of failure.
+  final String? siblingMountState;
+
   SanitizationCertificate({
     this.certVersion = 2,
     required this.certificateId,
@@ -225,6 +241,11 @@ class SanitizationCertificate {
     this.platform,
     this.backend,
     this.filesystemRecreation,
+    this.wipeCompleted,
+    this.failedStage,
+    this.engineStderr,
+    this.targetMountState,
+    this.siblingMountState,
   }) : simulationDisclaimer =
            simulationDisclaimer ??
            (executionMode == 'simulated'
@@ -314,6 +335,11 @@ class SanitizationCertificate {
       platform: json['platform'] as String?,
       backend: json['backend'] as String?,
       filesystemRecreation: filesystemRecreation,
+      wipeCompleted: json['wipeCompleted'] as bool?,
+      failedStage: json['failedStage'] as String?,
+      engineStderr: json['engineStderr'] as String?,
+      targetMountState: json['targetMountState'] as String?,
+      siblingMountState: json['siblingMountState'] as String?,
     );
   }
 
@@ -366,6 +392,11 @@ class SanitizationCertificate {
     // v1–v4 certificates round-trip exactly as before.
     if (certVersion >= 4 && filesystemRecreation != null)
       'filesystemRecreation': filesystemRecreation!.toJson(),
+    if (wipeCompleted != null) 'wipeCompleted': wipeCompleted,
+    if (failedStage != null) 'failedStage': failedStage,
+    if (engineStderr != null) 'engineStderr': engineStderr,
+    if (targetMountState != null) 'targetMountState': targetMountState,
+    if (siblingMountState != null) 'siblingMountState': siblingMountState,
     'startTime': startTime.toIso8601String(),
     'endTime': endTime.toIso8601String(),
     'timestamp': endTime.toIso8601String(),

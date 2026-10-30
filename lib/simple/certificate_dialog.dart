@@ -4,6 +4,8 @@ import 'package:provider/provider.dart';
 import 'package:printing/printing.dart';
 
 import '../models/certificate.dart';
+import '../models/sanitization_job.dart';
+import '../models/untrusted_text.dart';
 import '../services/certificate_service.dart';
 import '../services/failure_report_wording.dart';
 import '../services/sanitization_controller.dart';
@@ -269,6 +271,44 @@ class SimpleCertificateDialog extends StatelessWidget {
                           style: const TextStyle(
                               color: AppTheme.accentGold, fontSize: 11)),
                     ],
+
+                    // In-app diagnostics on failure (Task 6)
+                    if (isFailed) ...[
+                      const SizedBox(height: 12),
+                      const Divider(color: AppTheme.surfaceBorder),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Diagnostics',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                          color: AppTheme.textPrimary,
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      _row(
+                        'Failed Stage:',
+                        cert.failedStage ??
+                            _deriveFailedStage(cert, controller),
+                      ),
+                      _row(
+                        'Engine Stderr:',
+                        UntrustedText(
+                          cert.engineStderr ??
+                              _deriveEngineStderr(cert, controller),
+                        ).sanitized,
+                      ),
+                      _row(
+                        'Target Mount:',
+                        cert.targetMountState ??
+                            _deriveTargetMount(controller),
+                      ),
+                      _row(
+                        'Sibling Mounts:',
+                        cert.siblingMountState ??
+                            _deriveSiblingMounts(controller),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -366,5 +406,76 @@ class SimpleCertificateDialog extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  String _deriveFailedStage(
+    SanitizationCertificate cert,
+    SanitizationController controller,
+  ) {
+    if (controller.filesystemRecreationError != null) return 'format';
+    final job = controller.currentJob;
+    final wipeCompleted = cert.wipeCompleted ?? job?.wipeCompleted ?? false;
+    final verificationRan = FailureReportWording.verificationRan(cert);
+    if (wipeCompleted && !verificationRan) return 'verify';
+
+    final stderr = _deriveEngineStderr(cert, controller).toLowerCase();
+    if (stderr.contains('partition table re-read') ||
+        stderr.contains('partition-table re-read') ||
+        stderr.contains('table re-read') ||
+        stderr.contains('blkrrpart')) {
+      return 'table re-read';
+    }
+    if (stderr.contains('umount') ||
+        stderr.contains('unmount') ||
+        (job?.status == JobStatus.unmounting)) {
+      return 'unmount';
+    }
+    if (job?.logs.any((l) =>
+            l.toLowerCase().contains('writing to media') ||
+            l.toLowerCase().contains('pass 1 of') ||
+            l.toLowerCase().contains('progress: [overwrite]')) ==
+        true) {
+      return 'overwrite';
+    }
+    return 'guard';
+  }
+
+  String _deriveEngineStderr(
+    SanitizationCertificate cert,
+    SanitizationController controller,
+  ) {
+    if (cert.engineStderr != null && cert.engineStderr!.isNotEmpty) {
+      return cert.engineStderr!;
+    }
+    final job = controller.currentJob;
+    if (job != null) {
+      for (final log in job.logs.reversed) {
+        if (log.startsWith('ERROR Details: ')) {
+          return log.substring('ERROR Details: '.length);
+        }
+      }
+    }
+    return 'None';
+  }
+
+  String _deriveTargetMount(SanitizationController controller) {
+    final job = controller.currentJob;
+    if (job == null) return 'unknown';
+    if (job.isPartitionScope && job.targetPartition != null) {
+      return '${job.targetPartition!.devicePath}: ${job.targetPartition!.isMounted ? "mounted at ${job.targetPartition!.mountPoint}" : "unmounted"}';
+    }
+    final isMounted = job.device.mountPoint != null && job.device.mountPoint!.isNotEmpty;
+    return '${job.device.name}: ${isMounted ? "mounted at ${job.device.mountPoint}" : "unmounted"}';
+  }
+
+  String _deriveSiblingMounts(SanitizationController controller) {
+    final job = controller.currentJob;
+    if (job == null || !job.isPartitionScope) return 'None';
+    final siblings = job.device.partitions
+        .where((p) => p.devicePath != job.targetPartition?.devicePath)
+        .map((p) =>
+            '${p.name}: ${p.isMounted ? "mounted at ${p.mountPoint}" : "unmounted"}')
+        .join(', ');
+    return siblings.isNotEmpty ? siblings : 'None';
   }
 }

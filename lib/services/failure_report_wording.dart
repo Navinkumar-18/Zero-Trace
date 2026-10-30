@@ -91,6 +91,7 @@ class FailureReportWording {
   /// wipe stage finished). A failed wipe with no confirmation stays unclaimed.
   static bool overwriteConfirmed(SanitizationCertificate cert) {
     if (cert.result != 'FAILED') return true;
+    if (cert.wipeCompleted == true) return true;
     if (verificationRan(cert)) return true;
     final confirmation = cert.evidence.controllerConfirmation.toLowerCase();
     return confirmation.contains('disk wipe command succeeded') ||

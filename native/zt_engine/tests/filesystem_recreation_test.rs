@@ -103,7 +103,11 @@ fn formats_only_the_validated_partition_after_verification() {
     assert_eq!(report.scope, "partial");
     assert_eq!(
         backend.executed_commands(),
-        vec!["mkfs.vfat -F 32 -n BOOT /dev/sdb1".to_string()]
+        vec![
+            "mkfs.vfat -F 32 -n BOOT /dev/sdb1".to_string(),
+            "udevadm settle".to_string(),
+            "udevadm trigger --action=change /dev/sdb1".to_string(),
+        ]
     );
     assert_eq!(backend.partition_table_reread_count(), 1);
     let after = guard::compute_partition_table_fingerprint(&backend, "sdb").unwrap();
@@ -123,7 +127,14 @@ fn supports_each_allowed_filesystem_tool() {
         mark_wiped_and_verified(&backend, &target).unwrap();
         let report = recreate_filesystem_with(&backend, &target, fs, "LBL", false).unwrap();
         assert_eq!(report.tool, expected.split(' ').next().unwrap());
-        assert_eq!(backend.executed_commands(), vec![expected.to_string()]);
+        assert_eq!(
+            backend.executed_commands(),
+            vec![
+                expected.to_string(),
+                "udevadm settle".to_string(),
+                "udevadm trigger --action=change /dev/sdb1".to_string(),
+            ]
+        );
     }
 }
 
@@ -191,7 +202,11 @@ fn whole_device_recreation_writes_one_partition_and_formats_it() {
     assert_eq!(report.scope, "full");
     assert_eq!(
         backend.executed_commands(),
-        vec!["mkfs.ext4 -F -L NEW /dev/sdb1".to_string()]
+        vec![
+            "mkfs.ext4 -F -L NEW /dev/sdb1".to_string(),
+            "udevadm settle".to_string(),
+            "udevadm trigger --action=change /dev/sdb1".to_string(),
+        ]
     );
     // Protective MBR signature + GPT header are in the device image.
     let image = backend.data();
@@ -220,4 +235,25 @@ fn whole_device_recreation_refuses_partition_scope() {
         err
     );
     assert!(backend.executed_commands().is_empty());
+}
+
+#[test]
+fn udev_commands_never_run_if_mkfs_fails() {
+    let backend = mock_fixture().with_exec_result(
+        "mkfs.vfat -F 32 -n BOOT /dev/sdb1",
+        "",
+        "mkfs failed with simulated error",
+        1,
+    );
+    let target = partition_target(&backend);
+    mark_wiped_and_verified(&backend, &target).unwrap();
+
+    let err = recreate_filesystem_with(&backend, &target, "vfat", "BOOT", false).unwrap_err();
+    assert!(matches!(err, ExecuteError::FilesystemRecreationFailed(_)));
+
+    // mkfs was executed, but udev commands must NEVER run if mkfs fails.
+    assert_eq!(
+        backend.executed_commands(),
+        vec!["mkfs.vfat -F 32 -n BOOT /dev/sdb1".to_string()]
+    );
 }

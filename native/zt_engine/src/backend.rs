@@ -586,7 +586,7 @@ pub trait BlockBackend {
             let src = parts[0];
             let src_name = src.rsplit('/').next().unwrap_or(src);
             if src == canonical || src_name == name {
-                let (_, stderr, code) = self.exec("umount", &["-f", src])?;
+                let (_, stderr, code) = self.exec("umount", &[src])?;
                 if code != 0 {
                     return Err(BackendError::Io(format!(
                         "umount failed for {}: {}",

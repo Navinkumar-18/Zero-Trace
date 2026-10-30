@@ -14,6 +14,7 @@ SanitizationCertificate _certificate({
   required VerificationEvidence evidence,
   int? verificationSampleCount,
   String verificationSummary = '',
+  bool? wipeCompleted,
 }) {
   return SanitizationCertificate(
     certificateId: 'ZT-CERT-WORDING',
@@ -44,6 +45,7 @@ SanitizationCertificate _certificate({
       },
     ],
     evidence: evidence,
+    wipeCompleted: wipeCompleted,
   );
 }
 
@@ -139,6 +141,20 @@ void main() {
       expect(FailureReportWording.verificationRan(cert), isTrue);
       expect(FailureReportWording.overwriteConfirmed(cert), isTrue);
     });
+
+    test(
+      'overwriteConfirmed is true when wipeCompleted is true even if verification did not run',
+      () {
+        final cert = _certificate(
+          result: 'FAILED',
+          evidence: _notRunEvidence(),
+          wipeCompleted: true,
+        );
+
+        expect(FailureReportWording.verificationRan(cert), isFalse);
+        expect(FailureReportWording.overwriteConfirmed(cert), isTrue);
+      },
+    );
   });
 
   group('failure report UI wording', () {

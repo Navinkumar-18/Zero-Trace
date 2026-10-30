@@ -1012,15 +1012,16 @@ pub fn unmount_target_partition_and_holders(
                 holder_dev
             ));
             let (stdout, stderr, code) =
-                run_logged_cmd(backend, "umount", &["-f", &holder_dev], command_log)?;
+                run_logged_cmd(backend, "umount", &[&holder_dev], command_log)?;
             stdout_accum.push_str(&stdout);
             stderr_accum.push_str(&stderr);
             if code != 0 {
-                // P4-fix: name the blocking mount point and state that the
-                // forced unmount was attempted (and why it failed).
+                // Phase-u amendment: plain `umount` (no -f); name the blocking
+                // mount point and the umount stderr that explains why the
+                // holder could not be unmounted.
                 return Err(ExecuteError::CommandFailed(format!(
                     "Target partition {} is held by active holder '{}' which cannot be \
-                     unmounted (mounted at {}; forced unmount attempted and failed: {})",
+                     unmounted (mounted at {}; umount attempted and failed: {})",
                     target_partition,
                     holder_dev,
                     holder_mount_point.as_deref().unwrap_or("unknown mount point"),
@@ -1047,18 +1048,19 @@ pub fn unmount_target_partition_and_holders(
             target_partition
         ));
         let (stdout, stderr, code) =
-            run_logged_cmd(backend, "umount", &["-f", target_partition], command_log)?;
+            run_logged_cmd(backend, "umount", &[target_partition], command_log)?;
         stdout_accum.push_str(&stdout);
         stderr_accum.push_str(&stderr);
         if code != 0 {
-            // P4-fix: report the unmount-attempt status and the mount point
-            // that is still holding the partition.
+            // Phase-u amendment: plain `umount` (no -f); report the unmount
+            // attempt status, the mount point that is still holding the
+            // partition and the umount stderr.
             return Err(ExecuteError::CommandFailed(format!(
-                "Failed to unmount partition {}: {} (forced unmount attempted and failed; \
-                 still mounted at {})",
+                "Failed to unmount partition {}: umount attempted and failed (mounted at {}; \
+                 umount stderr: {})",
                 target_partition,
-                unmount_failure_detail(&stderr),
                 target_mount_point.as_deref().unwrap_or("unknown mount point"),
+                unmount_failure_detail(&stderr),
             )));
         }
     }
