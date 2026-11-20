@@ -1,6 +1,10 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:zero_trace/models/device_profile.dart';
+import 'package:zero_trace/models/sanitization_job.dart';
+import 'package:zero_trace/models/sanitization_support_level.dart';
+import 'package:zero_trace/services/classification_service.dart';
 import 'package:zero_trace/services/device_intelligence_service.dart';
+import 'package:zero_trace/services/recommendation_service.dart';
 
 void main() {
   group('DeviceIntelligenceService Tests', () {
@@ -174,6 +178,143 @@ void main() {
       expect(p.partTypeName, 'Windows NTFS/exFAT');
       expect(p.role, 'windows_data');
       expect(p.friendlyDisplayName, startsWith('NTFS volume'));
+    });
+  });
+
+  group('SD-1: SD card vs soldered eMMC via mmc_device_type', () {
+    final service = DeviceIntelligenceService();
+    final recommender = RecommendationService();
+
+    // Built-in-slot card: lsblk alone reports rm=0, hotplug=false,
+    // tran=mmc — indistinguishable from soldered-down eMMC.
+    Map<String, dynamic> mmcblkFixture({String name = 'mmcblk0'}) => {
+          'name': name,
+          'model': 'SanDisk 32GB',
+          'serial': 'SD-$name',
+          'size': 32010928128,
+          'rota': false,
+          'tran': 'mmc',
+          'type': 'disk',
+          'rm': false,
+          'hotplug': false,
+          'children': [
+            {
+              'name': '${name}p1',
+              'type': 'part',
+              'size': 32000000000,
+              'start': 8192,
+              'partn': 1,
+              'fstype': 'exfat',
+              'label': 'CAMCARD',
+            },
+          ],
+        };
+
+    test('lsblk alone cannot tell an SD card from soldered eMMC', () {
+      final raw = service.parseBlockDevices([mmcblkFixture()]).single;
+      expect(raw.mediaType, MediaType.emmc);
+      expect(raw.isRemovable, isFalse);
+      expect(raw.supportsEmmcSanitize, isTrue);
+      expect(raw.driveType, isNot(DriveType.sd));
+      expect(ClassificationService.deviceClassOf(raw), 'emmc');
+    });
+
+    test('type=SD corrects to removable media without eMMC sanitize (Clear single-pass)', () {
+      final raw = service.parseBlockDevices([mmcblkFixture()]).single;
+      final sd = DeviceIntelligenceService.applyMmcCardType(raw, 'SD');
+
+      expect(sd.isRemovable, isTrue);
+      expect(sd.supportsEmmcSanitize, isFalse,
+          reason: 'SD cards implement no eMMC sanitize command');
+      expect(sd.busType, 'SD');
+      expect(sd.driveType, DriveType.sd);
+      expect(sd.notes, 'REAL REMOVABLE STORAGE DEVICE');
+      expect(ClassificationService.deviceClassOf(sd), 'sd');
+
+      final matrix = ClassificationService().capabilityMatrix(sd);
+      expect(matrix.deviceClass, 'sd');
+      expect(matrix.supportsSanitize, isFalse);
+      expect(matrix.sanitizationLevel(wholeDevice: true), 'Clear',
+          reason: 'SD-card overwrite is NIST Clear, never Purge');
+
+      final rec = recommender.selectMethod(sd, 0.65, NistCategory.purge,
+          sensitivity: DataSensitivity.public);
+      expect(rec.method, SanitizationMethod.singlePassOverwrite);
+      expect(rec.standardReference, contains('Clear'));
+      expect(computeSupportLevel(sd), SanitizationSupportLevel.clearOnly);
+    });
+
+    test('type=MMC leaves soldered eMMC behavior byte-identical', () {
+      final raw = service.parseBlockDevices([mmcblkFixture()]).single;
+      final same = DeviceIntelligenceService.applyMmcCardType(raw, 'MMC');
+      expect(identical(same, raw), isTrue,
+          reason: 'non-SD card types must not touch the profile at all');
+      expect(same.supportsEmmcSanitize, isTrue);
+      expect(same.isRemovable, isFalse);
+      expect(same.driveType, isNot(DriveType.sd));
+      expect(ClassificationService.deviceClassOf(same), 'emmc');
+      expect(computeSupportLevel(same), SanitizationSupportLevel.full);
+
+      final rec = recommender.selectMethod(same, 0.65, NistCategory.purge,
+          sensitivity: DataSensitivity.public);
+      expect(rec.method, SanitizationMethod.emmcSanitize);
+    });
+
+    test('USB card reader keeps the usbFlash single-pass path', () {
+      final profiles = service.parseBlockDevices([
+        {
+          'name': 'sdb',
+          'model': 'Generic USB SD Reader',
+          'serial': 'READER-1',
+          'size': 32010928128,
+          'rota': false,
+          'tran': 'usb',
+          'type': 'disk',
+          'rm': true,
+          'hotplug': true,
+          'children': [
+            {
+              'name': 'sdb1',
+              'type': 'part',
+              'size': 32000000000,
+              'start': 2048,
+              'partn': 1,
+              'fstype': 'exfat',
+              'label': 'CAMCARD',
+            },
+          ],
+        },
+      ]);
+      final usb = profiles.single;
+      expect(usb.mediaType, MediaType.usbFlash);
+      expect(usb.isRemovable, isTrue);
+      expect(usb.supportsEmmcSanitize, isFalse);
+      // A stray SD card-type fact must not reclassify non-mmcblk media.
+      expect(
+          identical(DeviceIntelligenceService.applyMmcCardType(usb, 'SD'), usb),
+          isTrue);
+      expect(ClassificationService.deviceClassOf(usb), 'usb_flash');
+
+      final rec = recommender.selectMethod(usb, 0.65, NistCategory.purge,
+          sensitivity: DataSensitivity.public);
+      expect(rec.method, SanitizationMethod.singlePassOverwrite);
+      expect(rec.standardReference, contains('Clear'));
+    });
+
+    test('absent or unrecognised card-type facts never change the profile', () {
+      final raw = service.parseBlockDevices([mmcblkFixture()]).single;
+      expect(
+          identical(DeviceIntelligenceService.applyMmcCardType(raw, ''), raw),
+          isTrue);
+      expect(
+          identical(
+              DeviceIntelligenceService.applyMmcCardType(raw, 'eMMC-weird'),
+              raw),
+          isTrue);
+      // Case/whitespace-insensitive: the correction still applies.
+      final sd = DeviceIntelligenceService.applyMmcCardType(raw, ' sd ');
+      expect(sd.isRemovable, isTrue);
+      expect(sd.supportsEmmcSanitize, isFalse);
     });
   });
 }

@@ -61,6 +61,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (partition/flash wipes are Clear; Purge requires a whole-device hardware
   command).
 
+### Fixed
+- **SD cards wipe exactly like pendrives (SD-1):** an `mmcblk*` device whose
+  sysfs card type (`/sys/block/mmcblkN/device/type`) reads `SD` is now
+  classified as removable SD media even when a built-in slot reports
+  `removable=0`. It is shown as `SD`/removable, loses the eMMC sanitize
+  primitive and recommends the single-pass zero overwrite (NIST Clear), in a
+  built-in slot and behind a USB card reader alike. The detect report gains an
+  additive `mmc_device_type` field (`"SD"`/`"MMC"`, omitted when unreadable);
+  soldered-down eMMC (`"MMC"`) keeps its existing behavior. When no block
+  device is found, the empty state now explains that phones connected by
+  USB-C appear as MTP and that an SD card should be used in a card reader.
+
 ### Documentation
 - AGENTS/README/CHANGELOG/TASKS now describe the P1 display rules, the P2
   firmware contract and scan, the P3 manual tests, and the reviewed knowledge

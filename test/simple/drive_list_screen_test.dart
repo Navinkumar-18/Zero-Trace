@@ -373,4 +373,28 @@ void main() {
       expect(find.text('Unknown or unsupported device type – cannot wipe safely'), findsNothing);
     });
   });
+
+  group('SD-1 empty-state guidance (MTP phones and card readers)', () {
+    testWidgets('empty state explains MTP phones and points at a card reader', (tester) async {
+      tester.view.physicalSize = const Size(1920, 1080);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      final controller = SanitizationController(appPaths: tempPaths(), enableAutoPolling: false);
+      addTearDown(() => controller.dispose());
+      controller.setMockDevices([]);
+
+      await tester.pumpWidget(createSubject(controller));
+      await tester.pumpAndSettle();
+
+      expect(find.text('No removable drives detected'), findsOneWidget);
+      expect(find.text('Connect a USB drive or SD card, then tap Refresh'), findsOneWidget);
+      expect(find.textContaining('MTP'), findsOneWidget,
+          reason: 'phones must be told they cannot be wiped at block level');
+      expect(find.textContaining('card reader'), findsOneWidget);
+    });
+  });
 }

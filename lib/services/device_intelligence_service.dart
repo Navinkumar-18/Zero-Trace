@@ -77,14 +77,77 @@ class DeviceIntelligenceService {
       final Map<String, dynamic> parsed = jsonDecode(result.stdout as String);
       final List<dynamic> devicesJson = parsed['blockdevices'] ?? [];
       final profiles = parseBlockDevices(devicesJson);
-      // B1/B2: authoritative engine tags (GPT type names, BitLocker/LUKS,
-      // boot-sector fs probe) merged best-effort on top of lsblk data.
-      return await _enrichWithEngineTags(profiles);
+      // SD-1: distinguish SD cards from soldered eMMC via the engine's
+      // sysfs card type (additive `mmc_device_type` on DETECT_REPORT),
+      // then merge the authoritative engine tags (GPT type names,
+      // BitLocker/LUKS, boot-sector fs probe) best-effort on top of lsblk.
+      final withMmcType = await _enrichMmcCardTypes(profiles);
+      return await _enrichWithEngineTags(withMmcType);
     } catch (e) {
       lastScanError = e.toString();
       debugPrint('[DISCOVERY ERROR EXCEPTION] $e');
       return [];
     }
+  }
+
+  /// SD-1: ask the engine for the sysfs MMC card type of every `mmcblk*`
+  /// disk (`zt_engine detect` → additive `mmc_device_type`: `"SD"` |
+  /// `"MMC"`) and correct the profile when the card is really an SD card.
+  ///
+  /// lsblk alone cannot tell an SD card in a built-in slot from soldered
+  /// eMMC (both report `rm=0`, `tran=mmc`), which used to recommend eMMC
+  /// Sanitize for media that does not implement it. Best-effort: engine
+  /// absence or a failing probe leaves the lsblk-derived profile untouched
+  /// (historic behavior).
+  Future<List<DeviceProfile>> _enrichMmcCardTypes(
+      List<DeviceProfile> profiles) async {
+    for (var i = 0; i < profiles.length; i++) {
+      final profile = profiles[i];
+      if (!profile.id.startsWith('real_')) continue;
+      final diskName = profile.id.substring(5);
+      if (!diskName.startsWith('mmcblk')) continue;
+      try {
+        final bin = await resolveEngineBinaryPath();
+        final res = await Process.run(bin, ['detect', '/dev/$diskName'])
+            .timeout(const Duration(seconds: 10));
+        final out = res.stdout as String? ?? '';
+        const marker = 'DETECT_REPORT:';
+        final idx = out.indexOf(marker);
+        if (idx < 0) continue;
+        final report = jsonDecode(out.substring(idx + marker.length))
+            as Map<String, dynamic>;
+        final mmcType = report['mmc_device_type'] as String?;
+        if (mmcType == null || mmcType.trim().isEmpty) continue;
+        profiles[i] = applyMmcCardType(profile, mmcType);
+      } catch (e) {
+        debugPrint('[DISCOVERY] mmc card-type probe skipped for $diskName: $e');
+      }
+    }
+    return profiles;
+  }
+
+  /// SD-1: pure correction of an `mmcblk*` profile with the sysfs card type.
+  ///
+  /// `"SD"` → the card is removable media and implements no eMMC sanitize
+  /// command: `isRemovable=true`, `supportsEmmcSanitize=false`, bus shown as
+  /// `SD` — so the recommendation becomes single-pass overwrite (NIST Clear).
+  /// `"MMC"` (soldered eMMC) and every other value leave the profile
+  /// byte-identical: real eMMC behavior is unchanged.
+  static DeviceProfile applyMmcCardType(DeviceProfile profile, String mmcType) {
+    if (mmcType.trim().toUpperCase() != 'SD') return profile;
+    // Only correct profiles lsblk could not classify as removable media;
+    // USB readers and hotplug slots already take the usbFlash path.
+    if (profile.mediaType != MediaType.emmc || profile.isRemovable) {
+      return profile;
+    }
+    return profile.copyWith(
+      busType: 'SD',
+      isRemovable: true,
+      supportsEmmcSanitize: false,
+      notes: profile.notes == 'REAL CONNECTED STORAGE DEVICE'
+          ? 'REAL REMOVABLE STORAGE DEVICE'
+          : profile.notes,
+    );
   }
 
   /// B1/B2: enrich each real profile's partitions with the authoritative

@@ -152,6 +152,12 @@ pub struct DeviceCapabilities {
     /// Removability as reported by sysfs (`/sys/class/block/<dev>/removable`).
     #[serde(default)]
     pub is_removable: bool,
+    /// SD-1: sysfs `/sys/block/mmcblkN/device/type` — `"SD"` or `"MMC"`.
+    /// `None` for non-MMC devices (attribute absent) — additive and omitted
+    /// from the `DETECT_REPORT` JSON when absent, so historic payloads stay
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mmc_device_type: Option<String>,
 
     // Meta
     pub estimated_duration_class: DurationClass,
@@ -192,6 +198,7 @@ impl DeviceCapabilities {
             supports_discard: false,
             supports_nvme_format: false,
             is_removable: false,
+            mmc_device_type: None,
             estimated_duration_class: DurationClass::Unknown,
             probe_errors: Vec::new(),
         }
@@ -646,12 +653,22 @@ pub fn probe_device(device_path: &str) -> DeviceCapabilities {
         Err(e) => caps.probe_errors.push(format!("smartctl: {}", e)),
     }
 
-    // Determine which additional probes to run based on bus type
+    // Determine which additional probes to run based on bus type.
+    //
+    // SD-1: the sysfs MMC card type (`device/type` = "SD" vs "MMC") is read
+    // first. An SD card in a built-in slot is MMC-**family** for probe
+    // routing (no ATA/OPAL/EXT_CSD probes apply) but must never claim the
+    // eMMC bus type or eMMC sanitize support — only a real soldered eMMC
+    // (type "MMC", or a legacy sysfs without a readable type) runs them.
     let is_nvme = caps.bus_type == BusType::NVMe || device_path.contains("nvme");
-    let is_emmc = caps.bus_type == BusType::EMMC || device_path.contains("mmcblk");
+    let is_mmc_family = caps.bus_type == BusType::EMMC || device_path.contains("mmcblk");
+    let mmc_device_type = detect_mmc_device_type(device_path, "/sys");
+    let is_sd_card = mmc_device_type.as_deref() == Some("SD");
+    let is_emmc = is_mmc_family && !is_sd_card;
+    caps.mmc_device_type = mmc_device_type;
 
     // 2. hdparm -I (for ATA/SATA devices)
-    if !is_nvme && !is_emmc {
+    if !is_nvme && !is_mmc_family {
         match run_command("hdparm", &["-I", device_path]) {
             Ok(stdout) => {
                 let hdp = parse_hdparm_output(&stdout);
@@ -701,7 +718,7 @@ pub fn probe_device(device_path: &str) -> DeviceCapabilities {
     }
 
     // 4. sedutil-cli --query (for TCG OPAL / SED detection)
-    if !is_emmc {
+    if !is_mmc_family {
         match run_command("sedutil-cli", &["--query", device_path]) {
             Ok(stdout) => {
                 let sed = parse_sedutil_query(&stdout);
@@ -738,8 +755,17 @@ pub fn probe_device(device_path: &str) -> DeviceCapabilities {
     // 7. A1: capability matrix via sysfs (discard support, rotation, removable)
     caps.supports_discard = detect_discard_support(device_path, "/sys");
     let (rotational, removable) = detect_rotation_and_removable(device_path, "/sys");
-    caps.is_removable = removable.unwrap_or(false);
-    caps.device_class = classify_device_class(device_path, &caps.bus_type, rotational, removable);
+    // SD-1: an SD card is removable media even when the slot's sysfs
+    // `removable` flag reads 0 (built-in slots often report 0 for a card
+    // that physically comes out).
+    caps.is_removable = removable.unwrap_or(false) || is_sd_card;
+    caps.device_class = classify_device_class_with_mmc_type(
+        device_path,
+        &caps.bus_type,
+        rotational,
+        removable,
+        caps.mmc_device_type.as_deref(),
+    );
 
     caps
 }
@@ -800,6 +826,25 @@ pub fn detect_rotation_and_removable(
     (rotational, removable)
 }
 
+/// SD-1: read the sysfs MMC card type (`/sys/block/mmcblkN/device/type`)
+/// that distinguishes a removable **SD card** (`"SD"`) from soldered-down
+/// **eMMC** (`"MMC"`). Returns `None` for non-`mmcblk*` devices and when the
+/// attribute is absent or unreadable (the caller then keeps the historic
+/// removable-flag heuristic — classification never guesses from a missing
+/// fact).
+pub fn detect_mmc_device_type(device_path: &str, sys_root: &str) -> Option<String> {
+    let name = device_path.rsplit('/').next().unwrap_or(device_path);
+    if !name.starts_with("mmcblk") {
+        return None;
+    }
+    let raw = read_sysfs_attr(device_path, sys_root, "device/type")?;
+    let normalized = raw.trim().to_ascii_uppercase();
+    match normalized.as_str() {
+        "SD" | "MMC" => Some(normalized),
+        _ => None,
+    }
+}
+
 /// A1: classify a device into the capability-matrix device class.
 ///
 /// `bus_type`/`device_path` are the probe's view; `rotational` and `removable`
@@ -810,12 +855,35 @@ pub fn classify_device_class(
     rotational: Option<bool>,
     removable: Option<bool>,
 ) -> DeviceClass {
+    classify_device_class_with_mmc_type(device_path, bus_type, rotational, removable, None)
+}
+
+/// SD-1: the same classification with the sysfs MMC card type
+/// (`/sys/block/mmcblkN/device/type`, `"SD"` vs `"MMC"`) as an extra input.
+///
+/// An `mmcblk*` device whose type reads `SD` classifies as [`DeviceClass::Sd`]
+/// **even when the removable flag is 0 or unreadable** (built-in card slots
+/// often report `removable=0` for a removable card); type `MMC` classifies as
+/// [`DeviceClass::Emmc`] regardless of the flag. Without a readable type the
+/// historic removable-flag heuristic applies unchanged (existing tests pin it).
+pub fn classify_device_class_with_mmc_type(
+    device_path: &str,
+    bus_type: &BusType,
+    rotational: Option<bool>,
+    removable: Option<bool>,
+    mmc_device_type: Option<&str>,
+) -> DeviceClass {
     let name = device_path.rsplit('/').next().unwrap_or(device_path);
 
     if *bus_type == BusType::NVMe || name.starts_with("nvme") {
         return DeviceClass::NvMe;
     }
     if name.starts_with("mmcblk") {
+        match mmc_device_type.map(|t| t.trim().to_ascii_uppercase()).as_deref() {
+            Some("SD") => return DeviceClass::Sd,
+            Some("MMC") => return DeviceClass::Emmc,
+            _ => {}
+        }
         return match removable {
             Some(true) => DeviceClass::Sd,
             Some(false) => DeviceClass::Emmc,
@@ -1027,5 +1095,116 @@ mod tests {
             detect_rotation_and_removable("/dev/mmcblk0", tmp.path().to_str().unwrap());
         assert_eq!(rot, Some(false));
         assert_eq!(rem, Some(true));
+    }
+
+    // -----------------------------------------------------------------------
+    // SD-1: SD card vs soldered eMMC via /sys/block/mmcblkN/device/type
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_detect_mmc_device_type_fixture_sysfs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sys = tmp.path().to_str().unwrap();
+
+        // An SD card in a built-in slot: type=SD, removable flag often 0.
+        let sd_dir = tmp.path().join("class/block/mmcblk0/device");
+        std::fs::create_dir_all(&sd_dir).unwrap();
+        std::fs::write(sd_dir.join("type"), "SD\n").unwrap();
+        assert_eq!(
+            detect_mmc_device_type("/dev/mmcblk0", sys).as_deref(),
+            Some("SD")
+        );
+
+        // Soldered-down eMMC: type=MMC.
+        let mmc_dir = tmp.path().join("class/block/mmcblk1/device");
+        std::fs::create_dir_all(&mmc_dir).unwrap();
+        std::fs::write(mmc_dir.join("type"), "MMC\n").unwrap();
+        assert_eq!(
+            detect_mmc_device_type("/dev/mmcblk1", sys).as_deref(),
+            Some("MMC")
+        );
+
+        // Case-insensitive on both sides.
+        std::fs::write(sd_dir.join("type"), "sd\n").unwrap();
+        assert_eq!(
+            detect_mmc_device_type("/dev/mmcblk0", sys).as_deref(),
+            Some("SD")
+        );
+
+        // A non-MMC device never reports a card type.
+        let sd_blk = tmp.path().join("class/block/sdb/device");
+        std::fs::create_dir_all(&sd_blk).unwrap();
+        std::fs::write(sd_blk.join("type"), "SD\n").unwrap();
+        assert_eq!(detect_mmc_device_type("/dev/sdb", sys), None);
+
+        // Unreadable/absent/garbage facts stay None (never a guess).
+        let missing = tmp.path().join("class/block/mmcblk9");
+        std::fs::create_dir_all(&missing).unwrap();
+        assert_eq!(detect_mmc_device_type("/dev/mmcblk9", sys), None);
+        std::fs::write(mmc_dir.join("type"), "eMMC-weird\n").unwrap();
+        assert_eq!(detect_mmc_device_type("/dev/mmcblk1", sys), None);
+    }
+
+    #[test]
+    fn test_classify_with_sysfs_mmc_type_overrides_the_removable_flag() {
+        use BusType::*;
+
+        // Built-in slot SD card: type=SD wins over removable=0 (the exact
+        // regression this phase fixes — it used to classify as eMMC).
+        assert_eq!(
+            classify_device_class_with_mmc_type("/dev/mmcblk0", &EMMC, None, Some(false), Some("SD")),
+            DeviceClass::Sd
+        );
+        // ... and over an unreadable removable flag.
+        assert_eq!(
+            classify_device_class_with_mmc_type("/dev/mmcblk0", &EMMC, None, None, Some("SD")),
+            DeviceClass::Sd
+        );
+        // Soldered eMMC: type=MMC wins — real eMMC behavior unchanged.
+        assert_eq!(
+            classify_device_class_with_mmc_type(
+                "/dev/mmcblk1",
+                &EMMC,
+                None,
+                Some(true),
+                Some("MMC")
+            ),
+            DeviceClass::Emmc
+        );
+        // No readable type: the historic removable-flag heuristic applies
+        // unchanged (existing matrix test pins those exact expectations).
+        assert_eq!(
+            classify_device_class_with_mmc_type("/dev/mmcblk0", &EMMC, None, Some(true), None),
+            DeviceClass::Sd
+        );
+        assert_eq!(
+            classify_device_class_with_mmc_type("/dev/mmcblk0", &EMMC, None, Some(false), None),
+            DeviceClass::Emmc
+        );
+
+        // USB card reader (sdX on the usb bus) keeps the usbFlash path —
+        // single-pass overwrite (Clear), never eMMC sanitize.
+        assert_eq!(
+            classify_device_class_with_mmc_type("/dev/sdb", &USB, None, Some(true), None),
+            DeviceClass::UsbFlash
+        );
+    }
+
+    #[test]
+    fn test_mmc_device_type_is_an_additive_detect_field() {
+        // Absent (non-MMC device): the key must not appear, so historic
+        // DETECT_REPORT payloads stay byte-identical.
+        let plain = serde_json::to_value(DeviceCapabilities::new_unknown("/dev/sda")).unwrap();
+        assert!(plain.get("mmc_device_type").is_none());
+
+        // Present only when the sysfs fact was read.
+        let mut sd = DeviceCapabilities::new_unknown("/dev/mmcblk0");
+        sd.mmc_device_type = Some("SD".to_string());
+        let value = serde_json::to_value(&sd).unwrap();
+        assert_eq!(value["mmc_device_type"], "SD");
+
+        // Old payloads (without the field) still deserialize.
+        let parsed: DeviceCapabilities = serde_json::from_value(plain).unwrap();
+        assert_eq!(parsed.mmc_device_type, None);
     }
 }

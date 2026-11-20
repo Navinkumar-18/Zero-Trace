@@ -352,6 +352,17 @@ class _DriveListScreenState extends State<DriveListScreen> {
                           style:
                               TextStyle(color: AppTheme.textMuted, fontSize: 12),
                         ),
+                        const SizedBox(height: 8),
+                        const Text(
+                          'Phones connected by USB-C usually appear as MTP and '
+                          'cannot be wiped at block level. Remove the SD card '
+                          'and use a card reader.',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                              color: AppTheme.textMuted,
+                              fontSize: 11,
+                              fontStyle: FontStyle.italic),
+                        ),
                       ],
                     ),
                   )
