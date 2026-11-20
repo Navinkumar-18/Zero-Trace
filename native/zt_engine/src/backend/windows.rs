@@ -1,8 +1,10 @@
 //! Windows BlockBackend implementation (Phase D-a, piece 1 — read-only facts).
 //!
 //! Hard rules (Phase D-a):
-//! - Every disk and volume handle is opened with `dwDesiredAccess = 0` or `FILE_READ_ATTRIBUTES` only.
-//!   Zero write access is ever requested.
+//! - Every disk and volume handle is opened with `dwDesiredAccess = 0` or `FILE_READ_ATTRIBUTES` only,
+//!   with one reviewed exception: the BitLocker `-FVE-FS-` header probe opens the
+//!   volume with `GENERIC_READ` and performs a single `ReadFile` of the first
+//!   sector. No write, lock or dismount access is ever requested.
 //! - Every destructive / write operation returns `BackendError::Unsupported`.
 //! - Pure byte parsing is delegated to `crate::backend::windows_parse`.
 //! - Discovery is fail-closed: a drive that is absent is skipped, but
@@ -357,15 +359,17 @@ mod windows_impl {
 
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_ACCESS_DENIED, ERROR_ENVVAR_NOT_FOUND, ERROR_FILE_NOT_FOUND,
-        ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE,
+        ERROR_MORE_DATA, ERROR_NO_MORE_FILES, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, GENERIC_READ,
+        HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetVolumeInformationW,
-        GetVolumeNameForVolumeMountPointW, GetVolumePathNamesForVolumeNameW,
-        FILE_FLAGS_AND_ATTRIBUTES, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        CreateFileW, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW,
+        GetDriveTypeW, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
+        GetVolumePathNamesForVolumeNameW, ReadFile, FILE_FLAGS_AND_ATTRIBUTES,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
         IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::Environment::GetEnvironmentVariableW;
@@ -383,15 +387,18 @@ mod windows_impl {
     use windows_sys::Win32::System::IO::DeviceIoControl;
 
     use crate::backend::windows_parse::{
-        crash_dump_volume_roots, hibernation_volume_roots, pagefile_volume_roots,
-        parse_disk_geometry_ex, parse_drive_layout_ex, parse_reg_dword, parse_reg_multi_sz,
-        parse_reg_sz, parse_seek_penalty_descriptor, parse_storage_device_descriptor,
-        parse_volume_disk_extents, windows_volume_root,
+        classify_bitlocker, classify_drive_type, crash_dump_volume_roots, detect_bitlocker,
+        drive_letters_from_mount_points, find_partition_for_extent, hibernation_volume_roots,
+        pagefile_volume_roots, parse_disk_geometry_ex, parse_drive_layout_ex, parse_reg_dword,
+        parse_reg_multi_sz, parse_reg_sz, parse_seek_penalty_descriptor,
+        parse_storage_device_descriptor, parse_volume_disk_extents, parse_volume_path_names,
+        partition_container, volume_guid_matches_any, windows_mount_root, windows_volume_root,
+        BitLockerStatus, ParsedDriveLayout, ParsedVolumeExtents, PartitionContainer,
     };
     use crate::backend::{
         BackendCapabilities, BackendError, BlockBackend, DeviceGeometry, DeviceInfo, DiskSetFact,
         ElevationFact, ExclusiveHandle, MountState, PartitionFacts, Relation, StatFact,
-        WindowsBootFacts,
+        VolumeDriveType, VolumeFact, VolumeGuidSetFact, WindowsBootFacts, WindowsVolumeFacts,
     };
     use crate::guard::ValidatedTarget;
     use crate::types::{BootEnvironment, ExecuteError};
@@ -757,6 +764,20 @@ mod windows_impl {
             Ok(partitions)
         }
 
+        fn enumerate_volumes(&self) -> Result<Vec<WindowsVolumeFacts>, BackendError> {
+            collect_volume_facts()
+        }
+
+        fn resolve_volume_guid(&self, selector: &str) -> Result<String, BackendError> {
+            let root = windows_mount_root(selector);
+            if root.is_empty() {
+                return Err(BackendError::Unavailable(
+                    "empty volume selector".to_string(),
+                ));
+            }
+            volume_guid_path_for_root(&root)
+        }
+
         // -- Facts consumed by the shared guard chain --------------------------
 
         fn read_mount_state(&self) -> Result<MountState, BackendError> {
@@ -779,6 +800,13 @@ mod windows_impl {
 
         fn windows_boot_facts(&self) -> Result<Option<WindowsBootFacts>, BackendError> {
             collect_boot_facts().map(Some)
+        }
+
+        fn windows_drive_layout(
+            &self,
+            disk_number: u32,
+        ) -> Result<ParsedDriveLayout, BackendError> {
+            read_drive_layout(disk_number)
         }
 
         fn canonicalize_path(&self, path: &str, _dry_run: bool) -> Result<String, ExecuteError> {
@@ -1156,37 +1184,35 @@ mod windows_impl {
         DiskSetFact::known(disks)
     }
 
-    fn read_pagefile_disks(system_drive: Option<&str>) -> DiskSetFact {
+    fn read_pagefile_roots(system_drive: Option<&str>) -> Result<Vec<String>, String> {
         match read_registry_value(PAGEFILE_KEY, "PagingFiles") {
-            Err(e) => DiskSetFact::unreadable(e.to_string()),
+            Err(e) => Err(e.to_string()),
             // No configured paging file value: a known empty set, not an
             // unreadable fact.
-            Ok(None) => DiskSetFact::known(std::iter::empty::<u32>()),
+            Ok(None) => Ok(Vec::new()),
             Ok(Some(bytes)) => match parse_reg_multi_sz(&bytes) {
-                Err(e) => DiskSetFact::unreadable(e.to_string()),
-                Ok(entries) => match pagefile_volume_roots(&entries, system_drive.unwrap_or("")) {
-                    Err(e) => DiskSetFact::unreadable(e.to_string()),
-                    Ok(roots) => disk_set_from_roots(&roots),
-                },
+                Err(e) => Err(e.to_string()),
+                Ok(entries) => pagefile_volume_roots(&entries, system_drive.unwrap_or(""))
+                    .map_err(|e| e.to_string()),
             },
         }
     }
 
-    fn read_hibernation_disks(system_drive: Option<&str>) -> DiskSetFact {
+    fn read_hibernation_roots(system_drive: Option<&str>) -> Result<Vec<String>, String> {
         match read_registry_value(POWER_KEY, "HibernateEnabled") {
-            Err(e) => DiskSetFact::unreadable(e.to_string()),
+            Err(e) => Err(e.to_string()),
             // TODO-VERIFY: a missing HibernateEnabled value is reported as
             // unreadable rather than assumed "disabled" (fail closed).
-            Ok(None) => DiskSetFact::unreadable(
+            Ok(None) => Err(
                 "HibernateEnabled registry value is missing; cannot determine whether hiberfil.sys exists"
                     .to_string(),
             ),
             Ok(Some(bytes)) => match parse_reg_dword(&bytes) {
-                Err(e) => DiskSetFact::unreadable(e.to_string()),
-                Ok(0) => DiskSetFact::known(std::iter::empty::<u32>()),
+                Err(e) => Err(e.to_string()),
+                Ok(0) => Ok(Vec::new()),
                 Ok(enabled) => match system_drive {
-                    Some(drive) => disk_set_from_roots(&hibernation_volume_roots(enabled, drive)),
-                    None => DiskSetFact::unreadable(
+                    Some(drive) => Ok(hibernation_volume_roots(enabled, drive)),
+                    None => Err(
                         "Cannot resolve the system drive for the hibernation file".to_string(),
                     ),
                 },
@@ -1194,45 +1220,71 @@ mod windows_impl {
         }
     }
 
-    fn read_crashdump_disks(system_root: Option<&str>, system_drive: Option<&str>) -> DiskSetFact {
+    fn read_crashdump_roots(
+        system_root: Option<&str>,
+        system_drive: Option<&str>,
+    ) -> Result<Vec<String>, String> {
         let enabled = match read_registry_value(CRASH_KEY, "CrashDumpEnabled") {
-            Err(e) => return DiskSetFact::unreadable(e.to_string()),
+            Err(e) => return Err(e.to_string()),
             // TODO-VERIFY: missing CrashDumpEnabled is treated as unreadable
             // (fail closed) instead of guessing Windows' default.
             Ok(None) => {
-                return DiskSetFact::unreadable(
+                return Err(
                     "CrashDumpEnabled registry value is missing; cannot determine the crash-dump target"
                         .to_string(),
                 )
             }
             Ok(Some(bytes)) => match parse_reg_dword(&bytes) {
                 Ok(value) => value,
-                Err(e) => return DiskSetFact::unreadable(e.to_string()),
+                Err(e) => return Err(e.to_string()),
             },
         };
         if enabled == 0 {
-            return DiskSetFact::known(std::iter::empty::<u32>());
+            return Ok(Vec::new());
         }
 
-        let dump_file = match read_registry_string(CRASH_KEY, "DumpFile") {
-            Ok(value) => value,
-            Err(e) => return DiskSetFact::unreadable(e.to_string()),
-        };
-        let minidump_dir = match read_registry_string(CRASH_KEY, "MinidumpDir") {
-            Ok(value) => value,
-            Err(e) => return DiskSetFact::unreadable(e.to_string()),
-        };
+        let dump_file = read_registry_string(CRASH_KEY, "DumpFile").map_err(|e| e.to_string())?;
+        let minidump_dir =
+            read_registry_string(CRASH_KEY, "MinidumpDir").map_err(|e| e.to_string())?;
 
-        match crash_dump_volume_roots(
+        crash_dump_volume_roots(
             enabled,
             dump_file.as_deref(),
             minidump_dir.as_deref(),
             system_root.unwrap_or(""),
             system_drive.unwrap_or(""),
-        ) {
-            Err(e) => DiskSetFact::unreadable(e.to_string()),
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn roots_to_disk_set(roots: Result<Vec<String>, String>) -> DiskSetFact {
+        match roots {
             Ok(roots) => disk_set_from_roots(&roots),
+            Err(reason) => DiskSetFact::unreadable(reason),
         }
+    }
+
+    fn roots_to_volume_guid_set(roots: Result<Vec<String>, String>) -> VolumeGuidSetFact {
+        match roots {
+            Ok(roots) => volume_guid_set_from_roots(&roots),
+            Err(reason) => VolumeGuidSetFact::unreadable(reason),
+        }
+    }
+
+    fn volume_guid_set_from_roots(roots: &[String]) -> VolumeGuidSetFact {
+        let mut guids = Vec::new();
+        for root in roots {
+            match volume_guid_path_for_root(root) {
+                Ok(guid) => guids.push(guid),
+                Err(e) => {
+                    return VolumeGuidSetFact::unreadable(format!(
+                        "Cannot map volume {} to its volume GUID: {}",
+                        root, e
+                    ))
+                }
+            }
+        }
+        VolumeGuidSetFact::known(guids)
     }
 
     fn read_app_disks() -> DiskSetFact {
@@ -1350,9 +1402,15 @@ mod windows_impl {
             ),
         };
 
-        let pagefile_disks = read_pagefile_disks(system_drive.as_deref());
-        let hibernation_disks = read_hibernation_disks(system_drive.as_deref());
-        let crashdump_disks = read_crashdump_disks(system_root.as_deref(), system_drive.as_deref());
+        let pagefile_roots = read_pagefile_roots(system_drive.as_deref());
+        let hibernation_roots = read_hibernation_roots(system_drive.as_deref());
+        let crashdump_roots = read_crashdump_roots(system_root.as_deref(), system_drive.as_deref());
+        let pagefile_disks = roots_to_disk_set(pagefile_roots.clone());
+        let hibernation_disks = roots_to_disk_set(hibernation_roots.clone());
+        let crashdump_disks = roots_to_disk_set(crashdump_roots.clone());
+        let pagefile_volumes = roots_to_volume_guid_set(pagefile_roots);
+        let hibernation_volumes = roots_to_volume_guid_set(hibernation_roots);
+        let crashdump_volumes = roots_to_volume_guid_set(crashdump_roots);
         let app_disks = read_app_disks();
         let elevated = match read_elevation() {
             Ok(value) => ElevationFact::Known(value),
@@ -1366,6 +1424,9 @@ mod windows_impl {
             hibernation_disks,
             crashdump_disks,
             app_disks,
+            pagefile_volumes,
+            hibernation_volumes,
+            crashdump_volumes,
             elevated,
         })
     }
@@ -1561,5 +1622,494 @@ mod windows_impl {
             // Failed GetVolumeInformation => typed unknown
             (None, None)
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 1.2: read-only volume enumeration
+    // -----------------------------------------------------------------------
+
+    /// Enumerates every volume and reports per-volume facts. Unreadable
+    /// per-volume facts become `VolumeFact::Unreadable`; only a broken volume
+    /// enumeration itself (FindNextVolumeW) aborts with a typed error.
+    fn collect_volume_facts() -> Result<Vec<WindowsVolumeFacts>, BackendError> {
+        // Resolve the protected volume GUIDs once. A failure here is carried
+        // into every volume as an Unreadable fact so the guard refuses.
+        let system_guids = system_volume_guids();
+        let app_guids = running_app_volume_guids();
+
+        let mut volume_name = [0u16; 512];
+        let find_handle =
+            unsafe { FindFirstVolumeW(volume_name.as_mut_ptr(), volume_name.len() as u32) };
+        if find_handle == INVALID_HANDLE_VALUE {
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            if err == ERROR_NO_MORE_FILES {
+                return Ok(Vec::new());
+            }
+            return Err(BackendError::Io(format!(
+                "FindFirstVolumeW failed (Win32 error {})",
+                err
+            )));
+        }
+
+        let mut layouts: HashMap<u32, Result<ParsedDriveLayout, String>> = HashMap::new();
+        let mut volumes = Vec::new();
+
+        loop {
+            let len = volume_name.iter().position(|&c| c == 0).unwrap_or(0);
+            if len > 0 {
+                let guid_path = String::from_utf16_lossy(&volume_name[..len]);
+                volumes.push(collect_one_volume(
+                    &guid_path,
+                    &system_guids,
+                    &app_guids,
+                    &mut layouts,
+                ));
+            }
+
+            let next = unsafe {
+                FindNextVolumeW(
+                    find_handle,
+                    volume_name.as_mut_ptr(),
+                    volume_name.len() as u32,
+                )
+            };
+            if next != 0 {
+                continue;
+            }
+
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            unsafe { FindVolumeClose(find_handle) };
+            if err == ERROR_NO_MORE_FILES {
+                break;
+            }
+            return Err(BackendError::Io(format!(
+                "FindNextVolumeW failed (Win32 error {})",
+                err
+            )));
+        }
+
+        Ok(volumes)
+    }
+
+    fn collect_one_volume(
+        guid_path_input: &str,
+        system_guids: &Result<Vec<String>, String>,
+        app_guids: &Result<Vec<String>, String>,
+        layouts: &mut HashMap<u32, Result<ParsedDriveLayout, String>>,
+    ) -> WindowsVolumeFacts {
+        let device_path = guid_path_input.trim_end_matches('\\');
+        let guid_path = format!("{}\\", device_path);
+
+        let mount_points = match read_volume_path_names(&guid_path) {
+            Ok(points) => VolumeFact::Known(points),
+            Err(reason) => VolumeFact::Unreadable(reason),
+        };
+        let drive_letters = match &mount_points {
+            VolumeFact::Known(points) => VolumeFact::Known(drive_letters_from_mount_points(points)),
+            VolumeFact::Unreadable(reason) => VolumeFact::Unreadable(reason.clone()),
+        };
+
+        let volume_info = read_volume_information(&guid_path);
+        let (label, filesystem) = match &volume_info {
+            Ok((label, filesystem)) => (
+                VolumeFact::Known(label.clone()),
+                VolumeFact::Known(filesystem.clone()),
+            ),
+            Err(code) => {
+                let reason = format!("GetVolumeInformationW failed (Win32 error {})", code);
+                (
+                    VolumeFact::Unreadable(reason.clone()),
+                    VolumeFact::Unreadable(reason),
+                )
+            }
+        };
+
+        let extents = read_volume_extents(device_path);
+        let (extent_count, total_bytes, disk_number, partition_number, container) = match &extents {
+            Ok(parsed) => {
+                let count = parsed.extents.len() as u32;
+                // The disk extent sum is readable even for a locked BitLocker
+                // volume; it is the volume's authoritative on-disk size.
+                let total: u64 = parsed.extents.iter().map(|e| e.extent_length).sum();
+                if parsed.extents.len() == 1 {
+                    let extent = &parsed.extents[0];
+                    let layout = disk_layout(extent.disk_number, layouts);
+                    let (partition_number, container) = match layout {
+                        Ok(layout) => {
+                            let partition = layout
+                                .partitions
+                                .iter()
+                                .find(|p| p.starting_offset == extent.starting_offset);
+                            (
+                                VolumeFact::Known(find_partition_for_extent(
+                                    layout,
+                                    extent.starting_offset,
+                                )),
+                                partition
+                                    .map(|p| {
+                                        partition_container(
+                                            layout.style,
+                                            p.partition_type_guid.as_deref(),
+                                            p.partition_type_mbr,
+                                        )
+                                    })
+                                    .unwrap_or(PartitionContainer::Unknown),
+                            )
+                        }
+                        Err(reason) => {
+                            (VolumeFact::Unreadable(reason), PartitionContainer::Unknown)
+                        }
+                    };
+                    (
+                        VolumeFact::Known(count),
+                        VolumeFact::Known(total),
+                        VolumeFact::Known(Some(extent.disk_number)),
+                        partition_number,
+                        container,
+                    )
+                } else {
+                    // Multi-extent volumes are flagged (count > 1) and carry
+                    // no single disk/partition; a later guard step refuses them.
+                    (
+                        VolumeFact::Known(count),
+                        VolumeFact::Known(total),
+                        VolumeFact::Known(None),
+                        VolumeFact::Known(None),
+                        PartitionContainer::Unknown,
+                    )
+                }
+            }
+            Err(reason) => (
+                VolumeFact::Unreadable(reason.clone()),
+                VolumeFact::Unreadable(reason.clone()),
+                VolumeFact::Unreadable(reason.clone()),
+                VolumeFact::Unreadable(reason.clone()),
+                PartitionContainer::Unknown,
+            ),
+        };
+
+        let free_bytes = match volume_free_bytes(&guid_path) {
+            Ok(free) => VolumeFact::Known(free),
+            Err(code) => {
+                VolumeFact::Unreadable(format!("GetDiskFreeSpaceExW failed (Win32 error {})", code))
+            }
+        };
+
+        let drive_type = match &mount_points {
+            VolumeFact::Known(points) => match points.first() {
+                Some(root) => {
+                    let wide = to_wide_null(root);
+                    let raw = unsafe { GetDriveTypeW(wide.as_ptr()) };
+                    VolumeFact::Known(classify_drive_type(raw))
+                }
+                None => VolumeFact::Known(VolumeDriveType::NoRootDir),
+            },
+            VolumeFact::Unreadable(reason) => VolumeFact::Unreadable(reason.clone()),
+        };
+
+        let signature = read_volume_header_signature(device_path);
+        let filesystem_view = match &volume_info {
+            Ok((_, filesystem)) => Ok(filesystem.as_deref()),
+            Err(code) => Err(*code),
+        };
+        let assessment = classify_bitlocker(container, signature, filesystem_view);
+        let is_bitlocker = match assessment.encrypted {
+            Some(value) => VolumeFact::Known(value),
+            None => VolumeFact::Unreadable(
+                assessment
+                    .state
+                    .reason()
+                    .unwrap_or("BitLocker state could not be determined")
+                    .to_string(),
+            ),
+        };
+
+        let is_system_volume = match system_guids {
+            Ok(guids) => VolumeFact::Known(volume_guid_matches_any(&guid_path, guids)),
+            Err(reason) => VolumeFact::Unreadable(reason.clone()),
+        };
+        let hosts_running_app = match app_guids {
+            Ok(guids) => VolumeFact::Known(volume_guid_matches_any(&guid_path, guids)),
+            Err(reason) => VolumeFact::Unreadable(reason.clone()),
+        };
+
+        WindowsVolumeFacts {
+            volume_guid_path: guid_path,
+            mount_points,
+            drive_letters,
+            label,
+            filesystem,
+            total_bytes,
+            free_bytes,
+            drive_type,
+            extent_count,
+            disk_number,
+            partition_number,
+            is_bitlocker,
+            bitlocker_state: assessment.state,
+            is_system_volume,
+            hosts_running_app,
+        }
+    }
+
+    /// `GetVolumePathNamesForVolumeNameW` with the documented ERROR_MORE_DATA
+    /// growth loop; the buffer is a REG_MULTI_SZ-style double-NUL list.
+    fn read_volume_path_names(guid_path: &str) -> Result<Vec<String>, String> {
+        let wide = to_wide_null(guid_path);
+        let mut buf = vec![0u16; 512];
+
+        for _ in 0..8 {
+            let mut needed = 0u32;
+            let ok = unsafe {
+                GetVolumePathNamesForVolumeNameW(
+                    wide.as_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    &mut needed,
+                )
+            };
+            if ok != 0 {
+                let used = (needed as usize).min(buf.len());
+                return Ok(parse_volume_path_names(&buf[..used]));
+            }
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            if err == ERROR_MORE_DATA {
+                let target = (needed as usize).max(buf.len() * 2);
+                buf = vec![0u16; target];
+                continue;
+            }
+            return Err(format!(
+                "GetVolumePathNamesForVolumeNameW failed (Win32 error {})",
+                err
+            ));
+        }
+
+        Err("GetVolumePathNamesForVolumeNameW kept reporting ERROR_MORE_DATA".to_string())
+    }
+
+    /// Label + filesystem-name query, preserving the Win32 error code because
+    /// the BitLocker classifier treats a locked container's failure specially.
+    fn read_volume_information(guid_path: &str) -> Result<(Option<String>, Option<String>), u32> {
+        let wide = to_wide_null(guid_path);
+        let mut name_buf = [0u16; 260];
+        let mut fs_buf = [0u16; 260];
+
+        let ok = unsafe {
+            GetVolumeInformationW(
+                wide.as_ptr(),
+                name_buf.as_mut_ptr(),
+                name_buf.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                fs_buf.as_mut_ptr(),
+                fs_buf.len() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(unsafe { windows_sys::Win32::Foundation::GetLastError() });
+        }
+
+        let label = {
+            let len = name_buf.iter().position(|&c| c == 0).unwrap_or(0);
+            if len > 0 {
+                Some(String::from_utf16_lossy(&name_buf[..len]))
+            } else {
+                None
+            }
+        };
+        let filesystem = {
+            let len = fs_buf.iter().position(|&c| c == 0).unwrap_or(0);
+            if len > 0 {
+                Some(String::from_utf16_lossy(&fs_buf[..len]))
+            } else {
+                None
+            }
+        };
+        Ok((label, filesystem))
+    }
+
+    fn read_volume_extents(device_path: &str) -> Result<ParsedVolumeExtents, String> {
+        let handle = open_volume_read_only(device_path).map_err(|e| e.to_string())?;
+        let mut buf = vec![0u8; 4096];
+        let mut returned = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle.get(),
+                IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                std::ptr::null(),
+                0,
+                buf.as_mut_ptr() as *mut _,
+                buf.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            return Err(format!(
+                "IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS failed (Win32 error {})",
+                err
+            ));
+        }
+        let used = (returned as usize).min(buf.len());
+        parse_volume_disk_extents(&buf[..used]).map_err(|e| e.0)
+    }
+
+    /// Reads the drive layout of one physical disk once per enumeration.
+    /// `Err(String)` is cached as an unreadable fact for every volume on it.
+    fn disk_layout(
+        disk_number: u32,
+        cache: &mut HashMap<u32, Result<ParsedDriveLayout, String>>,
+    ) -> Result<&ParsedDriveLayout, String> {
+        let entry = cache
+            .entry(disk_number)
+            .or_insert_with(|| read_drive_layout(disk_number).map_err(|e| e.to_string()));
+        match entry.as_ref() {
+            Ok(layout) => Ok(layout),
+            Err(reason) => Err(reason.clone()),
+        }
+    }
+
+    fn read_drive_layout(disk_number: u32) -> Result<ParsedDriveLayout, BackendError> {
+        let path = format!(r"\\.\PhysicalDrive{}", disk_number);
+        let handle = open_read_only_handle(&path, false)?;
+        let mut buf = vec![0u8; 65536];
+        let mut returned = 0u32;
+        let ok = unsafe {
+            DeviceIoControl(
+                handle.get(),
+                IOCTL_DISK_GET_DRIVE_LAYOUT_EX,
+                std::ptr::null(),
+                0,
+                buf.as_mut_ptr() as *mut _,
+                buf.len() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+            return Err(BackendError::Io(format!(
+                "Failed to read the drive layout for {} (Win32 error {})",
+                path, err
+            )));
+        }
+        let used = (returned as usize).min(buf.len());
+        parse_drive_layout_ex(&buf[..used]).map_err(|e| BackendError::Io(e.0))
+    }
+
+    fn volume_free_bytes(guid_path: &str) -> Result<u64, u32> {
+        let wide = to_wide_null(guid_path);
+        let mut free_to_caller = 0u64;
+        let mut total = 0u64;
+        let mut total_free = 0u64;
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free_to_caller,
+                &mut total,
+                &mut total_free,
+            )
+        };
+        if ok == 0 {
+            return Err(unsafe { windows_sys::Win32::Foundation::GetLastError() });
+        }
+        Ok(free_to_caller)
+    }
+
+    /// Read-only first-sector read used only for the BitLocker `-FVE-FS-`
+    /// signature. No write access is ever requested and the handle is closed
+    /// before returning.
+    fn read_volume_header_signature(device_path: &str) -> Result<BitLockerStatus, u32> {
+        let wide = to_wide_null(device_path);
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0 as FILE_FLAGS_AND_ATTRIBUTES,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(unsafe { windows_sys::Win32::Foundation::GetLastError() });
+        }
+        let handle = ScopedHandle::new(handle)
+            .ok_or_else(|| unsafe { windows_sys::Win32::Foundation::GetLastError() })?;
+
+        let mut buf = [0u8; 512];
+        let mut read = 0u32;
+        let ok = unsafe {
+            ReadFile(
+                handle.get(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(unsafe { windows_sys::Win32::Foundation::GetLastError() });
+        }
+        if read < 11 {
+            return Ok(BitLockerStatus::Unknown(format!(
+                "Only {} bytes readable from the volume header",
+                read
+            )));
+        }
+        Ok(detect_bitlocker(&buf[..read as usize]))
+    }
+
+    /// Volume GUIDs of the system Windows directory and `%SystemDrive%`.
+    /// Any resolution failure is returned as a reason (never an empty set).
+    fn system_volume_guids() -> Result<Vec<String>, String> {
+        let mut roots = Vec::new();
+        if let Ok(directory) = get_system_windows_directory() {
+            if let Some(root) = windows_volume_root(&directory) {
+                roots.push(root);
+            }
+        }
+        if let Ok(Some(system_drive)) = get_env_var("SystemDrive") {
+            if let Some(root) = windows_volume_root(&system_drive) {
+                roots.push(root);
+            }
+        }
+        resolve_volume_guids(&roots)
+    }
+
+    /// Volume GUIDs holding this executable and `%LOCALAPPDATA%`.
+    fn running_app_volume_guids() -> Result<Vec<String>, String> {
+        let mut roots = Vec::new();
+        if let Ok(module) = current_module_path() {
+            if let Some(root) = windows_volume_root(&module) {
+                roots.push(root);
+            }
+        }
+        if let Ok(Some(local_app_data)) = get_env_var("LOCALAPPDATA") {
+            if let Some(root) = windows_volume_root(&local_app_data) {
+                roots.push(root);
+            }
+        }
+        resolve_volume_guids(&roots)
+    }
+
+    fn resolve_volume_guids(roots: &[String]) -> Result<Vec<String>, String> {
+        let mut guids: Vec<String> = Vec::new();
+        for root in roots {
+            let guid = volume_guid_path_for_root(root).map_err(|e| e.to_string())?;
+            if !guids
+                .iter()
+                .any(|existing| crate::backend::windows_parse::volume_guid_eq(existing, &guid))
+            {
+                guids.push(guid);
+            }
+        }
+        if guids.is_empty() {
+            return Err("Could not resolve any volume GUID for this check".to_string());
+        }
+        Ok(guids)
     }
 }

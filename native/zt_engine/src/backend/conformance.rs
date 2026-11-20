@@ -737,7 +737,7 @@ mod tests {
     // D-a piece 2: Windows boot facts → shared disk refusal.
     // -----------------------------------------------------------------------
 
-    use crate::backend::{DiskSetFact, ElevationFact, WindowsBootFacts};
+    use crate::backend::{DiskSetFact, ElevationFact, VolumeGuidSetFact, WindowsBootFacts};
 
     fn windows_facts() -> WindowsBootFacts {
         WindowsBootFacts {
@@ -747,6 +747,9 @@ mod tests {
             hibernation_disks: DiskSetFact::known(std::iter::empty::<u32>()),
             crashdump_disks: DiskSetFact::known(std::iter::empty::<u32>()),
             app_disks: DiskSetFact::known(std::iter::empty::<u32>()),
+            pagefile_volumes: VolumeGuidSetFact::known(std::iter::empty::<String>()),
+            hibernation_volumes: VolumeGuidSetFact::known(std::iter::empty::<String>()),
+            crashdump_volumes: VolumeGuidSetFact::known(std::iter::empty::<String>()),
             elevated: ElevationFact::Known(true),
         }
     }

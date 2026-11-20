@@ -1199,14 +1199,9 @@ async fn test_repro_sdb4_wipe_reread_ebusy_after_sibling_mount() {
         dev_root: tmp.path().join("dev"),
     };
 
-    let params = zt_engine::backend::conformance::partition_params(
-        &backend,
-        "/dev/sdb4",
-        4,
-        8192,
-        4096,
-    )
-    .expect("partition params for /dev/sdb4");
+    let params =
+        zt_engine::backend::conformance::partition_params(&backend, "/dev/sdb4", 4, 8192, 4096)
+            .expect("partition params for /dev/sdb4");
     assert_eq!(params.expected_partition_num, 4);
 
     let (tx, _rx) = mpsc::channel(16);
@@ -1231,9 +1226,10 @@ async fn test_repro_sdb4_wipe_reread_ebusy_after_sibling_mount() {
     let report = res.expect("partition wipe must complete; failed re-read is a warning");
     assert!(report.success);
     assert!(
-        report.command_log.iter().any(|l| l.contains(
-            "kernel partition-table re-read failed after wipe"
-        )),
+        report
+            .command_log
+            .iter()
+            .any(|l| l.contains("kernel partition-table re-read failed after wipe")),
         "the failed re-read must be recorded as a warning, command_log: {:?}",
         report.command_log
     );

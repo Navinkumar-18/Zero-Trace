@@ -15,11 +15,13 @@ One shared guard chain + one UI; platform-specific disk access sits behind the
 
 | Layer | Where | Compiled on |
 | :--- | :--- | :--- |
-| Guard chain (boot-disk protection, live/normal/container rules, confirmation token, partition validation, fingerprint, O_EXCL) | `src/guard.rs` | every target |
+| Guard chain (boot-disk protection, live/normal/container rules, confirmation token, partition validation, Windows volume-scope guard + identity pinning + inspection, fingerprint, O_EXCL) | `src/guard.rs` | every target |
+| Step 1.4a: `windows-validate` report, Windows sanitize dry run | `src/windows_validate.rs`, `src/windows_sanitize.rs` | every target (Windows-only CLI) |
+| Step 1.4a: checkpoint sink (`CheckpointSink`, `FileCheckpointSink`) + console cancel handler | `src/checkpoint_sink.rs`, `src/platform_cancel.rs` | every target |
 | Shared types + `ValidatedTarget` (private constructor) | `src/types.rs`, `src/guard.rs` | every target |
 | `BlockBackend` trait, `current_backend()`, capabilities | `src/backend.rs` | every target |
 | `LinuxBackend` (the only real backend; owns all raw device opens/ioctls incl. `DirectBlockWriter` and the read/write primitives) | `src/backend/linux.rs` | Linux |
-| `WindowsBackend` — read-only facts only (geometry, drive layout, storage descriptors, single-disk volume extents, boot/system facts incl. system/boot/pagefile/hibernation/crash-dump/app disks + elevation); all capabilities false, every write/wipe action `Unsupported` | `src/backend/windows.rs` + `src/backend/windows_parse.rs` | Windows; the pure parse/decision modules also build under `cfg(test)` on every host |
+| `WindowsBackend` — read-only facts only (geometry, drive layout, storage descriptors, single-disk volume extents, per-volume facts: GUID path, mount points/drive letters, label, filesystem, size, free space, drive type, disk/partition number, BitLocker state, system/app flags; boot/system facts incl. system/boot/pagefile/hibernation/crash-dump/app disks, volume-level pagefile/hibernation/crash-dump GUIDs + elevation); all capabilities false, every write/wipe action `Unsupported` | `src/backend/windows.rs` + `src/backend/windows_parse.rs` | Windows; the pure parse/decision modules also build under `cfg(test)` on every host |
 | Android/unknown stubs (`Unsupported`, caps all false) | `src/backend/{unsupported,android}.rs` | every target |
 | `MockBackend` + shared conformance suite | `src/backend/{mock,conformance}.rs` | every target |
 | Engine modules (`detect`, `execute`, `partitions`, `verify`, `main`) | `src/` | Linux only (`#[cfg(target_os = "linux")]`); other targets get a stub `main` that exits 2 |
@@ -146,14 +148,15 @@ Rules for agents:
   checkpoints may gain fields only when present (old fixtures must verify or
   parse byte-identically).
 
-Reference test counts after Phase D-a piece 2 (Phase D baseline: Dart 455 /
-Rust 252 + 5 ignored): `flutter test` → 455 passing; `cargo test` → 274
-passing, 5 ignored, 0 failed (includes the `compile_fail` doc test; the
-five ignored are the two legacy loop-device writer tests
-(`native_writer_test`, `partition_scope_test`) plus the three loop-image
-tests (`loopdev_filesystem_recreation_test` and two in
+Reference test counts after Step 1.4a (Windows validate/dry-run/cancel/checkpoint plumbing):
+`flutter test` → 506 passing; `cargo test` → 342 passing, 5 ignored, 0 failed
+(includes the `compile_fail` doc test; the five ignored are the two legacy
+loop-device writer tests (`native_writer_test`, `partition_scope_test`) plus
+the three loop-image tests (`loopdev_filesystem_recreation_test` and two in
 `loopdev_isolation_test`), all of which need root + real loop devices;
 the loop-image ones also require `--features loopdev_tests` to execute);
 `flutter analyze` and `cargo clippy --all-targets -- -D warnings` must be
 clean, and `cargo check` must pass for the `x86_64-pc-windows-gnu`,
 `x86_64-pc-windows-msvc` and `aarch64-linux-android` targets.
+`tests/guard_entry_scan_test.rs` contains 7 tests (3 fail-closed and 4 static
+scans).

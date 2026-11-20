@@ -20,6 +20,8 @@
 use sha2::{Digest, Sha256};
 use std::fmt;
 
+use crate::backend::{BitLockerLockState, VolumeDriveType};
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ParseError(pub String);
 
@@ -524,7 +526,250 @@ pub fn detect_bitlocker(boot_sector_or_header: &[u8]) -> BitLockerStatus {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Layout Fingerprint (matching Linux canonical format)
+// 7. Volume facts (Step 1.2: read-only enumeration helpers)
+// ---------------------------------------------------------------------------
+
+/// BitLocker GPT partition type GUID, uppercase like [`format_guid_le`].
+pub const BITLOCKER_GPT_TYPE_GUID: &str = "DE94BBA4-06D1-4D40-A16A-BFD50179D6AC";
+
+/// `GetVolumeInformationW` failures that mean "a BitLocker container exists but
+/// the OS cannot present its filesystem": `ERROR_ACCESS_DENIED` (5),
+/// `ERROR_NOT_READY` (21) and `ERROR_UNRECOGNIZED_VOLUME` (1005). Any other
+/// error stays `Unknown`, never "unlocked".
+pub const BITLOCKER_LOCKED_FS_ERRORS: [u32; 3] = [5, 21, 1005];
+
+/// What the parent disk's drive layout says about the partition holding a
+/// volume. GPT is authoritative; MBR type `0x07` is shared with plain NTFS and
+/// exFAT, so it is only a hint that needs the volume header to disambiguate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionContainer {
+    GptBitLocker,
+    GptOther,
+    Mbr(u8),
+    Unknown,
+}
+
+/// The BitLocker conclusion for one volume. `encrypted: None` means the
+/// detection was inconclusive and the shared guard must refuse the volume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitLockerAssessment {
+    pub encrypted: Option<bool>,
+    pub state: BitLockerLockState,
+}
+
+/// Parses the `REG_MULTI_SZ`-style buffer returned by
+/// `GetVolumePathNamesForVolumeNameW` (strings separated by NUL, list
+/// terminated by an empty string). Trailing bytes without a terminator are
+/// ignored, matching the API contract rather than guessing.
+pub fn parse_volume_path_names(buf: &[u16]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut start = 0usize;
+
+    for (idx, &unit) in buf.iter().enumerate() {
+        if unit != 0 {
+            continue;
+        }
+        if idx == start {
+            // Empty string: the double-NUL list terminator.
+            break;
+        }
+        names.push(String::from_utf16_lossy(&buf[start..idx]));
+        start = idx + 1;
+    }
+
+    names
+}
+
+/// Drive letters (uppercase, no colon) from mount points such as `E:\`.
+/// Mount-folder paths and UNC paths contribute no drive letter.
+pub fn drive_letters_from_mount_points(points: &[String]) -> Vec<char> {
+    let mut letters = Vec::new();
+    for point in points {
+        let bytes = point.trim().as_bytes();
+        let is_drive_root = bytes.len() >= 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && (bytes.len() == 2 || (bytes.len() == 3 && bytes[2] == b'\\'));
+        if is_drive_root {
+            let letter = (bytes[0] as char).to_ascii_uppercase();
+            if !letters.contains(&letter) {
+                letters.push(letter);
+            }
+        }
+    }
+    letters
+}
+
+/// `GetDriveTypeW` numeric result → fact. Unknown values are preserved.
+pub fn classify_drive_type(raw: u32) -> VolumeDriveType {
+    match raw {
+        0 => VolumeDriveType::Unknown,
+        1 => VolumeDriveType::NoRootDir,
+        2 => VolumeDriveType::Removable,
+        3 => VolumeDriveType::Fixed,
+        4 => VolumeDriveType::Remote,
+        5 => VolumeDriveType::CdRom,
+        6 => VolumeDriveType::RamDisk,
+        other => VolumeDriveType::Other(other),
+    }
+}
+
+/// A volume spanning more than one disk extent must be refused by the guard.
+pub fn is_multi_extent(extent_count: u32) -> bool {
+    extent_count > 1
+}
+
+/// Finds the partition ordinal whose starting offset equals the volume's
+/// single disk extent. `None` = the (successfully read) layout has no basic
+/// partition at that offset (dynamic/storage-space volumes).
+pub fn find_partition_for_extent(layout: &ParsedDriveLayout, starting_offset: u64) -> Option<u32> {
+    layout
+        .partitions
+        .iter()
+        .find(|p| p.starting_offset == starting_offset)
+        .map(|p| p.partition_number)
+}
+
+/// Classifies the partition holding a volume from the parent disk's layout.
+pub fn partition_container(
+    style: PartitionStyle,
+    partition_type_guid: Option<&str>,
+    partition_type_mbr: Option<u8>,
+) -> PartitionContainer {
+    match style {
+        PartitionStyle::Gpt => match partition_type_guid {
+            Some(guid) if guid.eq_ignore_ascii_case(BITLOCKER_GPT_TYPE_GUID) => {
+                PartitionContainer::GptBitLocker
+            }
+            Some(_) => PartitionContainer::GptOther,
+            None => PartitionContainer::Unknown,
+        },
+        PartitionStyle::Mbr => match partition_type_mbr {
+            Some(kind) => PartitionContainer::Mbr(kind),
+            None => PartitionContainer::Unknown,
+        },
+        PartitionStyle::Raw => PartitionContainer::Unknown,
+    }
+}
+
+/// MBR partition type of a dynamic-disk container (`PARTITION_LDM`).
+pub const MBR_DYNAMIC_DISK_TYPE: u8 = 0x42;
+/// GPT LDM metadata partition (dynamic disk).
+pub const GPT_LDM_METADATA_GUID: &str = "5808C8AA-7E8F-42E0-85D2-E1E90434CFB3";
+/// GPT LDM data partition (dynamic disk).
+pub const GPT_LDM_DATA_GUID: &str = "AF9B60A0-1431-4F62-BC68-3311714A69AD";
+/// GPT Storage Spaces pool-member partition type.
+pub const GPT_STORAGE_SPACES_GUID: &str = "E75CAF8F-F680-4CEE-AFA3-B001E56EFC2D";
+
+/// True when this partition entry belongs to a dynamic disk, a Storage
+/// Spaces pool, or another non-basic container the volume guard must refuse.
+pub fn partition_is_dynamic(partition: &ParsedPartition) -> bool {
+    match (&partition.partition_type_guid, partition.partition_type_mbr) {
+        (Some(guid), _) => {
+            guid.eq_ignore_ascii_case(GPT_LDM_METADATA_GUID)
+                || guid.eq_ignore_ascii_case(GPT_LDM_DATA_GUID)
+                || guid.eq_ignore_ascii_case(GPT_STORAGE_SPACES_GUID)
+        }
+        (None, Some(kind)) => kind == MBR_DYNAMIC_DISK_TYPE,
+        (None, None) => false,
+    }
+}
+
+/// True when any partition entry marks the disk as dynamic / Storage Spaces.
+/// A volume-scoped wipe requires a basic disk layout, so the guard refuses.
+pub fn layout_is_dynamic(layout: &ParsedDriveLayout) -> bool {
+    layout.partitions.iter().any(partition_is_dynamic)
+}
+
+/// Conclusive BitLocker classification from three independent read-only
+/// signals:
+///
+/// 1. the GPT partition type GUID (authoritative: BitLocker keeps its own
+///    type GUID even while unlocked);
+/// 2. the first sector read through a read-only volume handle (`-FVE-FS-`);
+/// 3. `GetVolumeInformationW` — a locked container fails with one of
+///    [`BITLOCKER_LOCKED_FS_ERRORS`], an unlocked container reports its
+///    filesystem normally.
+///
+/// The function never guesses: a container that cannot be ruled out stays
+/// `Unknown`, which the guard treats as locked.
+pub fn classify_bitlocker(
+    container: PartitionContainer,
+    signature: Result<BitLockerStatus, u32>,
+    filesystem: Result<Option<&str>, u32>,
+) -> BitLockerAssessment {
+    let header = match &signature {
+        Ok(BitLockerStatus::Encrypted) => Some(true),
+        Ok(BitLockerStatus::NotEncrypted) => Some(false),
+        Ok(BitLockerStatus::Unknown(_)) | Err(_) => None,
+    };
+
+    let encrypted = match container {
+        PartitionContainer::GptBitLocker => Some(true),
+        PartitionContainer::GptOther => Some(false),
+        // 0x07 is shared with NTFS/exFAT; only the header can disambiguate.
+        PartitionContainer::Mbr(0x07) => header,
+        PartitionContainer::Mbr(_) => Some(header.unwrap_or(false)),
+        PartitionContainer::Unknown => header,
+    };
+
+    match encrypted {
+        Some(false) => BitLockerAssessment {
+            encrypted: Some(false),
+            state: BitLockerLockState::NotEncrypted,
+        },
+        Some(true) => {
+            let state = match filesystem {
+                Ok(Some(name)) if !name.trim().is_empty() => BitLockerLockState::Unlocked,
+                Ok(_) => BitLockerLockState::Unknown(
+                    "BitLocker container exposes no filesystem name".to_string(),
+                ),
+                Err(code) if BITLOCKER_LOCKED_FS_ERRORS.contains(&code) => {
+                    BitLockerLockState::Locked
+                }
+                Err(code) => BitLockerLockState::Unknown(format!(
+                    "BitLocker filesystem query failed (Win32 error {})",
+                    code
+                )),
+            };
+            BitLockerAssessment {
+                encrypted: Some(true),
+                state,
+            }
+        }
+        None => {
+            let reason = match signature {
+                Err(code) => format!(
+                    "volume header unreadable (Win32 error {}) and the partition type is inconclusive",
+                    code
+                ),
+                Ok(BitLockerStatus::Unknown(detail)) => detail,
+                Ok(_) => "partition type is inconclusive (MBR type 0x07)".to_string(),
+            };
+            BitLockerAssessment {
+                encrypted: None,
+                state: BitLockerLockState::Unknown(reason),
+            }
+        }
+    }
+}
+
+/// Case-insensitive volume GUID comparison, tolerating a trailing backslash.
+pub fn volume_guid_eq(a: &str, b: &str) -> bool {
+    fn normalize(value: &str) -> String {
+        value.trim().trim_end_matches('\\').to_ascii_lowercase()
+    }
+    let left = normalize(a);
+    !left.is_empty() && left == normalize(b)
+}
+
+/// True when `volume_guid` matches any of `candidates`.
+pub fn volume_guid_matches_any(volume_guid: &str, candidates: &[String]) -> bool {
+    candidates.iter().any(|c| volume_guid_eq(volume_guid, c))
+}
+
+// ---------------------------------------------------------------------------
+// 8. Layout Fingerprint (matching Linux canonical format)
 // ---------------------------------------------------------------------------
 
 /// Computes SHA-256 partition table fingerprint matching the Linux format:
@@ -640,6 +885,38 @@ pub fn windows_volume_root(path: &str) -> Option<String> {
     }
 
     None
+}
+
+/// Normalizes a user-supplied volume selector to the mount-point form that
+/// `GetVolumeNameForVolumeMountPointW` expects.
+///
+/// * `E`, `e:` and `E:\` become `E:\`;
+/// * a path below a drive root (`E:\sub\dir`) is kept as a mount-point path
+///   (it may be a mount-folder volume; the read-only resolution decides);
+/// * a `\\?\Volume{GUID}` path and UNC/other forms get a trailing backslash.
+///
+/// Pure string work: no resolution and no Win32 call. An empty selector
+/// returns an empty string (the caller refuses it).
+pub fn windows_mount_root(selector: &str) -> String {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return String::new();
+    }
+    let bytes = selector.as_bytes();
+    if bytes.len() == 1 && bytes[0].is_ascii_alphabetic() {
+        return format!("{}:\\", selector.to_ascii_uppercase());
+    }
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        let rest = &selector[2..];
+        if rest.is_empty() || rest == "\\" {
+            return format!("{}:\\", selector[..1].to_ascii_uppercase());
+        }
+    }
+    let mut out = selector.to_string();
+    if !out.ends_with('\\') {
+        out.push('\\');
+    }
+    out
 }
 
 /// Expands `%SystemRoot%` / `%WINDIR%` / `%SystemDrive%` in a registry path.
@@ -1246,6 +1523,27 @@ mod tests {
     }
 
     #[test]
+    fn test_windows_mount_root_normalizes_volume_selectors() {
+        assert_eq!(windows_mount_root("E"), r"E:\");
+        assert_eq!(windows_mount_root("e"), r"E:\");
+        assert_eq!(windows_mount_root("E:"), r"E:\");
+        assert_eq!(windows_mount_root(r"E:\"), r"E:\");
+        assert_eq!(windows_mount_root("  e:  "), r"E:\");
+        assert_eq!(windows_mount_root(r"E:\sub\dir"), r"E:\sub\dir\");
+        assert_eq!(
+            windows_mount_root(r"\\?\Volume{11111111-1111-1111-1111-111111111111}"),
+            r"\\?\Volume{11111111-1111-1111-1111-111111111111}\"
+        );
+        assert_eq!(
+            windows_mount_root(r"\\?\Volume{11111111-1111-1111-1111-111111111111}\"),
+            r"\\?\Volume{11111111-1111-1111-1111-111111111111}\"
+        );
+        assert_eq!(windows_mount_root(r"\\server\share"), r"\\server\share\");
+        assert_eq!(windows_mount_root(""), "");
+        assert_eq!(windows_mount_root("   "), "");
+    }
+
+    #[test]
     fn test_pagefile_volume_roots_handles_system_managed_entries() {
         let entries = vec![
             r"C:\pagefile.sys 0 0".to_string(),
@@ -1307,5 +1605,362 @@ mod tests {
             "C:"
         )
         .is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Step 1.2: read-only volume facts
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_parse_volume_path_names_multi_sz() {
+        // "C:\\\0D:\\\0\0" (UTF-16), trailing metadata bytes ignored.
+        let units: Vec<u16> = "C:\\"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .chain("D:\\".encode_utf16())
+            .chain(std::iter::once(0))
+            .chain(std::iter::once(0))
+            .chain([0x77, 0x88])
+            .collect();
+        assert_eq!(
+            parse_volume_path_names(&units),
+            vec!["C:\\".to_string(), "D:\\".to_string()]
+        );
+
+        // Empty list (only the double-NUL terminator).
+        assert!(parse_volume_path_names(&[0, 0, 0]).is_empty());
+        assert!(parse_volume_path_names(&[]).is_empty());
+
+        // Unterminated tail is ignored rather than guessed.
+        let unterminated: Vec<u16> = "E:\\".encode_utf16().collect();
+        assert!(parse_volume_path_names(&unterminated).is_empty());
+    }
+
+    #[test]
+    fn test_drive_letters_from_mount_points() {
+        let points = vec![
+            r"E:\".to_string(),
+            r"F:\".to_string(),
+            r"E:\".to_string(),              // duplicate
+            r"\\?\Volume{abc}\".to_string(), // volume path contributes none
+            r"C:\Mount\Data\".to_string(),   // mount-folder path contributes none
+            r"\\server\share".to_string(),   // UNC contributes none
+            "g:".to_string(),                // lower-case, no trailing slash
+        ];
+        assert_eq!(
+            drive_letters_from_mount_points(&points),
+            vec!['E', 'F', 'G']
+        );
+        assert!(drive_letters_from_mount_points(&[]).is_empty());
+    }
+
+    #[test]
+    fn test_classify_drive_type() {
+        assert_eq!(classify_drive_type(2), VolumeDriveType::Removable);
+        assert_eq!(classify_drive_type(3), VolumeDriveType::Fixed);
+        assert_eq!(classify_drive_type(4), VolumeDriveType::Remote);
+        assert_eq!(classify_drive_type(5), VolumeDriveType::CdRom);
+        assert_eq!(classify_drive_type(6), VolumeDriveType::RamDisk);
+        assert_eq!(classify_drive_type(1), VolumeDriveType::NoRootDir);
+        assert_eq!(classify_drive_type(0), VolumeDriveType::Unknown);
+        // Unknown values are preserved, never mapped to a default.
+        assert_eq!(classify_drive_type(42), VolumeDriveType::Other(42));
+        assert!(classify_drive_type(2).is_removable());
+        assert!(classify_drive_type(3).is_fixed());
+    }
+
+    #[test]
+    fn test_is_multi_extent() {
+        assert!(!is_multi_extent(0));
+        assert!(!is_multi_extent(1));
+        assert!(is_multi_extent(2));
+        assert!(is_multi_extent(17));
+    }
+
+    /// GPT layout fixture with three partitions, matching the offsets used by
+    /// `parse_drive_layout_ex` (48-byte header, 144-byte entries).
+    fn layout_fixture() -> Vec<u8> {
+        let mut buf = vec![0u8; 48 + 144 * 3];
+        buf[0..4].copy_from_slice(&1u32.to_le_bytes()); // PartitionStyle = GPT
+        buf[4..8].copy_from_slice(&3u32.to_le_bytes()); // PartitionCount = 3
+
+        for (idx, (number, start_bytes)) in [
+            (1u32, 1_048_576u64),
+            (2u32, 20_971_520u64),
+            (3u32, 41_943_040u64),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let entry = &mut buf[48 + idx * 144..48 + (idx + 1) * 144];
+            entry[8..16].copy_from_slice(&(*start_bytes as i64).to_le_bytes());
+            entry[16..24].copy_from_slice(&(1_048_576i64).to_le_bytes());
+            entry[24..28].copy_from_slice(&number.to_le_bytes());
+            // Basic data GUID EBD0A0A2-B9E5-4433-87C0-68B6B72699C7 (a zero
+            // GUID marks an unused table entry and is skipped by the parser).
+            entry[32..36].copy_from_slice(&0xEBD0A0A2u32.to_le_bytes());
+            entry[36..38].copy_from_slice(&0xB9E5u16.to_le_bytes());
+            entry[38..40].copy_from_slice(&0x4433u16.to_le_bytes());
+            entry[40..48].copy_from_slice(&[0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7]);
+        }
+        buf
+    }
+
+    #[test]
+    fn test_find_partition_for_extent() {
+        let layout = parse_drive_layout_ex(&layout_fixture()).unwrap();
+        assert_eq!(find_partition_for_extent(&layout, 1_048_576), Some(1));
+        assert_eq!(find_partition_for_extent(&layout, 20_971_520), Some(2));
+        assert_eq!(find_partition_for_extent(&layout, 41_943_040), Some(3));
+        // A readable layout with no partition at the extent offset is a fact.
+        assert_eq!(find_partition_for_extent(&layout, 123_456), None);
+    }
+
+    #[test]
+    fn test_partition_container() {
+        assert_eq!(
+            partition_container(
+                PartitionStyle::Gpt,
+                Some("de94bba4-06d1-4d40-a16a-bfd50179d6ac"),
+                None
+            ),
+            PartitionContainer::GptBitLocker
+        );
+        assert_eq!(
+            partition_container(
+                PartitionStyle::Gpt,
+                Some("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"),
+                None
+            ),
+            PartitionContainer::GptOther
+        );
+        assert_eq!(
+            partition_container(PartitionStyle::Gpt, None, None),
+            PartitionContainer::Unknown
+        );
+        assert_eq!(
+            partition_container(PartitionStyle::Mbr, None, Some(0x07)),
+            PartitionContainer::Mbr(0x07)
+        );
+        assert_eq!(
+            partition_container(PartitionStyle::Mbr, None, None),
+            PartitionContainer::Unknown
+        );
+        assert_eq!(
+            partition_container(PartitionStyle::Raw, None, None),
+            PartitionContainer::Unknown
+        );
+    }
+
+    fn partition_fixture(guid: Option<&str>, mbr: Option<u8>) -> ParsedPartition {
+        ParsedPartition {
+            partition_number: 1,
+            starting_offset: 1_048_576,
+            partition_length: 32_000_000_000,
+            start_sector: 2048,
+            size_sectors: 62_500_000,
+            partition_type_guid: guid.map(str::to_string),
+            partition_type_mbr: mbr,
+        }
+    }
+
+    fn layout_with(partition: ParsedPartition) -> ParsedDriveLayout {
+        ParsedDriveLayout {
+            style: if partition.partition_type_guid.is_some() {
+                PartitionStyle::Gpt
+            } else {
+                PartitionStyle::Mbr
+            },
+            partitions: vec![partition],
+        }
+    }
+
+    #[test]
+    fn test_layout_is_dynamic_detects_ldm_and_storage_spaces() {
+        // Basic GPT data partition: not dynamic.
+        let basic = layout_with(partition_fixture(
+            Some("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"),
+            None,
+        ));
+        assert!(!layout_is_dynamic(&basic));
+
+        // GPT LDM metadata / data and Storage Spaces types.
+        for guid in [
+            GPT_LDM_METADATA_GUID,
+            GPT_LDM_DATA_GUID,
+            GPT_STORAGE_SPACES_GUID,
+        ] {
+            let layout = layout_with(partition_fixture(Some(guid), None));
+            assert!(
+                layout_is_dynamic(&layout),
+                "GPT type {} must be dynamic",
+                guid
+            );
+            assert!(partition_is_dynamic(&layout.partitions[0]));
+        }
+
+        // Case-insensitive GUID match.
+        let lower_guid = GPT_LDM_DATA_GUID.to_ascii_lowercase();
+        let lower = layout_with(partition_fixture(Some(&lower_guid), None));
+        assert!(layout_is_dynamic(&lower));
+
+        // MBR dynamic-disk container type 0x42.
+        let mbr_dynamic = layout_with(partition_fixture(None, Some(0x42)));
+        assert!(layout_is_dynamic(&mbr_dynamic));
+
+        // Basic MBR NTFS is not dynamic.
+        let mbr_basic = layout_with(partition_fixture(None, Some(0x07)));
+        assert!(!layout_is_dynamic(&mbr_basic));
+
+        // Empty and Raw layouts are not flagged as dynamic (the guard refuses
+        // them separately as non-basic).
+        assert!(!layout_is_dynamic(&ParsedDriveLayout {
+            style: PartitionStyle::Raw,
+            partitions: Vec::new(),
+        }));
+    }
+
+    #[test]
+    fn test_bitlocker_gpt_container_is_locked_when_filesystem_is_not_ready() {
+        for code in BITLOCKER_LOCKED_FS_ERRORS {
+            let assessment =
+                classify_bitlocker(PartitionContainer::GptBitLocker, Err(code), Err(code));
+            assert_eq!(assessment.encrypted, Some(true));
+            assert_eq!(assessment.state, BitLockerLockState::Locked);
+            assert!(assessment.state.treated_as_locked());
+        }
+    }
+
+    #[test]
+    fn test_bitlocker_gpt_container_is_unlocked_when_filesystem_is_readable() {
+        let assessment = classify_bitlocker(
+            PartitionContainer::GptBitLocker,
+            Ok(BitLockerStatus::Encrypted),
+            Ok(Some("NTFS")),
+        );
+        assert_eq!(assessment.encrypted, Some(true));
+        assert_eq!(assessment.state, BitLockerLockState::Unlocked);
+        assert!(!assessment.state.treated_as_locked());
+        assert_eq!(assessment.state.is_encrypted(), Some(true));
+    }
+
+    #[test]
+    fn test_bitlocker_unexpected_filesystem_error_is_unknown_not_unlocked() {
+        let assessment = classify_bitlocker(
+            PartitionContainer::GptBitLocker,
+            Ok(BitLockerStatus::Encrypted),
+            Err(87), // ERROR_INVALID_PARAMETER — not a lock signal
+        );
+        assert_eq!(assessment.encrypted, Some(true));
+        assert!(matches!(assessment.state, BitLockerLockState::Unknown(_)));
+        assert!(assessment.state.treated_as_locked());
+    }
+
+    #[test]
+    fn test_bitlocker_empty_filesystem_name_is_unknown() {
+        for filesystem in [Ok(None), Ok(Some("")), Ok(Some("   "))] {
+            let assessment = classify_bitlocker(
+                PartitionContainer::GptBitLocker,
+                Ok(BitLockerStatus::Encrypted),
+                filesystem,
+            );
+            assert!(
+                matches!(assessment.state, BitLockerLockState::Unknown(_)),
+                "state was {:?}",
+                assessment.state
+            );
+        }
+    }
+
+    #[test]
+    fn test_bitlocker_not_encrypted_is_conclusive_from_gpt_type() {
+        // GPT basic-data type is authoritative even when the header read fails.
+        let assessment = classify_bitlocker(PartitionContainer::GptOther, Err(5), Ok(Some("NTFS")));
+        assert_eq!(assessment.encrypted, Some(false));
+        assert_eq!(assessment.state, BitLockerLockState::NotEncrypted);
+        assert!(!assessment.state.treated_as_locked());
+        assert_eq!(assessment.state.is_encrypted(), Some(false));
+    }
+
+    #[test]
+    fn test_bitlocker_mbr_0x07_requires_a_readable_header() {
+        // Unreadable header: cannot rule BitLocker To Go out -> Unknown.
+        let unknown = classify_bitlocker(PartitionContainer::Mbr(0x07), Err(21), Ok(Some("NTFS")));
+        assert!(matches!(unknown.state, BitLockerLockState::Unknown(_)));
+        assert!(unknown.state.treated_as_locked());
+
+        // Readable header without the FVE signature -> conclusively not encrypted.
+        let plain = classify_bitlocker(
+            PartitionContainer::Mbr(0x07),
+            Ok(BitLockerStatus::NotEncrypted),
+            Ok(Some("NTFS")),
+        );
+        assert_eq!(plain.encrypted, Some(false));
+        assert_eq!(plain.state, BitLockerLockState::NotEncrypted);
+
+        // Readable FVE header -> encrypted; filesystem decides locked/unlocked.
+        let locked = classify_bitlocker(
+            PartitionContainer::Mbr(0x07),
+            Ok(BitLockerStatus::Encrypted),
+            Err(21),
+        );
+        assert_eq!(locked.state, BitLockerLockState::Locked);
+
+        // Another MBR type cannot be a BitLocker container.
+        let fat = classify_bitlocker(PartitionContainer::Mbr(0x0c), Err(5), Ok(Some("FAT32")));
+        assert_eq!(fat.encrypted, Some(false));
+    }
+
+    #[test]
+    fn test_bitlocker_signature_overrides_mbr_non_07_type() {
+        // Defensive: a readable FVE header wins over an unexpected MBR type.
+        let assessment = classify_bitlocker(
+            PartitionContainer::Mbr(0x83),
+            Ok(BitLockerStatus::Encrypted),
+            Err(21),
+        );
+        assert_eq!(assessment.state, BitLockerLockState::Locked);
+    }
+
+    #[test]
+    fn test_bitlocker_unknown_container_and_header_stays_unknown() {
+        let assessment = classify_bitlocker(
+            PartitionContainer::Unknown,
+            Ok(BitLockerStatus::Unknown("short read".to_string())),
+            Ok(Some("NTFS")),
+        );
+        assert_eq!(assessment.encrypted, None);
+        assert!(matches!(assessment.state, BitLockerLockState::Unknown(_)));
+        assert!(assessment.state.treated_as_locked());
+
+        let no_header = classify_bitlocker(PartitionContainer::Unknown, Err(5), Err(5));
+        match no_header.state {
+            BitLockerLockState::Unknown(reason) => {
+                assert!(reason.contains("Win32 error 5"), "reason: {}", reason)
+            }
+            other => panic!("expected Unknown, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_volume_guid_eq_normalizes_case_and_trailing_slash() {
+        assert!(volume_guid_eq(
+            r"\\?\Volume{01234567-89AB-CDEF-0123-456789ABCDEF}\",
+            r"\\?\volume{01234567-89ab-cdef-0123-456789abcdef}"
+        ));
+        assert!(!volume_guid_eq(
+            r"\\?\Volume{01234567-89AB-CDEF-0123-456789ABCDEF}\",
+            r"\\?\Volume{FFFFFFFF-89AB-CDEF-0123-456789ABCDEF}\"
+        ));
+        // An empty candidate never matches (fail closed, not "matches nothing to protect").
+        assert!(!volume_guid_eq(r"\\?\Volume{abc}\", ""));
+    }
+
+    #[test]
+    fn test_volume_guid_matches_any() {
+        let system = vec![r"\\?\Volume{AAA}\".to_string()];
+        assert!(volume_guid_matches_any(r"\\?\volume{aaa}", &system));
+        assert!(!volume_guid_matches_any(r"\\?\Volume{BBB}\", &system));
+        assert!(!volume_guid_matches_any(r"\\?\Volume{AAA}\", &[]));
     }
 }

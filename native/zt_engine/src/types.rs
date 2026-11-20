@@ -50,6 +50,45 @@ pub enum ExecuteError {
     /// Phase F: the target is (or belongs to) the running system/live disk.
     #[error("Filesystem recreation refused: target is a system partition: {0}")]
     SystemPartition(String),
+    /// Step 1.3: Windows volume guard — the process token is not elevated
+    /// (or the elevation fact is unreadable).
+    #[error("Windows volume guard refused: process is not elevated: {0}")]
+    WindowsVolumeNotElevated(String),
+    /// Step 1.3: the target volume has no drive letter (EFI/recovery/OEM
+    /// partitions are never wipe targets).
+    #[error("Windows volume guard refused: volume has no drive letter: {0}")]
+    WindowsVolumeNoDriveLetter(String),
+    /// Step 1.3: the target volume is the Windows system/boot volume or
+    /// holds the running Zero Trace application.
+    #[error("Windows volume guard refused: volume is a protected system/app volume: {0}")]
+    WindowsVolumeProtected(String),
+    /// Step 1.3: the target volume holds an active page file, hibernation
+    /// file or crash dump.
+    #[error("Windows volume guard refused: volume holds an active Windows file: {0}")]
+    WindowsVolumeInUse(String),
+    /// Step 1.3: the target is not exactly one basic local partition (multi-
+    /// extent, dynamic disk, Storage Spaces, VHD/virtual disk, or an
+    /// unreadable layout).
+    #[error("Windows volume guard refused: volume is not a single basic local partition: {0}")]
+    WindowsVolumeNotBasic(String),
+    /// Step 1.3: BitLocker reports `Locked`, or the state is unknown (fail
+    /// closed — `Unknown` is never "not encrypted").
+    #[error("Windows volume guard refused: BitLocker state is locked or unknown: {0}")]
+    WindowsVolumeBitLockerLocked(String),
+    /// Step 1.3: volume size / logical sector size is unreadable, zero, or
+    /// the size is not a multiple of the logical block size.
+    #[error("Windows volume guard refused: volume geometry is unreadable or misaligned: {0}")]
+    WindowsVolumeGeometry(String),
+    /// Step 1.3: a fact required to build the confirmation token (drive
+    /// letter, label, size) exists but could not be read.
+    #[error("Windows volume guard refused: required volume fact is unreadable: {0}")]
+    WindowsVolumeFactsUnreadable(String),
+    /// Step 1.3: the volume is on the same physical disk as the system
+    /// volume and the caller did not supply the extra confirmation token.
+    #[error(
+        "Windows volume guard refused: same-disk-as-system confirmation missing or wrong: {0}"
+    )]
+    WindowsVolumeSameDiskConfirmation(String),
     /// Phase F: the validated scope and the node handed to the formatter do
     /// not agree (e.g. partition scope with the whole-disk device node).
     #[error("Filesystem recreation refused: target scope mismatch: {0}")]
@@ -66,6 +105,46 @@ pub enum ExecuteError {
     /// format it cannot honor.
     #[error("Verified-wipe receipt failed: {0}")]
     VerifiedWipeReceiptFailed(String),
+}
+
+impl ExecuteError {
+    /// Stable machine-readable variant name. Step 1.4a: the
+    /// `windows-validate` CLI prints this so the Flutter side can branch on
+    /// the exact refusal instead of parsing English messages. Adding a
+    /// variant requires adding its arm here (the match is exhaustive).
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            ExecuteError::BootDiskProtection(_) => "BootDiskProtection",
+            ExecuteError::ConfirmationMismatch => "ConfirmationMismatch",
+            ExecuteError::CommandFailed(_) => "CommandFailed",
+            ExecuteError::DeviceNotFound(_) => "DeviceNotFound",
+            ExecuteError::UnsupportedOperation(_) => "UnsupportedOperation",
+            ExecuteError::IoError(_) => "IoError",
+            ExecuteError::HardwareIo(_) => "HardwareIo",
+            ExecuteError::DeviceDisconnected(_) => "DeviceDisconnected",
+            ExecuteError::PrematureEndOfDevice(_) => "PrematureEndOfDevice",
+            ExecuteError::ChannelClosed => "ChannelClosed",
+            ExecuteError::IdentityMismatch(_) => "IdentityMismatch",
+            ExecuteError::NotWipedAndVerified => "NotWipedAndVerified",
+            ExecuteError::TargetMounted(_) => "TargetMounted",
+            ExecuteError::SystemPartition(_) => "SystemPartition",
+            ExecuteError::WindowsVolumeNotElevated(_) => "WindowsVolumeNotElevated",
+            ExecuteError::WindowsVolumeNoDriveLetter(_) => "WindowsVolumeNoDriveLetter",
+            ExecuteError::WindowsVolumeProtected(_) => "WindowsVolumeProtected",
+            ExecuteError::WindowsVolumeInUse(_) => "WindowsVolumeInUse",
+            ExecuteError::WindowsVolumeNotBasic(_) => "WindowsVolumeNotBasic",
+            ExecuteError::WindowsVolumeBitLockerLocked(_) => "WindowsVolumeBitLockerLocked",
+            ExecuteError::WindowsVolumeGeometry(_) => "WindowsVolumeGeometry",
+            ExecuteError::WindowsVolumeFactsUnreadable(_) => "WindowsVolumeFactsUnreadable",
+            ExecuteError::WindowsVolumeSameDiskConfirmation(_) => {
+                "WindowsVolumeSameDiskConfirmation"
+            }
+            ExecuteError::FilesystemScopeMismatch(_) => "FilesystemScopeMismatch",
+            ExecuteError::UnsupportedFilesystem(_) => "UnsupportedFilesystem",
+            ExecuteError::FilesystemRecreationFailed(_) => "FilesystemRecreationFailed",
+            ExecuteError::VerifiedWipeReceiptFailed(_) => "VerifiedWipeReceiptFailed",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

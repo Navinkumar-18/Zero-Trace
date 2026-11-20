@@ -483,6 +483,11 @@ impl BlockBackend for LinuxBackend {
                 target.canonical_path().to_string(),
                 target.canonical_path().to_string(),
             ),
+            crate::guard::TargetScope::Volume { .. } => {
+                return Err(BackendError::Unsupported(
+                    "partition-table re-read for a volume-scoped target",
+                ))
+            }
         };
         let read_path = self.device_file_path(&device, &canonical);
         // Fixture/temp-file targets have no kernel partition table to re-read.

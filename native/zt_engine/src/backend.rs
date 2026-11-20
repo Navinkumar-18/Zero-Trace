@@ -244,6 +244,66 @@ impl DiskSetFact {
     }
 }
 
+/// A set of Windows volume GUID paths (`\\?\Volume{...}\`) reported by a
+/// backend.
+///
+/// Step 1.3: the disk-level boot facts cannot name which volume on a disk
+/// holds a page file / hibernation file / crash dump. These volume-level
+/// facts do, so a volume-scoped guard can refuse the exact volume while
+/// still allowing another data volume on the same physical disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VolumeGuidSetFact {
+    Known(Vec<String>),
+    Unreadable(String),
+}
+
+impl VolumeGuidSetFact {
+    /// Build a `Known` fact with deterministic (sorted, unique,
+    /// trailing-backslash-normalized) contents.
+    pub fn known<I: IntoIterator<Item = String>>(volumes: I) -> Self {
+        fn normalize(value: &str) -> String {
+            let trimmed = value.trim().trim_end_matches('\\');
+            if trimmed.is_empty() {
+                String::new()
+            } else {
+                format!("{}\\", trimmed)
+            }
+        }
+
+        let mut volumes: Vec<String> = volumes
+            .into_iter()
+            .map(|value| normalize(&value))
+            .filter(|value| !value.is_empty())
+            .collect();
+        volumes.sort();
+        volumes.dedup();
+        Self::Known(volumes)
+    }
+
+    pub fn unreadable(reason: impl Into<String>) -> Self {
+        Self::Unreadable(reason.into())
+    }
+
+    /// Known volume GUIDs, or `None` when the fact is unreadable.
+    pub fn volumes(&self) -> Option<&[String]> {
+        match self {
+            Self::Known(volumes) => Some(volumes),
+            Self::Unreadable(_) => None,
+        }
+    }
+
+    pub fn is_unreadable(&self) -> bool {
+        matches!(self, Self::Unreadable(_))
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Known(_) => None,
+            Self::Unreadable(reason) => Some(reason),
+        }
+    }
+}
+
 /// Whether the process token is elevated (`TOKEN_QUERY` + `TokenElevation`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ElevationFact {
@@ -292,8 +352,181 @@ pub struct WindowsBootFacts {
     pub crashdump_disks: DiskSetFact,
     /// Disk(s) holding this executable and its application data directory.
     pub app_disks: DiskSetFact,
+    /// Volume(s) holding active page files from `PagingFiles`.
+    pub pagefile_volumes: VolumeGuidSetFact,
+    /// Volume holding `hiberfil.sys` when hibernation is enabled.
+    pub hibernation_volumes: VolumeGuidSetFact,
+    /// Volume(s) holding the configured crash-dump / minidump targets.
+    pub crashdump_volumes: VolumeGuidSetFact,
     /// Whether the current process token is elevated (`TokenElevation`).
     pub elevated: ElevationFact,
+}
+
+/// A single Windows volume fact that is either known or exists-but-unreadable.
+///
+/// Step 1.2: discovery never substitutes a default for an unreadable fact.
+/// `Unreadable` carries the reason and the shared guard must refuse any
+/// volume whose safety-relevant facts cannot be read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
+pub enum VolumeFact<T> {
+    Known(T),
+    Unreadable(String),
+}
+
+impl<T> VolumeFact<T> {
+    pub fn known(value: T) -> Self {
+        Self::Known(value)
+    }
+
+    pub fn unreadable(reason: impl Into<String>) -> Self {
+        Self::Unreadable(reason.into())
+    }
+
+    pub fn as_known(&self) -> Option<&T> {
+        match self {
+            Self::Known(value) => Some(value),
+            Self::Unreadable(_) => None,
+        }
+    }
+
+    pub fn is_unreadable(&self) -> bool {
+        matches!(self, Self::Unreadable(_))
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Known(_) => None,
+            Self::Unreadable(reason) => Some(reason),
+        }
+    }
+}
+
+/// `GetDriveTypeW` classification, reported as a fact.
+///
+/// `NoRootDir` is the Win32 value (a volume with no drive-letter/mount-point
+/// root); it is not an error. `Other` preserves an unknown numeric value
+/// instead of mapping it to a default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeDriveType {
+    Unknown,
+    NoRootDir,
+    Removable,
+    Fixed,
+    Remote,
+    CdRom,
+    RamDisk,
+    Other(u32),
+}
+
+impl VolumeDriveType {
+    pub fn is_removable(self) -> bool {
+        matches!(self, Self::Removable)
+    }
+
+    pub fn is_fixed(self) -> bool {
+        matches!(self, Self::Fixed)
+    }
+}
+
+/// Three-state-plus BitLocker protection fact for an enumerated volume.
+///
+/// `Unknown` is **not** "not encrypted": the shared guard must treat it as
+/// locked and refuse the volume. `NotEncrypted` is only reported when the
+/// detection was conclusive (GPT type GUID, or a readable volume header).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BitLockerLockState {
+    NotEncrypted,
+    Locked,
+    Unlocked,
+    Unknown(String),
+}
+
+impl BitLockerLockState {
+    /// `Some(true)` = encrypted, `Some(false)` = conclusively not encrypted,
+    /// `None` = the encryption state could not be determined.
+    pub fn is_encrypted(&self) -> Option<bool> {
+        match self {
+            Self::Locked | Self::Unlocked => Some(true),
+            Self::NotEncrypted => Some(false),
+            Self::Unknown(_) => None,
+        }
+    }
+
+    /// Guard policy (Step 1.3 consumes this): locked **or** unknown refuses.
+    pub fn treated_as_locked(&self) -> bool {
+        matches!(self, Self::Locked | Self::Unknown(_))
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Unknown(reason) => Some(reason),
+            _ => None,
+        }
+    }
+}
+
+/// Read-only facts for one Windows volume (Step 1.2).
+///
+/// A volume with more than one disk extent has `extent_count > 1` and
+/// `disk_number = Known(None)` — it is flagged for a later refusal instead of
+/// being mapped to a single disk. `total_bytes` is the sum of the disk
+/// extents (readable even for a locked BitLocker volume); `free_bytes` is the
+/// filesystem view and is `Unreadable` when the volume cannot be queried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowsVolumeFacts {
+    /// Always the `\\?\Volume{GUID}\` form with a trailing backslash.
+    pub volume_guid_path: String,
+    /// Every mount point returned by `GetVolumePathNamesForVolumeNameW`
+    /// (drive letters and/or mount-folder paths).
+    pub mount_points: VolumeFact<Vec<String>>,
+    /// Drive letters derived from `mount_points` (uppercase, no colon).
+    pub drive_letters: VolumeFact<Vec<char>>,
+    pub label: VolumeFact<Option<String>>,
+    pub filesystem: VolumeFact<Option<String>>,
+    /// Sum of the volume's disk extents.
+    pub total_bytes: VolumeFact<u64>,
+    /// `GetDiskFreeSpaceExW` free-bytes-to-caller.
+    pub free_bytes: VolumeFact<u64>,
+    pub drive_type: VolumeFact<VolumeDriveType>,
+    pub extent_count: VolumeFact<u32>,
+    /// `Known(Some(n))` only for a single-extent volume.
+    pub disk_number: VolumeFact<Option<u32>>,
+    /// Partition ordinal mapped from the parent disk's drive layout.
+    /// `Known(None)` = a readable layout has no matching basic partition.
+    pub partition_number: VolumeFact<Option<u32>>,
+    pub is_bitlocker: VolumeFact<bool>,
+    pub bitlocker_state: BitLockerLockState,
+    pub is_system_volume: VolumeFact<bool>,
+    pub hosts_running_app: VolumeFact<bool>,
+}
+
+impl WindowsVolumeFacts {
+    /// Lowest drive letter, when the volume has one. Lowest (not API order)
+    /// keeps the typed confirmation token deterministic when a volume has
+    /// several mount points.
+    pub fn primary_drive_letter(&self) -> Option<char> {
+        self.drive_letters
+            .as_known()
+            .and_then(|letters| letters.iter().copied().min())
+    }
+
+    /// First mount point (drive root or mount-folder path).
+    pub fn primary_mount_point(&self) -> Option<&str> {
+        self.mount_points
+            .as_known()
+            .and_then(|points| points.first().map(String::as_str))
+    }
+
+    /// `Some(true)` = a readable fact says the volume spans several extents;
+    /// `None` = the extent count is unreadable.
+    pub fn is_multi_extent(&self) -> Option<bool> {
+        self.extent_count
+            .as_known()
+            .map(|count| crate::backend::windows_parse::is_multi_extent(*count))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -366,28 +599,21 @@ impl ExclusiveHandle {
 
     /// Write at `offset` — **absolute device byte offset**, bounds-enforced
     /// against the validated scope: a partition-scoped handle refuses any
-    /// write outside `[start_bytes, start_bytes + size_bytes)`, so it can
-    /// never touch the partition table or sibling partitions.
+    /// write outside `[start_bytes, start_bytes + size_bytes)`, and a
+    /// volume-scoped handle refuses any write outside `[0, size_bytes)`
+    /// (volume handles are volume-relative), so it can never touch the
+    /// partition table, sibling partitions or a different volume.
     pub fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<usize> {
-        if let crate::guard::TargetScope::Partition {
-            start_bytes,
-            size_bytes,
-            ..
-        } = self.target.scope()
-        {
+        if let Some((lo, hi, label)) = self.target.scope().write_bounds() {
             let end = offset.checked_add(data.len() as u64).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset overflow")
-            })?;
-            let lo = *start_bytes;
-            let hi = start_bytes.checked_add(*size_bytes).ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "scope overflow")
             })?;
             if offset < lo || end > hi {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!(
-                        "write [{}..{}) outside validated partition range [{}..{}) for {}",
-                        offset, end, lo, hi, self.path
+                        "write [{}..{}) outside validated {} range [{}..{}) for {}",
+                        offset, end, label, lo, hi, self.path
                     ),
                 ));
             }
@@ -472,6 +698,18 @@ pub trait BlockBackend {
 
     fn enumerate_devices(&self) -> Result<Vec<DeviceInfo>, BackendError>;
     fn enumerate_partitions(&self, device: &str) -> Result<Vec<PartitionFacts>, BackendError>;
+    /// Read-only Windows volume facts (Step 1.2). Only `WindowsBackend`
+    /// implements this; every other backend reports `Unsupported`.
+    fn enumerate_volumes(&self) -> Result<Vec<WindowsVolumeFacts>, BackendError> {
+        Err(BackendError::Unsupported("volume enumeration"))
+    }
+    /// Read-only resolution of a user-supplied volume selector (`E`, `E:`,
+    /// `E:\`, a mount-folder path or a `\\?\Volume{GUID}\` path) to its
+    /// canonical volume GUID path (Step 1.4a). Only `WindowsBackend` can
+    /// resolve real mount points; every other backend reports `Unsupported`.
+    fn resolve_volume_guid(&self, _selector: &str) -> Result<String, BackendError> {
+        Err(BackendError::Unsupported("volume GUID resolution"))
+    }
 
     // -- Facts consumed by the shared guard chain --------------------------
 
@@ -490,6 +728,17 @@ pub trait BlockBackend {
     /// read must be `Unreadable`, never an empty set (the guard fail-closes).
     fn windows_boot_facts(&self) -> Result<Option<WindowsBootFacts>, BackendError> {
         Ok(None)
+    }
+    /// Read-only parsed partition table of one Windows physical disk (Step
+    /// 1.3). Only `WindowsBackend` implements this; every other backend
+    /// reports `Unsupported`. The shared guard uses the parsed layout to pin
+    /// the partition-table fingerprint, the partition starting offset and
+    /// the dynamic-disk flags.
+    fn windows_drive_layout(
+        &self,
+        _disk_number: u32,
+    ) -> Result<windows_parse::ParsedDriveLayout, BackendError> {
+        Err(BackendError::Unsupported("Windows drive layout"))
     }
     fn canonicalize_path(&self, path: &str, dry_run: bool) -> Result<String, ExecuteError>;
     /// `class/block/<name>/<attr_rel>` content (e.g. `partition`, `start`,

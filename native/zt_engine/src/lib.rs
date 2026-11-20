@@ -20,6 +20,20 @@ pub mod backend;
 pub mod guard;
 pub mod types;
 
+// Phase Step 1.1: platform-neutral wipe/verify cores. These carry no device
+// access; Linux/Windows/Android backends supply the `BlockWriter` and
+// `SectorReader` implementations.
+pub mod verify_core;
+pub mod wipe_core;
+
+// Step 1.4a: platform-neutral plumbing for the Windows volume flow —
+// checkpoint storage behind an injected sink, console-control cancellation,
+// the read-only `windows-validate` report and the Windows sanitize dry run.
+pub mod checkpoint_sink;
+pub mod platform_cancel;
+pub mod windows_sanitize;
+pub mod windows_validate;
+
 #[cfg(target_os = "linux")]
 pub mod detect;
 #[cfg(target_os = "linux")]

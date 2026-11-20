@@ -26,8 +26,13 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
+use crate::backend::windows_parse::{
+    compute_windows_partition_fingerprint, layout_is_dynamic, volume_guid_eq, ParsedDriveLayout,
+    PartitionStyle,
+};
 use crate::backend::{
-    BackendError, BlockBackend, DiskSetFact, ElevationFact, Relation, WindowsBootFacts,
+    BackendError, BitLockerLockState, BlockBackend, DiskSetFact, ElevationFact, Relation,
+    VolumeFact, VolumeGuidSetFact, WindowsBootFacts, WindowsVolumeFacts,
 };
 use crate::types::{
     dev_major, dev_minor, is_mount_unmountable_allowlisted, parse_major_minor, BootEnvironment,
@@ -52,14 +57,29 @@ pub enum TargetScope {
         size_bytes: u64,
         logical_block_size: u64,
     },
+    /// Volume-scoped Windows wipe: the handle is the volume itself, so its
+    /// byte range is volume-relative `[0, size_bytes)`. The parent-disk
+    /// coordinates are pinned on [`WindowsVolumeIdentity`] instead.
+    Volume {
+        disk_number: u32,
+        partition_number: u32,
+        /// Always `0`: writes are volume-relative.
+        start_bytes: u64,
+        size_bytes: u64,
+        /// `\\?\Volume{...}\` of the target.
+        volume_guid: String,
+        /// Drive letter used in the typed confirmation token.
+        drive_letter: char,
+        logical_block_size: u64,
+    },
 }
 
 impl TargetScope {
     /// Byte range `start..end` of a partition scope on the parent device
-    /// (None = whole disk).
+    /// (None = whole disk or volume-relative scope).
     pub fn partition_range(&self) -> Option<(u64, u64)> {
         match self {
-            TargetScope::WholeDisk => None,
+            TargetScope::WholeDisk | TargetScope::Volume { .. } => None,
             TargetScope::Partition {
                 start_bytes,
                 size_bytes,
@@ -67,6 +87,59 @@ impl TargetScope {
             } => Some((*start_bytes, start_bytes.saturating_add(*size_bytes))),
         }
     }
+
+    /// Bounds enforced by [`crate::backend::ExclusiveHandle::write_at`]:
+    /// `(low, high, scope label)`. `None` = whole disk (no extra bound).
+    pub(crate) fn write_bounds(&self) -> Option<(u64, u64, &'static str)> {
+        match self {
+            TargetScope::WholeDisk => None,
+            TargetScope::Partition {
+                start_bytes,
+                size_bytes,
+                ..
+            } => Some((
+                *start_bytes,
+                start_bytes.saturating_add(*size_bytes),
+                "partition",
+            )),
+            TargetScope::Volume {
+                start_bytes,
+                size_bytes,
+                ..
+            } => Some((
+                *start_bytes,
+                start_bytes.saturating_add(*size_bytes),
+                "volume",
+            )),
+        }
+    }
+}
+
+/// Warnings that the UI must surface for a validated Windows volume target.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct WindowsVolumeWarnings {
+    /// The volume is BitLocker-protected and currently unlocked. On-disk data
+    /// is ciphertext; verification reads the decrypted view through Windows.
+    pub bitlocker_unlocked: bool,
+    /// The volume shares a physical disk with the Windows system volume.
+    /// Validation additionally required the caller's same-disk confirmation.
+    pub same_disk_as_system: bool,
+}
+
+/// Identity pinned at Windows volume validation time (Step 1.3) and
+/// re-checked immediately before the lock in Step 1.4.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct WindowsVolumeIdentity {
+    pub disk_number: u32,
+    pub partition_number: u32,
+    /// Absolute offset of the partition on the parent disk.
+    pub partition_start_bytes: u64,
+    /// Volume logical size; also the write bound `[0, size_bytes)`.
+    pub size_bytes: u64,
+    /// `\\?\Volume{...}\` form.
+    pub volume_guid: String,
+    /// Windows partition-table fingerprint (`compute_windows_partition_fingerprint`).
+    pub partition_table_fingerprint: String,
 }
 
 /// A target that has passed the full guard chain: confirmation token, boot
@@ -101,6 +174,11 @@ pub struct ValidatedTarget {
     /// every destructive firmware command. `0` = geometry unavailable at
     /// mint time (fixture backends), comparison skipped.
     pinned_size_bytes: u64,
+    /// Step 1.3: Windows volume identity pinned by
+    /// [`validate_windows_volume_target`]. `None` for Linux scopes.
+    windows_volume: Option<WindowsVolumeIdentity>,
+    /// Step 1.3: warnings the UI must surface for a Windows volume target.
+    windows_warnings: WindowsVolumeWarnings,
 }
 
 impl ValidatedTarget {
@@ -116,6 +194,26 @@ impl ValidatedTarget {
             guard_identity,
             scope,
             pinned_size_bytes,
+            windows_volume: None,
+            windows_warnings: WindowsVolumeWarnings::default(),
+        }
+    }
+
+    /// Sealed Windows-volume constructor (Step 1.3).
+    fn sealed_windows_volume(
+        canonical_path: String,
+        guard_identity: GuardIdentity,
+        scope: TargetScope,
+        identity: WindowsVolumeIdentity,
+        warnings: WindowsVolumeWarnings,
+    ) -> Self {
+        Self {
+            canonical_path,
+            guard_identity,
+            scope,
+            pinned_size_bytes: identity.size_bytes,
+            windows_volume: Some(identity),
+            windows_warnings: warnings,
         }
     }
 
@@ -129,6 +227,16 @@ impl ValidatedTarget {
 
     pub fn scope(&self) -> &TargetScope {
         &self.scope
+    }
+
+    /// Step 1.3: pinned Windows volume identity, when this is a volume target.
+    pub fn windows_volume_identity(&self) -> Option<&WindowsVolumeIdentity> {
+        self.windows_volume.as_ref()
+    }
+
+    /// Step 1.3: warnings the UI must display (both false for Linux scopes).
+    pub fn windows_warnings(&self) -> WindowsVolumeWarnings {
+        self.windows_warnings
     }
 
     pub fn device_serial(&self) -> &str {
@@ -739,6 +847,769 @@ pub fn check_windows_boot_disk_protection(
     check_windows_boot_facts_for_disk(&facts, disk)
 }
 
+// ---------------------------------------------------------------------------
+// Step 1.3: Windows volume-scope guard
+// ---------------------------------------------------------------------------
+
+/// Prefix of the extra confirmation token required when the target volume
+/// shares a physical disk with the Windows system volume.
+pub const WINDOWS_SAME_DISK_PREFIX: &str = "SAME DISK ";
+
+/// Placeholder label field for a volume with no label.
+pub const WINDOWS_NO_LABEL: &str = "NO_LABEL";
+
+/// Caller inputs for [`validate_windows_volume_target`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsVolumeTargetParams {
+    /// `\\?\Volume{...}\` (or any form compared by `volume_guid_eq`).
+    pub volume_guid: String,
+    /// Required token: `<letter>: <label> <size>`, e.g. `E: BACKUP 29.8GB`.
+    pub confirmation_token: String,
+    /// Required only when the volume is on the system volume's physical
+    /// disk: `SAME DISK <letter>: <label> <size>`.
+    pub same_disk_confirmation: Option<String>,
+}
+
+/// Formats a byte count for the typed confirmation token: the largest
+/// decimal (SI, 1000-based) unit with at least 1.0, one rounded decimal and
+/// no space, e.g. `29.8GB`, `500.1GB`, `1.0TB`. Rounding is half-up on
+/// integer arithmetic so the Dart dialog can reproduce it exactly.
+pub fn format_windows_volume_size(bytes: u64) -> String {
+    const UNITS: [(u64, &str); 4] = [
+        (1_000_000_000_000, "TB"),
+        (1_000_000_000, "GB"),
+        (1_000_000, "MB"),
+        (1_000, "KB"),
+    ];
+
+    if bytes < 1_000 {
+        return format!("{}B", bytes);
+    }
+
+    let mut index = UNITS
+        .iter()
+        .position(|(unit, _)| bytes >= *unit)
+        .unwrap_or(UNITS.len() - 1);
+
+    loop {
+        let (unit, suffix) = UNITS[index];
+        let tenths = ((bytes as u128) * 10 + (unit as u128) / 2) / (unit as u128);
+        // 999.95+ rounded to 1000.0 — promote to the next larger unit so the
+        // token never says "1000.0GB".
+        if tenths >= 10_000 && index > 0 {
+            index -= 1;
+            continue;
+        }
+        return format!("{}.{}{}", tenths / 10, tenths % 10, suffix);
+    }
+}
+
+/// Canonical required confirmation token from volume facts:
+/// `"<letter>: <label> <size>"`.
+///
+/// * letter: uppercase drive letter, colon attached;
+/// * label: reported label trimmed; the literal `NO_LABEL` when absent/empty;
+/// * size: [`format_windows_volume_size`] of `total_bytes`, no space before
+///   the unit.
+pub fn windows_volume_confirmation_token(
+    facts: &WindowsVolumeFacts,
+) -> Result<String, ExecuteError> {
+    let (letter, label, size) = windows_volume_token_parts(facts)?;
+    Ok(format!("{}: {} {}", letter, label, size))
+}
+
+/// Canonical same-disk token: `SAME DISK <required token>`.
+pub fn windows_volume_same_disk_token(facts: &WindowsVolumeFacts) -> Result<String, ExecuteError> {
+    Ok(format!(
+        "{}{}",
+        WINDOWS_SAME_DISK_PREFIX,
+        windows_volume_confirmation_token(facts)?
+    ))
+}
+
+fn windows_volume_token_parts(
+    facts: &WindowsVolumeFacts,
+) -> Result<(char, String, String), ExecuteError> {
+    let letter = facts.primary_drive_letter().ok_or_else(|| {
+        ExecuteError::WindowsVolumeNoDriveLetter(format!(
+            "Volume '{}' has no drive letter mount point",
+            facts.volume_guid_path
+        ))
+    })?;
+
+    let label = match &facts.label {
+        VolumeFact::Known(Some(label)) => {
+            let trimmed = label.trim();
+            if trimmed.is_empty() {
+                WINDOWS_NO_LABEL.to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }
+        VolumeFact::Known(None) => WINDOWS_NO_LABEL.to_string(),
+        VolumeFact::Unreadable(reason) => {
+            return Err(ExecuteError::WindowsVolumeFactsUnreadable(format!(
+                "Cannot read the volume label for '{}': {}",
+                facts.volume_guid_path, reason
+            )))
+        }
+    };
+
+    let size = match &facts.total_bytes {
+        VolumeFact::Known(bytes) => format_windows_volume_size(*bytes),
+        VolumeFact::Unreadable(reason) => {
+            return Err(ExecuteError::WindowsVolumeGeometry(format!(
+                "Cannot read the volume size for '{}': {}",
+                facts.volume_guid_path, reason
+            )))
+        }
+    };
+
+    Ok((letter, label, size))
+}
+
+/// Parses `"<letter>: <label> <size>"`. Label may contain spaces; the size
+/// is the last whitespace-delimited token. `None` = malformed.
+fn split_windows_volume_token(token: &str) -> Option<(char, String, String)> {
+    let token = token.trim();
+    let (head, rest) = token.split_once(|c: char| c.is_whitespace())?;
+
+    let mut head_chars = head.chars();
+    let letter = head_chars.next()?.to_ascii_uppercase();
+    if !letter.is_ascii_alphabetic() || head_chars.next()? != ':' {
+        return None;
+    }
+    if head_chars.next().is_some() {
+        return None;
+    }
+
+    let rest = rest.trim();
+    let split_at = rest.rfind(|c: char| c.is_whitespace())?;
+    let label = rest[..split_at].trim();
+    let size = rest[split_at..].trim();
+    if label.is_empty() || size.is_empty() {
+        return None;
+    }
+
+    Some((letter, label.to_string(), size.to_ascii_uppercase()))
+}
+
+/// Verifies the required token: case-insensitive drive letter, trimmed label
+/// (exact otherwise), case-insensitive size unit. Any mismatch is the
+/// existing typed [`ExecuteError::ConfirmationMismatch`].
+pub fn verify_windows_volume_confirmation(
+    token: &str,
+    facts: &WindowsVolumeFacts,
+) -> Result<(), ExecuteError> {
+    let (letter, label, size) = windows_volume_token_parts(facts)?;
+    let Some((got_letter, got_label, got_size)) = split_windows_volume_token(token) else {
+        return Err(ExecuteError::ConfirmationMismatch);
+    };
+    if got_letter != letter || got_label != label || got_size != size.to_ascii_uppercase() {
+        return Err(ExecuteError::ConfirmationMismatch);
+    }
+    Ok(())
+}
+
+/// Verifies the extra same-disk token (`SAME DISK <required token>`). The
+/// prefix is case-insensitive; the remainder follows the required-token
+/// rules.
+pub fn verify_windows_same_disk_confirmation(
+    token: &str,
+    facts: &WindowsVolumeFacts,
+) -> Result<(), ExecuteError> {
+    let token = token.trim();
+    let prefix = token.get(..WINDOWS_SAME_DISK_PREFIX.len()).ok_or_else(|| {
+        ExecuteError::WindowsVolumeSameDiskConfirmation(
+            "same-disk confirmation must start with 'SAME DISK '".to_string(),
+        )
+    })?;
+    if !prefix.eq_ignore_ascii_case(WINDOWS_SAME_DISK_PREFIX) {
+        return Err(ExecuteError::WindowsVolumeSameDiskConfirmation(
+            "same-disk confirmation must start with 'SAME DISK '".to_string(),
+        ));
+    }
+    verify_windows_volume_confirmation(&token[WINDOWS_SAME_DISK_PREFIX.len()..], facts).map_err(
+        |_| {
+            ExecuteError::WindowsVolumeSameDiskConfirmation(
+                "same-disk confirmation token does not match the target volume".to_string(),
+            )
+        },
+    )
+}
+
+fn windows_volume_flag_refusal(fact: &VolumeFact<bool>, what: &str) -> Option<String> {
+    match fact {
+        VolumeFact::Known(true) => Some(format!("Volume {}", what)),
+        VolumeFact::Known(false) => None,
+        VolumeFact::Unreadable(reason) => Some(format!(
+            "Cannot read whether the volume {} ({}): refusing destructive operation (fail closed)",
+            what, reason
+        )),
+    }
+}
+
+fn windows_volume_set_refusal(
+    fact: &VolumeGuidSetFact,
+    volume_guid: &str,
+    what: &str,
+) -> Option<String> {
+    match fact {
+        VolumeGuidSetFact::Unreadable(reason) => Some(format!(
+            "Cannot read the Windows {} volume fact ({}): refusing destructive operation (fail closed)",
+            what, reason
+        )),
+        VolumeGuidSetFact::Known(volumes) => {
+            if volumes
+                .iter()
+                .any(|candidate| volume_guid_eq(candidate, volume_guid))
+            {
+                Some(format!("Volume {} ({})", what, volume_guid))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn windows_volume_known<T: Copy>(fact: &VolumeFact<T>, what: &str) -> Result<T, ExecuteError> {
+    match fact {
+        VolumeFact::Known(value) => Ok(*value),
+        VolumeFact::Unreadable(reason) => Err(ExecuteError::WindowsVolumeNotBasic(format!(
+            "Cannot read the volume {} ({}): refusing destructive operation (fail closed)",
+            what, reason
+        ))),
+    }
+}
+
+/// Reads the parent-disk layout and returns `(partition, fingerprint)` for the
+/// target partition. A layout that cannot be read or has no matching basic
+/// partition is a refusal, never a guess.
+fn windows_volume_layout_identity(
+    backend: &dyn BlockBackend,
+    disk_number: u32,
+    partition_number: u32,
+) -> Result<(crate::backend::windows_parse::ParsedPartition, String), ExecuteError> {
+    let layout: ParsedDriveLayout = backend.windows_drive_layout(disk_number).map_err(|e| {
+        ExecuteError::WindowsVolumeNotBasic(format!(
+            "Cannot read the partition table of disk {} ({}): refusing destructive operation",
+            disk_number, e
+        ))
+    })?;
+
+    if !matches!(layout.style, PartitionStyle::Gpt | PartitionStyle::Mbr) {
+        return Err(ExecuteError::WindowsVolumeNotBasic(format!(
+            "Disk {} has no basic MBR/GPT partition table ({:?})",
+            disk_number, layout.style
+        )));
+    }
+    if layout_is_dynamic(&layout) {
+        return Err(ExecuteError::WindowsVolumeNotBasic(format!(
+            "Disk {} is a dynamic disk / Storage Spaces member",
+            disk_number
+        )));
+    }
+
+    let partition = layout
+        .partitions
+        .iter()
+        .find(|partition| partition.partition_number == partition_number)
+        .cloned()
+        .ok_or_else(|| {
+            ExecuteError::WindowsVolumeNotBasic(format!(
+                "Disk {} has no basic partition #{} in its drive layout",
+                disk_number, partition_number
+            ))
+        })?;
+
+    let fingerprint = compute_windows_partition_fingerprint(&layout.partitions);
+    Ok((partition, fingerprint))
+}
+
+/// Every fact and policy decision for a Windows volume target, with the
+/// typed confirmation excluded: used by `windows-validate` to show the
+/// required tokens, warnings and pinned identity, and by
+/// [`validate_windows_volume_target`] as its single pre-token decision path.
+#[derive(Debug, Clone)]
+pub struct WindowsVolumeInspection {
+    pub volume_guid: String,
+    pub facts: WindowsVolumeFacts,
+    pub drive_letter: char,
+    pub size_bytes: u64,
+    pub logical_block_size: u64,
+    pub identity: WindowsVolumeIdentity,
+    pub warnings: WindowsVolumeWarnings,
+    /// Canonical required token: `<letter>: <label> <size>`.
+    pub required_confirmation: String,
+    /// `SAME DISK <required token>` when the volume shares the system disk.
+    pub required_same_disk_confirmation: Option<String>,
+}
+
+/// Runs every Windows volume check **except** the typed confirmation tokens:
+/// elevation, drive letter, local drive type, system/app volume,
+/// boot/pagefile/hibernation/crash-dump, single basic extent, dynamic disk,
+/// Storage Spaces, VHD, BitLocker and geometry. The volume is re-enumerated
+/// by the guard (the caller cannot pass stale or forged facts).
+pub fn inspect_windows_volume_target(
+    backend: &dyn BlockBackend,
+    volume_guid: &str,
+) -> Result<WindowsVolumeInspection, ExecuteError> {
+    // 1. Elevation. Missing/unreadable facts are a refusal, never a pass.
+    let boot_facts = backend
+        .windows_boot_facts()
+        .map_err(|e| {
+            ExecuteError::WindowsVolumeNotElevated(format!(
+                "Cannot read the Windows elevation fact ({}): refusing destructive operation (fail closed)",
+                e
+            ))
+        })?
+        .ok_or_else(|| {
+            ExecuteError::WindowsVolumeNotElevated(
+                "Windows boot/elevation facts are unavailable on this backend".to_string(),
+            )
+        })?;
+    if let Some(reason) = windows_elevation_refusal(&boot_facts) {
+        return Err(ExecuteError::WindowsVolumeNotElevated(reason));
+    }
+
+    // 2. Re-enumerate and select the exact volume.
+    let volumes = backend.enumerate_volumes().map_err(|e| {
+        ExecuteError::UnsupportedOperation(format!(
+            "Cannot enumerate Windows volumes on this backend: {}",
+            e
+        ))
+    })?;
+    let facts = volumes
+        .iter()
+        .find(|volume| volume_guid_eq(&volume.volume_guid_path, volume_guid))
+        .ok_or_else(|| {
+            ExecuteError::DeviceNotFound(format!(
+                "Windows volume '{}' was not enumerated",
+                volume_guid
+            ))
+        })?;
+
+    // 3. Drive letter and local drive type: EFI/recovery/OEM volumes,
+    //    network shares, CD-ROMs and RAM disks are never targets.
+    let letter = match &facts.drive_letters {
+        VolumeFact::Known(letters) if !letters.is_empty() => {
+            *letters.iter().min().expect("non-empty")
+        }
+        VolumeFact::Known(_) => {
+            return Err(ExecuteError::WindowsVolumeNoDriveLetter(format!(
+                "Volume '{}' has no drive-letter mount point",
+                facts.volume_guid_path
+            )))
+        }
+        VolumeFact::Unreadable(reason) => {
+            return Err(ExecuteError::WindowsVolumeNoDriveLetter(format!(
+                "Cannot read the mount points of '{}' ({}): refusing destructive operation (fail closed)",
+                facts.volume_guid_path, reason
+            )))
+        }
+    };
+    let drive_type = windows_volume_known(&facts.drive_type, "drive type")?;
+    if !matches!(
+        drive_type,
+        crate::backend::VolumeDriveType::Fixed | crate::backend::VolumeDriveType::Removable
+    ) {
+        return Err(ExecuteError::WindowsVolumeNotBasic(format!(
+            "Volume '{}' has drive type {:?}; only local fixed/removable volumes can be wiped",
+            facts.volume_guid_path, drive_type
+        )));
+    }
+
+    // 4. System / running-app volume.
+    if let Some(reason) =
+        windows_volume_flag_refusal(&facts.is_system_volume, "is the Windows system/boot volume")
+    {
+        return Err(ExecuteError::WindowsVolumeProtected(reason));
+    }
+    if let Some(reason) = windows_volume_flag_refusal(
+        &facts.hosts_running_app,
+        "holds the running Zero Trace application",
+    ) {
+        return Err(ExecuteError::WindowsVolumeProtected(reason));
+    }
+
+    // 5. Page file / hibernation file / crash dump, at volume granularity.
+    if let Some(reason) = windows_volume_set_refusal(
+        &boot_facts.pagefile_volumes,
+        &facts.volume_guid_path,
+        "holds an active page file",
+    ) {
+        return Err(ExecuteError::WindowsVolumeInUse(reason));
+    }
+    if let Some(reason) = windows_volume_set_refusal(
+        &boot_facts.hibernation_volumes,
+        &facts.volume_guid_path,
+        "holds the hibernation file",
+    ) {
+        return Err(ExecuteError::WindowsVolumeInUse(reason));
+    }
+    if let Some(reason) = windows_volume_set_refusal(
+        &boot_facts.crashdump_volumes,
+        &facts.volume_guid_path,
+        "holds the crash-dump target",
+    ) {
+        return Err(ExecuteError::WindowsVolumeInUse(reason));
+    }
+
+    // 6. Exactly one basic local partition.
+    let extent_count = windows_volume_known(&facts.extent_count, "extent count")?;
+    if extent_count != 1 {
+        return Err(ExecuteError::WindowsVolumeNotBasic(format!(
+            "Volume '{}' spans {} disk extents (exactly 1 is required)",
+            facts.volume_guid_path, extent_count
+        )));
+    }
+    let disk_number =
+        windows_volume_known(&facts.disk_number, "disk number")?.ok_or_else(|| {
+            ExecuteError::WindowsVolumeNotBasic(format!(
+                "Volume '{}' has no single disk number",
+                facts.volume_guid_path
+            ))
+        })?;
+    let partition_number = windows_volume_known(&facts.partition_number, "partition number")?
+        .ok_or_else(|| {
+            ExecuteError::WindowsVolumeNotBasic(format!(
+                "Volume '{}' has no basic partition number",
+                facts.volume_guid_path
+            ))
+        })?;
+
+    // 7. Parent-disk layout, dynamic-disk flags, starting offset, fingerprint.
+    let (partition, fingerprint) =
+        windows_volume_layout_identity(backend, disk_number, partition_number)?;
+
+    // 8. Storage Spaces / VHD / virtual disk transport.
+    let devices = backend.enumerate_devices().map_err(|e| {
+        ExecuteError::WindowsVolumeNotBasic(format!(
+            "Cannot enumerate physical disks to classify disk {} ({}): refusing destructive operation",
+            disk_number, e
+        ))
+    })?;
+    let disk_info = devices
+        .iter()
+        .find(|device| windows_disk_number(&device.name) == Some(disk_number))
+        .ok_or_else(|| {
+            ExecuteError::WindowsVolumeNotBasic(format!(
+                "Physical disk {} was not found in device discovery",
+                disk_number
+            ))
+        })?;
+    match disk_info.transport.as_deref() {
+        Some("virtual") => {
+            return Err(ExecuteError::WindowsVolumeNotBasic(format!(
+                "Disk {} is a virtual disk (VHD/VHDX); volume wipes require a physical disk",
+                disk_number
+            )))
+        }
+        Some("spaces") => {
+            return Err(ExecuteError::WindowsVolumeNotBasic(format!(
+                "Disk {} is a Storage Spaces disk; volume wipes require a basic physical disk",
+                disk_number
+            )))
+        }
+        Some(_) => {}
+        None => {
+            return Err(ExecuteError::WindowsVolumeNotBasic(format!(
+                "Cannot determine the transport of physical disk {}",
+                disk_number
+            )))
+        }
+    }
+
+    // 9. BitLocker: locked and unknown both refuse; unlocked is allowed with
+    //    the warning. Unlocked on-disk data is ciphertext, not plaintext.
+    if facts.bitlocker_state.treated_as_locked() {
+        let reason = facts
+            .bitlocker_state
+            .reason()
+            .unwrap_or("BitLocker reports the volume as locked");
+        return Err(ExecuteError::WindowsVolumeBitLockerLocked(format!(
+            "Volume '{}': {}",
+            facts.volume_guid_path, reason
+        )));
+    }
+    let bitlocker_unlocked = facts.bitlocker_state == BitLockerLockState::Unlocked;
+
+    // 10. Size / logical block size.
+    let size_bytes = match &facts.total_bytes {
+        VolumeFact::Known(bytes) if *bytes > 0 => *bytes,
+        VolumeFact::Known(_) => {
+            return Err(ExecuteError::WindowsVolumeGeometry(format!(
+                "Volume '{}' reports a zero size",
+                facts.volume_guid_path
+            )))
+        }
+        VolumeFact::Unreadable(reason) => {
+            return Err(ExecuteError::WindowsVolumeGeometry(format!(
+                "Cannot read the size of '{}' ({}): refusing destructive operation (fail closed)",
+                facts.volume_guid_path, reason
+            )))
+        }
+    };
+    let geometry = backend
+        .device_geometry(&facts.volume_guid_path)
+        .map_err(|e| {
+            ExecuteError::WindowsVolumeGeometry(format!(
+                "Cannot read the logical sector size of '{}' ({}): refusing destructive operation (fail closed)",
+                facts.volume_guid_path, e
+            ))
+        })?;
+    let logical_block_size = u64::from(geometry.logical_block_size);
+    if logical_block_size == 0 {
+        return Err(ExecuteError::WindowsVolumeGeometry(format!(
+            "Volume '{}' reports a zero logical block size",
+            facts.volume_guid_path
+        )));
+    }
+    if size_bytes % logical_block_size != 0 {
+        return Err(ExecuteError::WindowsVolumeGeometry(format!(
+            "Volume '{}' size {} is not a multiple of the logical block size {}",
+            facts.volume_guid_path, size_bytes, logical_block_size
+        )));
+    }
+
+    // 11. Same-physical-disk-as-system fact: an unreadable system-disk set
+    //     refuses (fail closed). The extra token itself is verified by
+    //     `validate_windows_volume_target`.
+    let system_disks = match &boot_facts.system_disks {
+        DiskSetFact::Known(disks) => disks,
+        DiskSetFact::Unreadable(reason) => {
+            return Err(ExecuteError::WindowsVolumeProtected(format!(
+                "Cannot read the Windows system-disk fact ({}): refusing destructive operation (fail closed)",
+                reason
+            )))
+        }
+    };
+    let same_disk_as_system = system_disks.contains(&disk_number);
+
+    let volume_guid_path = facts.volume_guid_path.clone();
+    let identity = WindowsVolumeIdentity {
+        disk_number,
+        partition_number,
+        partition_start_bytes: partition.starting_offset,
+        size_bytes,
+        volume_guid: volume_guid_path.clone(),
+        partition_table_fingerprint: fingerprint,
+    };
+    let warnings = WindowsVolumeWarnings {
+        bitlocker_unlocked,
+        same_disk_as_system,
+    };
+    // Both token builders only need facts that steps 3 and 10 already
+    // validated; an unreadable label is still a typed refusal here.
+    let required_confirmation = windows_volume_confirmation_token(facts)?;
+    let required_same_disk_confirmation = if same_disk_as_system {
+        Some(windows_volume_same_disk_token(facts)?)
+    } else {
+        None
+    };
+
+    Ok(WindowsVolumeInspection {
+        volume_guid: volume_guid_path,
+        facts: facts.clone(),
+        drive_letter: letter,
+        size_bytes,
+        logical_block_size,
+        identity,
+        warnings,
+        required_confirmation,
+        required_same_disk_confirmation,
+    })
+}
+
+/// Validates a Windows volume as a wipe target and mints the sealed
+/// [`ValidatedTarget`]. **Every** decision lives here; the backend only
+/// supplied facts.
+///
+/// The volume is re-enumerated by the guard (the caller cannot pass stale or
+/// forged facts), then refused with a distinct typed error for: unelevated
+/// process, no drive letter, system/app volume, boot/pagefile/hibernation/
+/// crash-dump volume, multi-extent / unknown disk or partition / dynamic
+/// disk / Storage Spaces / VHD, locked or unknown BitLocker, unreadable or
+/// misaligned geometry, and a wrong typed confirmation. An unlocked
+/// BitLocker volume is allowed with
+/// [`WindowsVolumeWarnings::bitlocker_unlocked`]; a volume on the system
+/// volume's physical disk is allowed only with the extra same-disk token and
+/// sets [`WindowsVolumeWarnings::same_disk_as_system`].
+pub fn validate_windows_volume_target(
+    backend: &dyn BlockBackend,
+    params: &WindowsVolumeTargetParams,
+) -> Result<ValidatedTarget, ExecuteError> {
+    let inspection = inspect_windows_volume_target(backend, &params.volume_guid)?;
+
+    // Typed confirmation (single pass/fail decision for the whole chain).
+    verify_windows_volume_confirmation(&params.confirmation_token, &inspection.facts)?;
+
+    // Same-physical-disk-as-system policy: not a blanket refusal, but an
+    // extra explicit confirmation and a warning flag.
+    if let Some(required) = &inspection.required_same_disk_confirmation {
+        let token = params.same_disk_confirmation.as_deref().ok_or_else(|| {
+            ExecuteError::WindowsVolumeSameDiskConfirmation(format!(
+                "Volume '{}' is on the Windows system disk {}; type '{}' to continue",
+                inspection.volume_guid, inspection.identity.disk_number, required
+            ))
+        })?;
+        verify_windows_same_disk_confirmation(token, &inspection.facts)?;
+    }
+
+    let guard_identity = GuardIdentity {
+        canonical_path: inspection.volume_guid.clone(),
+        st_rdev: 0,
+        major: 0,
+        minor: 0,
+        is_block: true,
+        device_serial: inspection.volume_guid.clone(),
+        st_ino: 0,
+    };
+    let scope = TargetScope::Volume {
+        disk_number: inspection.identity.disk_number,
+        partition_number: inspection.identity.partition_number,
+        start_bytes: 0,
+        size_bytes: inspection.size_bytes,
+        volume_guid: inspection.volume_guid.clone(),
+        drive_letter: inspection.drive_letter,
+        logical_block_size: inspection.logical_block_size,
+    };
+
+    Ok(ValidatedTarget::sealed_windows_volume(
+        inspection.volume_guid,
+        guard_identity,
+        scope,
+        inspection.identity,
+        inspection.warnings,
+    ))
+}
+
+/// Resolves a CLI/UI volume selector (`E`, `E:`, `E:\`, a mount point or a
+/// `\\?\Volume{GUID}\` path) to its canonical volume GUID path. A selector
+/// that does not resolve is the typed [`ExecuteError::DeviceNotFound`]; a
+/// backend without Volume GUID resolution (non-Windows) is
+/// [`ExecuteError::UnsupportedOperation`].
+pub fn resolve_windows_volume_target(
+    backend: &dyn BlockBackend,
+    selector: &str,
+) -> Result<String, ExecuteError> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return Err(ExecuteError::DeviceNotFound(
+            "empty Windows volume selector".to_string(),
+        ));
+    }
+    backend.resolve_volume_guid(selector).map_err(|e| match e {
+        crate::backend::BackendError::Unsupported(_) => ExecuteError::UnsupportedOperation(
+            "volume GUID resolution is only available on Windows".to_string(),
+        ),
+        other => ExecuteError::DeviceNotFound(format!(
+            "Cannot resolve Windows volume '{}': {}",
+            selector, other
+        )),
+    })
+}
+
+/// Re-checks every pinned Windows volume identity value immediately before
+/// the lock (Step 1.4). Any drift — vanished volume, changed disk/partition,
+/// changed size, changed starting offset, changed partition table, or a
+/// volume that became locked — is a hard [`ExecuteError::IdentityMismatch`].
+pub fn revalidate_windows_volume_identity(
+    backend: &dyn BlockBackend,
+    target: &ValidatedTarget,
+) -> Result<(), ExecuteError> {
+    let identity = target.windows_volume_identity().ok_or_else(|| {
+        ExecuteError::IdentityMismatch(
+            "Revalidation requires a validated Windows volume target".to_string(),
+        )
+    })?;
+
+    let volumes = backend.enumerate_volumes().map_err(|e| {
+        ExecuteError::IdentityMismatch(format!(
+            "Cannot re-enumerate Windows volumes before the lock: {}",
+            e
+        ))
+    })?;
+    let facts = volumes
+        .iter()
+        .find(|volume| volume_guid_eq(&volume.volume_guid_path, &identity.volume_guid))
+        .ok_or_else(|| {
+            ExecuteError::IdentityMismatch(format!(
+                "Volume '{}' disappeared after validation",
+                identity.volume_guid
+            ))
+        })?;
+
+    if facts.bitlocker_state.treated_as_locked() {
+        return Err(ExecuteError::WindowsVolumeBitLockerLocked(format!(
+            "Volume '{}' is locked or its BitLocker state is unknown after validation",
+            identity.volume_guid
+        )));
+    }
+
+    let extent_count = windows_volume_known(&facts.extent_count, "extent count")?;
+    if extent_count != 1 {
+        return Err(ExecuteError::IdentityMismatch(format!(
+            "Volume '{}' now spans {} extents (expected 1)",
+            identity.volume_guid, extent_count
+        )));
+    }
+    let disk_number =
+        windows_volume_known(&facts.disk_number, "disk number")?.ok_or_else(|| {
+            ExecuteError::IdentityMismatch(format!(
+                "Volume '{}' no longer maps to a single disk",
+                identity.volume_guid
+            ))
+        })?;
+    let partition_number = windows_volume_known(&facts.partition_number, "partition number")?
+        .ok_or_else(|| {
+            ExecuteError::IdentityMismatch(format!(
+                "Volume '{}' no longer maps to a basic partition",
+                identity.volume_guid
+            ))
+        })?;
+    let size_bytes = windows_volume_known(&facts.total_bytes, "size")?;
+
+    if disk_number != identity.disk_number {
+        return Err(ExecuteError::IdentityMismatch(format!(
+            "Volume '{}' moved from disk {} to disk {}",
+            identity.volume_guid, identity.disk_number, disk_number
+        )));
+    }
+    if partition_number != identity.partition_number {
+        return Err(ExecuteError::IdentityMismatch(format!(
+            "Volume '{}' moved from partition #{} to #{}",
+            identity.volume_guid, identity.partition_number, partition_number
+        )));
+    }
+    if size_bytes != identity.size_bytes {
+        return Err(ExecuteError::IdentityMismatch(format!(
+            "Volume '{}' size changed from {} to {} bytes",
+            identity.volume_guid, identity.size_bytes, size_bytes
+        )));
+    }
+
+    let (partition, fingerprint) =
+        windows_volume_layout_identity(backend, identity.disk_number, identity.partition_number)?;
+    if partition.starting_offset != identity.partition_start_bytes {
+        return Err(ExecuteError::IdentityMismatch(format!(
+            "Partition #{} on disk {} moved from byte {} to byte {}",
+            identity.partition_number,
+            identity.disk_number,
+            identity.partition_start_bytes,
+            partition.starting_offset
+        )));
+    }
+    if fingerprint != identity.partition_table_fingerprint {
+        return Err(ExecuteError::IdentityMismatch(format!(
+            "Partition table of disk {} changed after validation (expected {}, got {})",
+            identity.disk_number, identity.partition_table_fingerprint, fingerprint
+        )));
+    }
+
+    Ok(())
+}
+
 /// O_EXCL probe + immediate re-check (the pre-command revalidation).
 pub fn verify_exclusive_access_and_recheck(
     backend: &dyn BlockBackend,
@@ -1024,7 +1895,9 @@ pub fn unmount_target_partition_and_holders(
                      unmounted (mounted at {}; umount attempted and failed: {})",
                     target_partition,
                     holder_dev,
-                    holder_mount_point.as_deref().unwrap_or("unknown mount point"),
+                    holder_mount_point
+                        .as_deref()
+                        .unwrap_or("unknown mount point"),
                     unmount_failure_detail(&stderr),
                 )));
             }
@@ -1059,7 +1932,9 @@ pub fn unmount_target_partition_and_holders(
                 "Failed to unmount partition {}: umount attempted and failed (mounted at {}; \
                  umount stderr: {})",
                 target_partition,
-                target_mount_point.as_deref().unwrap_or("unknown mount point"),
+                target_mount_point
+                    .as_deref()
+                    .unwrap_or("unknown mount point"),
                 unmount_failure_detail(&stderr),
             )));
         }
@@ -1643,7 +2518,7 @@ impl ValidatedTarget {
     /// Project onto the legacy struct used by existing execution paths.
     pub fn to_legacy_partition_target(&self) -> Option<ValidatedPartitionTarget> {
         match &self.scope {
-            TargetScope::WholeDisk => None,
+            TargetScope::WholeDisk | TargetScope::Volume { .. } => None,
             TargetScope::Partition {
                 parent_name,
                 start_bytes,
@@ -1658,5 +2533,876 @@ impl ValidatedTarget {
                 guard_identity: self.guard_identity.clone(),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod windows_volume_tests {
+    use super::*;
+    use crate::backend::mock::MockBackend;
+    use crate::backend::windows_parse::{ParsedPartition, PartitionStyle};
+    use crate::backend::{
+        BackendCapabilities, BitLockerLockState, ExclusiveHandle, HandleReader, VolumeDriveType,
+        VolumeFact, WindowsVolumeFacts,
+    };
+    use crate::types::{BlockWriter, GuardIdentity};
+    use std::io;
+
+    const GUID_E: &str = r"\\?\Volume{11111111-1111-1111-1111-111111111111}\";
+    const BASIC_DATA_GUID: &str = "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7";
+    const SIZE_32GB: u64 = 32_000_000_000;
+
+    fn volume_facts(
+        guid: &str,
+        letter: char,
+        label: &str,
+        disk: u32,
+        part: u32,
+        size: u64,
+        drive_type: VolumeDriveType,
+    ) -> WindowsVolumeFacts {
+        WindowsVolumeFacts {
+            volume_guid_path: guid.to_string(),
+            mount_points: VolumeFact::Known(vec![format!("{}:\\", letter)]),
+            drive_letters: VolumeFact::Known(vec![letter]),
+            label: VolumeFact::Known(Some(label.to_string())),
+            filesystem: VolumeFact::Known(Some("NTFS".to_string())),
+            total_bytes: VolumeFact::Known(size),
+            free_bytes: VolumeFact::Known(size / 2),
+            drive_type: VolumeFact::Known(drive_type),
+            extent_count: VolumeFact::Known(1),
+            disk_number: VolumeFact::Known(Some(disk)),
+            partition_number: VolumeFact::Known(Some(part)),
+            is_bitlocker: VolumeFact::Known(false),
+            bitlocker_state: BitLockerLockState::NotEncrypted,
+            is_system_volume: VolumeFact::Known(false),
+            hosts_running_app: VolumeFact::Known(false),
+        }
+    }
+
+    fn removable_volume() -> WindowsVolumeFacts {
+        volume_facts(
+            GUID_E,
+            'E',
+            "BACKUP",
+            1,
+            1,
+            SIZE_32GB,
+            VolumeDriveType::Removable,
+        )
+    }
+
+    fn basic_layout(part: u32, start: u64, len: u64) -> ParsedDriveLayout {
+        ParsedDriveLayout {
+            style: PartitionStyle::Gpt,
+            partitions: vec![ParsedPartition {
+                partition_number: part,
+                starting_offset: start,
+                partition_length: len,
+                start_sector: start / 512,
+                size_sectors: len / 512,
+                partition_type_guid: Some(BASIC_DATA_GUID.to_string()),
+                partition_type_mbr: None,
+            }],
+        }
+    }
+
+    fn boot_facts_with(
+        elevated: bool,
+        system_disks: Vec<u32>,
+        pagefile_volumes: Vec<String>,
+        hibernation_volumes: Vec<String>,
+        crashdump_volumes: Vec<String>,
+    ) -> WindowsBootFacts {
+        WindowsBootFacts {
+            system_disks: DiskSetFact::known(system_disks),
+            boot_disks: DiskSetFact::known(std::iter::empty::<u32>()),
+            pagefile_disks: DiskSetFact::known(std::iter::empty::<u32>()),
+            hibernation_disks: DiskSetFact::known(std::iter::empty::<u32>()),
+            crashdump_disks: DiskSetFact::known(std::iter::empty::<u32>()),
+            app_disks: DiskSetFact::known(std::iter::empty::<u32>()),
+            pagefile_volumes: VolumeGuidSetFact::known(pagefile_volumes),
+            hibernation_volumes: VolumeGuidSetFact::known(hibernation_volumes),
+            crashdump_volumes: VolumeGuidSetFact::known(crashdump_volumes),
+            elevated: ElevationFact::Known(elevated),
+        }
+    }
+
+    fn boot_facts(system_disks: Vec<u32>) -> WindowsBootFacts {
+        boot_facts_with(true, system_disks, Vec::new(), Vec::new(), Vec::new())
+    }
+
+    fn backend_for(
+        volume: &WindowsVolumeFacts,
+        boot: WindowsBootFacts,
+        disk: u32,
+        layout: ParsedDriveLayout,
+        transport: Option<&str>,
+    ) -> MockBackend {
+        let size = volume.total_bytes.as_known().copied().unwrap_or(SIZE_32GB);
+        let guid = volume.volume_guid_path.clone();
+        MockBackend::new()
+            .with_capabilities(BackendCapabilities::full())
+            .with_windows_boot_facts(boot)
+            .with_windows_volumes(vec![volume.clone()])
+            .with_windows_disk_layout(disk, layout)
+            .with_windows_device(disk, transport)
+            .with_geometry(&guid, size, 512)
+    }
+
+    fn params_for(volume: &WindowsVolumeFacts) -> WindowsVolumeTargetParams {
+        WindowsVolumeTargetParams {
+            volume_guid: volume.volume_guid_path.clone(),
+            confirmation_token: windows_volume_confirmation_token(volume)
+                .unwrap_or_else(|_| "E: FALLBACK 1.0GB".to_string()),
+            same_disk_confirmation: None,
+        }
+    }
+
+    fn validate_with(
+        volume: WindowsVolumeFacts,
+        boot: WindowsBootFacts,
+        layout: ParsedDriveLayout,
+        transport: Option<&str>,
+        mutate_params: impl FnOnce(&mut WindowsVolumeTargetParams),
+    ) -> Result<ValidatedTarget, ExecuteError> {
+        let disk = volume
+            .disk_number
+            .as_known()
+            .copied()
+            .flatten()
+            .unwrap_or(1);
+        let backend = backend_for(&volume, boot, disk, layout, transport);
+        let mut params = params_for(&volume);
+        mutate_params(&mut params);
+        validate_windows_volume_target(&backend, &params)
+    }
+
+    fn assert_refused(
+        result: Result<ValidatedTarget, ExecuteError>,
+        predicate: impl Fn(&ExecuteError) -> bool,
+        label: &str,
+    ) {
+        match result {
+            Err(error) => assert!(
+                predicate(&error),
+                "{} was refused with the wrong error: {:?}",
+                label,
+                error
+            ),
+            Ok(_) => panic!("{} should have been refused", label),
+        }
+    }
+
+    #[test]
+    fn windows_volume_positive_removable() {
+        let volume = removable_volume();
+        let backend = backend_for(
+            &volume,
+            boot_facts(vec![0]),
+            1,
+            basic_layout(1, 1_048_576, SIZE_32GB),
+            Some("usb"),
+        );
+        let target = validate_windows_volume_target(&backend, &params_for(&volume))
+            .expect("removable volume must validate");
+
+        match target.scope() {
+            TargetScope::Volume {
+                disk_number,
+                partition_number,
+                start_bytes,
+                size_bytes,
+                volume_guid,
+                drive_letter,
+                logical_block_size,
+            } => {
+                assert_eq!(*disk_number, 1);
+                assert_eq!(*partition_number, 1);
+                assert_eq!(*start_bytes, 0);
+                assert_eq!(*size_bytes, SIZE_32GB);
+                assert_eq!(volume_guid, GUID_E);
+                assert_eq!(*drive_letter, 'E');
+                assert_eq!(*logical_block_size, 512);
+            }
+            other => panic!("expected Volume scope, got {:?}", other),
+        }
+
+        let identity = target.windows_volume_identity().expect("identity pinned");
+        assert_eq!(identity.disk_number, 1);
+        assert_eq!(identity.partition_number, 1);
+        assert_eq!(identity.partition_start_bytes, 1_048_576);
+        assert_eq!(identity.size_bytes, SIZE_32GB);
+        assert_eq!(identity.volume_guid, GUID_E);
+        assert_eq!(
+            identity.partition_table_fingerprint,
+            compute_windows_partition_fingerprint(
+                &basic_layout(1, 1_048_576, SIZE_32GB).partitions
+            )
+        );
+        assert_eq!(target.windows_warnings(), WindowsVolumeWarnings::default());
+    }
+
+    #[test]
+    fn windows_volume_inspection_exposes_tokens_and_warnings() {
+        let volume = removable_volume();
+        let backend = backend_for(
+            &volume,
+            boot_facts(vec![1]),
+            1,
+            basic_layout(1, 1_048_576, SIZE_32GB),
+            Some("usb"),
+        );
+        let inspection =
+            inspect_windows_volume_target(&backend, GUID_E).expect("inspection must succeed");
+        assert_eq!(inspection.required_confirmation, "E: BACKUP 32.0GB");
+        assert_eq!(
+            inspection.required_same_disk_confirmation.as_deref(),
+            Some("SAME DISK E: BACKUP 32.0GB")
+        );
+        assert!(inspection.warnings.same_disk_as_system);
+        assert!(!inspection.warnings.bitlocker_unlocked);
+        assert_eq!(inspection.identity.size_bytes, SIZE_32GB);
+        assert_eq!(inspection.identity.volume_guid, GUID_E);
+        assert_eq!(inspection.drive_letter, 'E');
+    }
+
+    #[test]
+    fn windows_volume_resolution_by_drive_letter() {
+        let volume = removable_volume();
+        let backend = backend_for(
+            &volume,
+            boot_facts(vec![0]),
+            1,
+            basic_layout(1, 1_048_576, SIZE_32GB),
+            Some("usb"),
+        );
+        assert_eq!(
+            resolve_windows_volume_target(&backend, "E:").expect("E: must resolve"),
+            GUID_E
+        );
+        assert_eq!(
+            resolve_windows_volume_target(&backend, "e").expect("e must resolve"),
+            GUID_E
+        );
+        assert_eq!(
+            resolve_windows_volume_target(&backend, GUID_E).expect("GUID must resolve"),
+            GUID_E
+        );
+        assert!(matches!(
+            resolve_windows_volume_target(&backend, "Z:"),
+            Err(ExecuteError::DeviceNotFound(_))
+        ));
+        assert!(matches!(
+            resolve_windows_volume_target(&backend, "  "),
+            Err(ExecuteError::DeviceNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn windows_volume_refuses_unelevated() {
+        let volume = removable_volume();
+        let result = validate_with(
+            volume,
+            boot_facts_with(false, vec![0], vec![], vec![], vec![]),
+            basic_layout(1, 1_048_576, SIZE_32GB),
+            Some("usb"),
+            |_| {},
+        );
+        assert_refused(
+            result,
+            |e| matches!(e, ExecuteError::WindowsVolumeNotElevated(_)),
+            "unelevated process",
+        );
+    }
+
+    #[test]
+    fn windows_volume_refuses_missing_drive_letter() {
+        let mut volume = removable_volume();
+        volume.drive_letters = VolumeFact::Known(Vec::new());
+        volume.mount_points = VolumeFact::Known(Vec::new());
+        let result = validate_with(
+            volume,
+            boot_facts(vec![0]),
+            basic_layout(1, 1_048_576, SIZE_32GB),
+            Some("usb"),
+            |_| {},
+        );
+        assert_refused(
+            result,
+            |e| matches!(e, ExecuteError::WindowsVolumeNoDriveLetter(_)),
+            "volume without a drive letter",
+        );
+    }
+
+    #[test]
+    fn windows_volume_refuses_non_local_drive_type() {
+        for drive_type in [
+            VolumeDriveType::Remote,
+            VolumeDriveType::CdRom,
+            VolumeDriveType::RamDisk,
+            VolumeDriveType::NoRootDir,
+            VolumeDriveType::Unknown,
+            VolumeDriveType::Other(42),
+        ] {
+            let mut volume = removable_volume();
+            volume.drive_type = VolumeFact::Known(drive_type);
+            assert_refused(
+                validate_with(
+                    volume,
+                    boot_facts(vec![0]),
+                    basic_layout(1, 1_048_576, SIZE_32GB),
+                    Some("usb"),
+                    |_| {},
+                ),
+                |e| matches!(e, ExecuteError::WindowsVolumeNotBasic(_)),
+                &format!("drive type {:?}", drive_type),
+            );
+        }
+
+        let mut unreadable = removable_volume();
+        unreadable.drive_type = VolumeFact::Unreadable("mock: denied".to_string());
+        assert_refused(
+            validate_with(
+                unreadable,
+                boot_facts(vec![0]),
+                basic_layout(1, 1_048_576, SIZE_32GB),
+                Some("usb"),
+                |_| {},
+            ),
+            |e| matches!(e, ExecuteError::WindowsVolumeNotBasic(_)),
+            "unreadable drive type",
+        );
+    }
+
+    #[test]
+    fn windows_volume_refuses_system_and_app_volumes() {
+        let mut system = removable_volume();
+        system.is_system_volume = VolumeFact::Known(true);
+        assert_refused(
+            validate_with(
+                system,
+                boot_facts(vec![0]),
+                basic_layout(1, 1_048_576, SIZE_32GB),
+                Some("usb"),
+                |_| {},
+            ),
+            |e| matches!(e, ExecuteError::WindowsVolumeProtected(_)),
+            "system volume",
+        );
+
+        let mut app = removable_volume();
+        app.hosts_running_app = VolumeFact::Known(true);
+        assert_refused(
+            validate_with(
+                app,
+                boot_facts(vec![0]),
+                basic_layout(1, 1_048_576, SIZE_32GB),
+                Some("usb"),
+                |_| {},
+            ),
+            |e| matches!(e, ExecuteError::WindowsVolumeProtected(_)),
+            "running-app volume",
+        );
+
+        let mut unreadable = removable_volume();
+        unreadable.is_system_volume = VolumeFact::Unreadable("mock: denied".to_string());
+        assert_refused(
+            validate_with(
+                unreadable,
+                boot_facts(vec![0]),
+                basic_layout(1, 1_048_576, SIZE_32GB),
+                Some("usb"),
+                |_| {},
+            ),
+            |e| matches!(e, ExecuteError::WindowsVolumeProtected(_)),
+            "unreadable system flag",
+        );
+    }
+
+    #[test]
+    fn windows_volume_refuses_active_windows_files() {
+        for (name, boot) in [
+            (
+                "page file",
+                boot_facts_with(true, vec![0], vec![GUID_E.to_string()], vec![], vec![]),
+            ),
+            (
+                "hibernation file",
+                boot_facts_with(true, vec![0], vec![], vec![GUID_E.to_string()], vec![]),
+            ),
+            (
+                "crash dump",
+                boot_facts_with(true, vec![0], vec![], vec![], vec![GUID_E.to_string()]),
+            ),
+        ] {
+            assert_refused(
+                validate_with(
+                    removable_volume(),
+                    boot,
+                    basic_layout(1, 1_048_576, SIZE_32GB),
+                    Some("usb"),
+                    |_| {},
+                ),
+                |e| matches!(e, ExecuteError::WindowsVolumeInUse(_)),
+                name,
+            );
+        }
+
+        let mut boot = boot_facts(vec![0]);
+        boot.pagefile_volumes = VolumeGuidSetFact::Unreadable("mock: denied".to_string());
+        assert_refused(
+            validate_with(
+                removable_volume(),
+                boot,
+                basic_layout(1, 1_048_576, SIZE_32GB),
+                Some("usb"),
+                |_| {},
+            ),
+            |e| matches!(e, ExecuteError::WindowsVolumeInUse(_)),
+            "unreadable page-file volume fact",
+        );
+    }
+
+    #[test]
+    fn windows_volume_refuses_multi_extent_and_unknown_mapping() {
+        let mut multi = removable_volume();
+        multi.extent_count = VolumeFact::Known(2);
+        multi.disk_number = VolumeFact::Known(None);
+        multi.partition_number = VolumeFact::Known(None);
+        assert_refused(
+            validate_with(
+                multi,
+                boot_facts(vec![0]),
+                basic_layout(1, 1_048_576, SIZE_32GB),
+                Some("usb"),
+                |_| {},
+            ),
+            |e| matches!(e, ExecuteError::WindowsVolumeNotBasic(_)),
+            "multi-extent volume",
+        );
+
+        let mut no_disk = removable_volume();
+        no_disk.disk_number = VolumeFact::Known(None);
+        assert_refused(
+            validate_with(
+                no_disk,
+                boot_facts(vec![0]),
+                basic_layout(1, 1_048_576, SIZE_32GB),
+                Some("usb"),
+                |_| {},
+            ),
+            |e| matches!(e, ExecuteError::WindowsVolumeNotBasic(_)),
+            "unknown disk number",
+        );
+
+        let mut no_partition = removable_volume();
+        no_partition.partition_number = VolumeFact::Known(None);
+        assert_refused(
+            validate_with(
+                no_partition,
+                boot_facts(vec![0]),
+                basic_layout(1, 1_048_576, SIZE_32GB),
+                Some("usb"),
+                |_| {},
+            ),
+            |e| matches!(e, ExecuteError::WindowsVolumeNotBasic(_)),
+            "unknown partition number",
+        );
+
+        let mut unreadable = removable_volume();
+        unreadable.extent_count = VolumeFact::Unreadable("mock: denied".to_string());
+        assert_refused(
+            validate_with(
+                unreadable,
+                boot_facts(vec![0]),
+                basic_layout(1, 1_048_576, SIZE_32GB),
+                Some("usb"),
+                |_| {},
+            ),
+            |e| matches!(e, ExecuteError::WindowsVolumeNotBasic(_)),
+            "unreadable extent count",
+        );
+    }
+
+    #[test]
+    fn windows_volume_refuses_dynamic_disk() {
+        let mut layout = basic_layout(1, 1_048_576, SIZE_32GB);
+        layout.style = PartitionStyle::Mbr;
+        layout.partitions[0].partition_type_guid = None;
+        layout.partitions[0].partition_type_mbr = Some(0x42);
+        assert_refused(
+            validate_with(
+                removable_volume(),
+                boot_facts(vec![0]),
+                layout,
+                Some("usb"),
+                |_| {},
+            ),
+            |e| matches!(e, ExecuteError::WindowsVolumeNotBasic(_)),
+            "dynamic disk",
+        );
+    }
+
+    #[test]
+    fn windows_volume_refuses_storage_spaces_and_virtual_disks() {
+        for transport in ["spaces", "virtual"] {
+            assert_refused(
+                validate_with(
+                    removable_volume(),
+                    boot_facts(vec![0]),
+                    basic_layout(1, 1_048_576, SIZE_32GB),
+                    Some(transport),
+                    |_| {},
+                ),
+                |e| matches!(e, ExecuteError::WindowsVolumeNotBasic(_)),
+                transport,
+            );
+        }
+
+        // Unknown transport is a refusal, not an implicit "physical".
+        assert_refused(
+            validate_with(
+                removable_volume(),
+                boot_facts(vec![0]),
+                basic_layout(1, 1_048_576, SIZE_32GB),
+                None,
+                |_| {},
+            ),
+            |e| matches!(e, ExecuteError::WindowsVolumeNotBasic(_)),
+            "unknown transport",
+        );
+    }
+
+    #[test]
+    fn windows_volume_refuses_locked_and_unknown_bitlocker() {
+        for state in [
+            BitLockerLockState::Locked,
+            BitLockerLockState::Unknown("mock: cannot classify".to_string()),
+        ] {
+            let mut volume = removable_volume();
+            volume.bitlocker_state = state.clone();
+            assert_refused(
+                validate_with(
+                    volume,
+                    boot_facts(vec![0]),
+                    basic_layout(1, 1_048_576, SIZE_32GB),
+                    Some("usb"),
+                    |_| {},
+                ),
+                |e| matches!(e, ExecuteError::WindowsVolumeBitLockerLocked(_)),
+                &format!("BitLocker state {:?}", state),
+            );
+        }
+    }
+
+    #[test]
+    fn windows_volume_allows_unlocked_bitlocker_with_warning() {
+        let mut volume = removable_volume();
+        volume.is_bitlocker = VolumeFact::Known(true);
+        volume.bitlocker_state = BitLockerLockState::Unlocked;
+        let target = validate_with(
+            volume,
+            boot_facts(vec![0]),
+            basic_layout(1, 1_048_576, SIZE_32GB),
+            Some("usb"),
+            |_| {},
+        )
+        .expect("unlocked BitLocker volume must validate");
+        let warnings = target.windows_warnings();
+        assert!(warnings.bitlocker_unlocked);
+        assert!(!warnings.same_disk_as_system);
+    }
+
+    #[test]
+    fn windows_volume_refuses_unreadable_or_unaligned_geometry() {
+        let mut unreadable = removable_volume();
+        unreadable.total_bytes = VolumeFact::Unreadable("mock: denied".to_string());
+        assert_refused(
+            validate_with(
+                unreadable,
+                boot_facts(vec![0]),
+                basic_layout(1, 1_048_576, SIZE_32GB),
+                Some("usb"),
+                |_| {},
+            ),
+            |e| matches!(e, ExecuteError::WindowsVolumeGeometry(_)),
+            "unreadable volume size",
+        );
+
+        let mut unaligned = removable_volume();
+        unaligned.total_bytes = VolumeFact::Known(1_000);
+        assert_refused(
+            validate_with(
+                unaligned,
+                boot_facts(vec![0]),
+                basic_layout(1, 1_048_576, SIZE_32GB),
+                Some("usb"),
+                |_| {},
+            ),
+            |e| matches!(e, ExecuteError::WindowsVolumeGeometry(_)),
+            "size not a multiple of the logical block size",
+        );
+    }
+
+    #[test]
+    fn windows_volume_size_token_units() {
+        assert_eq!(format_windows_volume_size(29_800_000_000), "29.8GB");
+        assert_eq!(format_windows_volume_size(500_107_862_016), "500.1GB");
+        assert_eq!(format_windows_volume_size(1_000_000_000_000), "1.0TB");
+        assert_eq!(format_windows_volume_size(1_500_000_000_000), "1.5TB");
+        assert_eq!(format_windows_volume_size(999_999_999), "1.0GB");
+        assert_eq!(format_windows_volume_size(999_950), "1.0MB");
+        assert_eq!(format_windows_volume_size(1_000), "1.0KB");
+        assert_eq!(format_windows_volume_size(999), "999B");
+        assert_eq!(format_windows_volume_size(0), "0B");
+
+        // The exact example format from the Step 1.3 specification.
+        let volume = volume_facts(
+            GUID_E,
+            'E',
+            "BACKUP",
+            1,
+            1,
+            29_800_000_000,
+            VolumeDriveType::Removable,
+        );
+        assert_eq!(
+            windows_volume_confirmation_token(&volume).unwrap(),
+            "E: BACKUP 29.8GB"
+        );
+    }
+
+    #[test]
+    fn windows_volume_requires_the_exact_confirmation_token() {
+        let volume = removable_volume();
+        assert_eq!(
+            windows_volume_confirmation_token(&volume).unwrap(),
+            "E: BACKUP 32.0GB"
+        );
+
+        // Case-insensitive letter and size unit; lower-case label is a
+        // different label and must be refused.
+        for token in ["e: BACKUP 32.0gb", "  E:  BACKUP   32.0GB  "] {
+            let result = validate_with(
+                volume.clone(),
+                boot_facts(vec![0]),
+                basic_layout(1, 1_048_576, SIZE_32GB),
+                Some("usb"),
+                |params| params.confirmation_token = token.to_string(),
+            );
+            assert!(result.is_ok(), "token {:?} should be accepted", token);
+        }
+
+        for token in [
+            "e: backup 32.0GB",
+            "E: BACKUP 32.1GB",
+            "E: 32.0GB",
+            "F: BACKUP 32.0GB",
+        ] {
+            let result = validate_with(
+                volume.clone(),
+                boot_facts(vec![0]),
+                basic_layout(1, 1_048_576, SIZE_32GB),
+                Some("usb"),
+                |params| params.confirmation_token = token.to_string(),
+            );
+            assert_refused(
+                result,
+                |e| matches!(e, ExecuteError::ConfirmationMismatch),
+                token,
+            );
+        }
+
+        // A volume without a label uses the NO_LABEL placeholder.
+        let mut unlabeled = volume;
+        unlabeled.label = VolumeFact::Known(None);
+        assert_eq!(
+            windows_volume_confirmation_token(&unlabeled).unwrap(),
+            "E: NO_LABEL 32.0GB"
+        );
+    }
+
+    #[test]
+    fn windows_volume_same_disk_requires_extra_confirmation() {
+        let volume = removable_volume();
+        let layout = basic_layout(1, 1_048_576, SIZE_32GB);
+
+        // Same disk as the system volume, no extra token -> refuse.
+        assert_refused(
+            validate_with(
+                volume.clone(),
+                boot_facts(vec![1]),
+                layout.clone(),
+                Some("usb"),
+                |_| {},
+            ),
+            |e| matches!(e, ExecuteError::WindowsVolumeSameDiskConfirmation(_)),
+            "same-disk volume without confirmation",
+        );
+
+        // Wrong extra token -> refuse.
+        assert_refused(
+            validate_with(
+                volume.clone(),
+                boot_facts(vec![1]),
+                layout.clone(),
+                Some("usb"),
+                |params| params.same_disk_confirmation = Some("SAME DISK E: OTHER 32.0GB".into()),
+            ),
+            |e| matches!(e, ExecuteError::WindowsVolumeSameDiskConfirmation(_)),
+            "same-disk volume with wrong confirmation",
+        );
+
+        // Correct extra token -> allowed with the warning flag.
+        let target = validate_with(
+            volume.clone(),
+            boot_facts(vec![1]),
+            layout,
+            Some("usb"),
+            |params| {
+                params.same_disk_confirmation =
+                    Some(windows_volume_same_disk_token(&volume).unwrap())
+            },
+        )
+        .expect("same-disk volume with confirmation must validate");
+        assert!(target.windows_warnings().same_disk_as_system);
+        assert!(!target.windows_warnings().bitlocker_unlocked);
+    }
+
+    #[test]
+    fn windows_volume_revalidation_detects_drift() {
+        let volume = removable_volume();
+        let backend = backend_for(
+            &volume,
+            boot_facts(vec![0]),
+            1,
+            basic_layout(1, 1_048_576, SIZE_32GB),
+            Some("usb"),
+        );
+        let target = validate_windows_volume_target(&backend, &params_for(&volume))
+            .expect("fixture volume must validate");
+        revalidate_windows_volume_identity(&backend, &target)
+            .expect("unchanged identity must pass");
+
+        // Size drift.
+        let mut resized = volume.clone();
+        resized.total_bytes = VolumeFact::Known(SIZE_32GB + 4096);
+        let backend = backend_for(
+            &resized,
+            boot_facts(vec![0]),
+            1,
+            basic_layout(1, 1_048_576, SIZE_32GB),
+            Some("usb"),
+        );
+        assert!(matches!(
+            revalidate_windows_volume_identity(&backend, &target),
+            Err(ExecuteError::IdentityMismatch(_))
+        ));
+
+        // Partition-table drift (same volume, moved partition).
+        let backend = backend_for(
+            &volume,
+            boot_facts(vec![0]),
+            1,
+            basic_layout(1, 2_097_152, SIZE_32GB),
+            Some("usb"),
+        );
+        assert!(matches!(
+            revalidate_windows_volume_identity(&backend, &target),
+            Err(ExecuteError::IdentityMismatch(_))
+        ));
+
+        // Volume disappeared.
+        let backend = MockBackend::new().with_windows_boot_facts(boot_facts(vec![0]));
+        assert!(matches!(
+            revalidate_windows_volume_identity(&backend, &target),
+            Err(ExecuteError::IdentityMismatch(_))
+        ));
+    }
+
+    struct CountingWriter {
+        writes: usize,
+        total: u64,
+    }
+
+    impl BlockWriter for CountingWriter {
+        fn write_chunk(&mut self, _offset: u64, data: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            Ok(data.len())
+        }
+        fn sync_data(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn flush_buffers(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn total_size(&self) -> io::Result<u64> {
+            Ok(self.total)
+        }
+        fn io_mode(&self) -> &'static str {
+            "raw"
+        }
+    }
+
+    struct EmptyReader;
+
+    impl HandleReader for EmptyReader {
+        fn read_at(&self, _offset: u64, len: usize) -> io::Result<Vec<u8>> {
+            Ok(vec![0u8; len])
+        }
+    }
+
+    #[test]
+    fn volume_scope_write_at_is_bounded() {
+        let size = 4096u64;
+        let target = ValidatedTarget::sealed_windows_volume(
+            GUID_E.to_string(),
+            GuardIdentity {
+                canonical_path: GUID_E.to_string(),
+                st_rdev: 0,
+                major: 0,
+                minor: 0,
+                is_block: true,
+                device_serial: GUID_E.to_string(),
+                st_ino: 0,
+            },
+            TargetScope::Volume {
+                disk_number: 1,
+                partition_number: 1,
+                start_bytes: 0,
+                size_bytes: size,
+                volume_guid: GUID_E.to_string(),
+                drive_letter: 'E',
+                logical_block_size: 512,
+            },
+            WindowsVolumeIdentity {
+                disk_number: 1,
+                partition_number: 1,
+                partition_start_bytes: 1_048_576,
+                size_bytes: size,
+                volume_guid: GUID_E.to_string(),
+                partition_table_fingerprint: "fixture".to_string(),
+            },
+            WindowsVolumeWarnings::default(),
+        );
+        let mut handle = ExclusiveHandle::new(
+            target,
+            GUID_E.to_string(),
+            "raw",
+            512,
+            Box::new(CountingWriter {
+                writes: 0,
+                total: size,
+            }),
+            Box::new(EmptyReader),
+            None,
+        );
+
+        assert_eq!(handle.write_at(0, &[0u8; 512]).unwrap(), 512);
+        assert_eq!(handle.write_at(size - 512, &[0u8; 512]).unwrap(), 512);
+        assert!(handle.write_at(size - 1, &[0u8; 2]).is_err());
+        assert!(handle.write_at(size, &[0u8; 1]).is_err());
+        assert!(handle.write_at(u64::MAX, &[0u8; 2]).is_err());
     }
 }

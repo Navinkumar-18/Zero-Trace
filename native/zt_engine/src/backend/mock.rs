@@ -12,9 +12,11 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex};
 
+use crate::backend::windows_parse::{volume_guid_eq, ParsedDriveLayout};
 use crate::backend::{
-    BackendCapabilities, BackendError, BlockBackend, ExclusiveHandle, HandleReader, MountState,
-    PartitionFacts, Relation, StatFact, WindowsBootFacts,
+    BackendCapabilities, BackendError, BlockBackend, DeviceGeometry, DeviceInfo, ExclusiveHandle,
+    HandleReader, MountState, PartitionFacts, Relation, StatFact, WindowsBootFacts,
+    WindowsVolumeFacts,
 };
 use crate::guard::ValidatedTarget;
 use crate::types::{BlockWriter, BootEnvironment, ExecuteError};
@@ -45,6 +47,15 @@ pub struct MockBackend {
     /// D-a piece 2: injected Windows boot/system facts (fault injection for
     /// the shared Windows disk-refusal policy). `None` = non-Windows.
     windows_boot_facts: Option<WindowsBootFacts>,
+    /// Step 1.3: injected per-volume facts returned by `enumerate_volumes`.
+    windows_volumes: Vec<WindowsVolumeFacts>,
+    /// Step 1.3: injected parent-disk layouts keyed by disk number.
+    windows_layouts: HashMap<u32, ParsedDriveLayout>,
+    /// Step 1.3: injected physical-disk discovery facts keyed by disk number.
+    windows_devices: HashMap<u32, DeviceInfo>,
+    /// Step 1.3: explicit geometry overrides (volume GUID paths have no sysfs
+    /// attributes on the mock backend).
+    geometry_overrides: HashMap<String, DeviceGeometry>,
 
     canonical: HashMap<String, String>,
     attrs: HashMap<String, HashMap<String, String>>,
@@ -102,6 +113,10 @@ impl MockBackend {
             swaps: String::new(),
             boot_env: BootEnvironment::Normal,
             windows_boot_facts: None,
+            windows_volumes: Vec::new(),
+            windows_layouts: HashMap::new(),
+            windows_devices: HashMap::new(),
+            geometry_overrides: HashMap::new(),
             canonical: HashMap::new(),
             attrs: HashMap::new(),
             unreadable: HashSet::new(),
@@ -161,6 +176,49 @@ impl MockBackend {
     /// decide identically from these facts regardless of platform.
     pub fn with_windows_boot_facts(mut self, facts: WindowsBootFacts) -> Self {
         self.windows_boot_facts = Some(facts);
+        self
+    }
+
+    /// Step 1.3: inject the volume facts returned by `enumerate_volumes`.
+    pub fn with_windows_volumes(mut self, volumes: Vec<WindowsVolumeFacts>) -> Self {
+        self.windows_volumes = volumes;
+        self
+    }
+
+    /// Step 1.3: inject one parent-disk layout for `windows_drive_layout`.
+    pub fn with_windows_disk_layout(mut self, disk_number: u32, layout: ParsedDriveLayout) -> Self {
+        self.windows_layouts.insert(disk_number, layout);
+        self
+    }
+
+    /// Step 1.3: inject the discovery fact for one physical disk. `transport`
+    /// mirrors `DeviceInfo::transport` ("usb", "virtual", "spaces", ...).
+    pub fn with_windows_device(mut self, disk_number: u32, transport: Option<&str>) -> Self {
+        self.windows_devices.insert(
+            disk_number,
+            DeviceInfo {
+                name: format!(r"\\.\PhysicalDrive{}", disk_number),
+                model: None,
+                serial: None,
+                size_bytes: 0,
+                is_removable: false,
+                is_rotational: false,
+                transport: transport.map(str::to_string),
+            },
+        );
+        self
+    }
+
+    /// Step 1.3: explicit geometry for a path that has no sysfs attributes
+    /// (e.g. a Windows volume GUID path).
+    pub fn with_geometry(mut self, target: &str, size_bytes: u64, logical_block_size: u32) -> Self {
+        self.geometry_overrides.insert(
+            target.to_string(),
+            DeviceGeometry {
+                size_bytes,
+                logical_block_size,
+            },
+        );
         self
     }
 
@@ -471,6 +529,11 @@ impl BlockBackend for MockBackend {
                 transport: None,
             });
         }
+        for info in self.windows_devices.values() {
+            if !out.iter().any(|existing| existing.name == info.name) {
+                out.push(info.clone());
+            }
+        }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
@@ -499,6 +562,85 @@ impl BlockBackend for MockBackend {
         }
         out.sort_by_key(|p| p.partition_number);
         Ok(out)
+    }
+
+    fn enumerate_volumes(&self) -> Result<Vec<WindowsVolumeFacts>, BackendError> {
+        Ok(self.windows_volumes.clone())
+    }
+
+    fn resolve_volume_guid(&self, selector: &str) -> Result<String, BackendError> {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            return Err(BackendError::Unavailable(
+                "empty volume selector".to_string(),
+            ));
+        }
+        let letter = selector
+            .chars()
+            .next()
+            .filter(|c| c.is_ascii_alphabetic())
+            .map(|c| c.to_ascii_uppercase());
+        let selector_root = crate::backend::windows_parse::windows_mount_root(selector);
+        for volume in &self.windows_volumes {
+            if volume_guid_eq(&volume.volume_guid_path, selector)
+                || volume_guid_eq(&volume.volume_guid_path, &selector_root)
+            {
+                return Ok(volume.volume_guid_path.clone());
+            }
+            if let (Some(wanted), Some(actual)) = (letter, volume.primary_drive_letter()) {
+                if wanted == actual {
+                    return Ok(volume.volume_guid_path.clone());
+                }
+            }
+            if let Some(points) = volume.mount_points.as_known() {
+                let wanted = selector.trim_end_matches('\\');
+                if points.iter().any(|point| {
+                    point.trim_end_matches('\\').eq_ignore_ascii_case(wanted)
+                        || point
+                            .trim_end_matches('\\')
+                            .eq_ignore_ascii_case(selector_root.trim_end_matches('\\'))
+                }) {
+                    return Ok(volume.volume_guid_path.clone());
+                }
+            }
+        }
+        Err(BackendError::Unavailable(format!(
+            "mock: no injected Windows volume matches '{}'",
+            selector
+        )))
+    }
+
+    fn windows_drive_layout(&self, disk_number: u32) -> Result<ParsedDriveLayout, BackendError> {
+        self.windows_layouts
+            .get(&disk_number)
+            .cloned()
+            .ok_or_else(|| {
+                BackendError::Unavailable(format!(
+                    "mock: no drive layout injected for disk {}",
+                    disk_number
+                ))
+            })
+    }
+
+    fn device_geometry(&self, target: &str) -> Result<DeviceGeometry, BackendError> {
+        if let Some(geometry) = self.geometry_overrides.get(target) {
+            return Ok(*geometry);
+        }
+        let name = target.strip_prefix("/dev/").unwrap_or(target);
+        let size_sectors: u64 = self
+            .sysfs_class_attr(name, "size")?
+            .unwrap_or_default()
+            .trim()
+            .parse()
+            .map_err(|_| BackendError::Unavailable(format!("Corrupt sysfs size for {}", name)))?;
+        let logical_block_size: u32 = self
+            .sysfs_class_attr(name, "queue/logical_block_size")?
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(512);
+        Ok(DeviceGeometry {
+            size_bytes: size_sectors * 512,
+            logical_block_size,
+        })
     }
 
     fn read_mount_state(&self) -> Result<MountState, BackendError> {

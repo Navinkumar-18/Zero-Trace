@@ -69,10 +69,16 @@ fn receipt_lifecycle_write_read_roundtrip() {
     );
 
     write_verified_wipe_receipt(&path, &stamp).unwrap();
-    assert!(path.exists(), "receipt file must exist after a passing verify");
+    assert!(
+        path.exists(),
+        "receipt file must exist after a passing verify"
+    );
 
     // No temp debris: the atomic write committed exactly one file.
-    assert_eq!(sorted_names(dir.path()), vec!["verified_wipe_JOB-1_p1.json"]);
+    assert_eq!(
+        sorted_names(dir.path()),
+        vec!["verified_wipe_JOB-1_p1.json"]
+    );
 
     let read = read_verified_wipe_receipt(&path).unwrap();
     assert_eq!(

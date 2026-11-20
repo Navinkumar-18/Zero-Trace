@@ -10,17 +10,14 @@
 //! - Supports dry_run mode (logs commands without executing)
 //! - Streams ProgressEvents for real-time UI updates
 
-use rand::{RngCore, SeedableRng};
-use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -40,30 +37,15 @@ pub use crate::types::{
 // Public types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum ExecutionPhase {
-    SecurityUnlock,
-    FirmwareCommand,
-    KeyDestruction,
-    CacheFlush,
-    Verification,
-    Preparing,
-    Flushing,
-}
-
-impl std::fmt::Display for ExecutionPhase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ExecutionPhase::SecurityUnlock => write!(f, "Security Unlock"),
-            ExecutionPhase::FirmwareCommand => write!(f, "Firmware Command"),
-            ExecutionPhase::KeyDestruction => write!(f, "Key Destruction"),
-            ExecutionPhase::CacheFlush => write!(f, "Cache Flush"),
-            ExecutionPhase::Verification => write!(f, "Post-Verification"),
-            ExecutionPhase::Preparing => write!(f, "Preparing"),
-            ExecutionPhase::Flushing => write!(f, "Flushing"),
-        }
-    }
-}
+// Phase Step 1.1: the platform-neutral wipe core owns the overwrite loop,
+// progress/event/report types, aligned buffers and the range writer. These
+// re-exports keep every historic `zt_engine::execute::*` path and test import
+// unchanged; Linux behavior is byte-identical.
+use crate::wipe_core::send_detailed_progress;
+pub use crate::wipe_core::{
+    execute_writer_overwrite, execute_writer_overwrite_with_cancel, AlignedBuffer, ExecutionPhase,
+    ExecutionReport, OverwritePattern, PartitionRangeWriter, ProgressEvent, SpeedEstimator,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SanitizeAction {
@@ -76,53 +58,6 @@ pub enum AtaSanitizeAction {
     BlockErase,
     CryptoScramble,
     Overwrite,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum OverwritePattern {
-    Zeros,
-    Ones,
-    Random,
-    MultiPass3,
-}
-
-fn default_schema_version() -> u32 {
-    2
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProgressEvent {
-    #[serde(default = "default_schema_version")]
-    pub schema_version: u32,
-    pub phase: ExecutionPhase,
-    #[serde(default)]
-    pub bytes_done: u64,
-    #[serde(default)]
-    pub bytes_total: u64,
-    #[serde(default)]
-    pub percent: Option<f32>,
-    #[serde(default)]
-    pub speed_bytes_per_sec: f64,
-    pub eta_seconds: Option<u32>,
-    pub message: String,
-    #[serde(default)]
-    pub is_heartbeat: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExecutionReport {
-    pub success: bool,
-    pub method_used: String,
-    pub command_log: Vec<String>,
-    pub stdout: String,
-    pub stderr: String,
-    pub exit_code: i32,
-    pub duration_ms: u64,
-    pub dry_run: bool,
-    #[serde(default)]
-    pub bytes_written: u64,
-    #[serde(default)]
-    pub io_mode: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -372,33 +307,6 @@ async fn send_progress(
         .await;
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn send_detailed_progress(
-    tx: &mpsc::Sender<ProgressEvent>,
-    phase: ExecutionPhase,
-    bytes_done: u64,
-    bytes_total: u64,
-    percent: Option<f32>,
-    speed_bytes_per_sec: f64,
-    eta_seconds: Option<u32>,
-    message: &str,
-    is_heartbeat: bool,
-) {
-    let _ = tx
-        .send(ProgressEvent {
-            schema_version: 2,
-            phase,
-            bytes_done,
-            bytes_total,
-            percent,
-            speed_bytes_per_sec,
-            eta_seconds,
-            message: message.to_string(),
-            is_heartbeat,
-        })
-        .await;
-}
-
 /// P2: run one external tool step for an execution flow.
 ///
 /// Every external tool invocation from a flow goes through the backend
@@ -560,6 +468,7 @@ fn target_scope_token(target: &ValidatedTarget) -> &'static str {
     match target.scope() {
         crate::guard::TargetScope::WholeDisk => "full",
         crate::guard::TargetScope::Partition { .. } => "partial",
+        crate::guard::TargetScope::Volume { .. } => "volume",
     }
 }
 
@@ -578,6 +487,17 @@ fn target_stamp(backend: &dyn BlockBackend, target: &ValidatedTarget) -> Verifie
             crate::guard::compute_partition_table_fingerprint(backend, parent_name).ok(),
         ),
         crate::guard::TargetScope::WholeDisk => (None, None, None),
+        crate::guard::TargetScope::Volume {
+            disk_number,
+            partition_number,
+            ..
+        } => (
+            Some(format!(r"\\.\PhysicalDrive{}", disk_number)),
+            Some(*partition_number),
+            target
+                .windows_volume_identity()
+                .map(|identity| identity.partition_table_fingerprint.clone()),
+        ),
     };
     VerifiedWipeStamp {
         canonical_path: target.canonical_path().to_string(),
@@ -648,10 +568,7 @@ pub fn verified_wipe_stamp_for_path(
 ) -> Result<VerifiedWipeStamp, ExecuteError> {
     let canonical = backend.canonicalize_path(device_path, false)?;
     let stat = backend.stat_path(&canonical).map_err(|e| {
-        ExecuteError::IdentityMismatch(format!(
-            "cannot stat verified target {}: {}",
-            canonical, e
-        ))
+        ExecuteError::IdentityMismatch(format!("cannot stat verified target {}: {}", canonical, e))
     })?;
     let name = canonical.strip_prefix("/dev/").unwrap_or(&canonical);
     let part_attr = backend
@@ -732,8 +649,7 @@ pub fn write_verified_wipe_receipt(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp_path =
-        path.with_file_name(format!(".{}.{}.{}.tmp", base, std::process::id(), nanos));
+    let tmp_path = path.with_file_name(format!(".{}.{}.{}.tmp", base, std::process::id(), nanos));
 
     let mut tmp = OpenOptions::new()
         .write(true)
@@ -890,6 +806,11 @@ fn assert_format_scope(
                     canonical
                 )));
             }
+        }
+        crate::guard::TargetScope::Volume { .. } => {
+            return Err(ExecuteError::FilesystemScopeMismatch(
+                "volume scope is not a filesystem-recreation target".to_string(),
+            ));
         }
     }
     Ok(())
@@ -1475,7 +1396,10 @@ fn unmount_target_if_mounted(
                         .next()
                         .is_some_and(|c| c.is_ascii_digit() || c == 'p'))
             {
-                mounted_targets.push((mount_src.to_string(), parts.get(1).map(|m| (*m).to_string())));
+                mounted_targets.push((
+                    mount_src.to_string(),
+                    parts.get(1).map(|m| (*m).to_string()),
+                ));
             }
         }
     }
@@ -1485,9 +1409,9 @@ fn unmount_target_if_mounted(
             "[UNMOUNT] Unmounting active filesystem target: {}",
             mount_src
         ));
-        let (stdout, stderr, code) = backend.exec("umount", &[&mount_src]).map_err(|e| {
-            ExecuteError::CommandFailed(format!("Failed to run umount: {}", e))
-        })?;
+        let (stdout, stderr, code) = backend
+            .exec("umount", &[&mount_src])
+            .map_err(|e| ExecuteError::CommandFailed(format!("Failed to run umount: {}", e)))?;
         stdout_accum.push_str(&stdout);
         stderr_accum.push_str(&stderr);
         if code != 0 {
@@ -1580,8 +1504,7 @@ pub async fn nvme_sanitize_with(
     let device = target.canonical_path();
 
     // Unmount any active partitions on device
-    let (u_out, u_err) =
-        unmount_target_if_mounted(backend, target, dry_run, &mut command_log)?;
+    let (u_out, u_err) = unmount_target_if_mounted(backend, target, dry_run, &mut command_log)?;
     all_stdout.push_str(&u_out);
     all_stderr.push_str(&u_err);
 
@@ -1769,8 +1692,7 @@ pub async fn ata_secure_erase_with(
     };
 
     // Unmount any active partitions on device
-    let (u_out, u_err) =
-        unmount_target_if_mounted(backend, target, dry_run, &mut command_log)?;
+    let (u_out, u_err) = unmount_target_if_mounted(backend, target, dry_run, &mut command_log)?;
     all_stdout.push_str(&u_out);
     all_stderr.push_str(&u_err);
 
@@ -2022,8 +1944,7 @@ pub async fn ata_sanitize_with(
     let device = target.canonical_path();
 
     // Unmount any active partitions on device
-    let (u_out, u_err) =
-        unmount_target_if_mounted(backend, target, dry_run, &mut command_log)?;
+    let (u_out, u_err) = unmount_target_if_mounted(backend, target, dry_run, &mut command_log)?;
     all_stdout.push_str(&u_out);
     all_stderr.push_str(&u_err);
 
@@ -2170,8 +2091,7 @@ pub async fn opal_revert_with(
     let device = target.canonical_path();
 
     // Unmount any active partitions on device
-    let (u_out, u_err) =
-        unmount_target_if_mounted(backend, target, dry_run, &mut command_log)?;
+    let (u_out, u_err) = unmount_target_if_mounted(backend, target, dry_run, &mut command_log)?;
     all_stdout.push_str(&u_out);
     all_stderr.push_str(&u_err);
 
@@ -2337,8 +2257,7 @@ pub async fn emmc_sanitize_with(
     let device = target.canonical_path();
 
     // Unmount any active partitions on device
-    let (u_out, u_err) =
-        unmount_target_if_mounted(backend, target, dry_run, &mut command_log)?;
+    let (u_out, u_err) = unmount_target_if_mounted(backend, target, dry_run, &mut command_log)?;
     all_stdout.push_str(&u_out);
     all_stderr.push_str(&u_err);
 
@@ -3008,39 +2927,6 @@ pub async fn discard_erase_partition_ctx(
 // Native Block Writer & Telemetry Engine
 // ---------------------------------------------------------------------------
 
-pub struct AlignedBuffer {
-    ptr: *mut u8,
-    layout: std::alloc::Layout,
-}
-
-unsafe impl Send for AlignedBuffer {}
-unsafe impl Sync for AlignedBuffer {}
-
-impl AlignedBuffer {
-    pub fn new(size: usize) -> Self {
-        let layout = std::alloc::Layout::from_size_align(size, 4096).unwrap();
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-        Self { ptr, layout }
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.layout.size()) }
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.layout.size()) }
-    }
-}
-
-impl Drop for AlignedBuffer {
-    fn drop(&mut self) {
-        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
-    }
-}
-
 // C2a: the direct writer (O_EXCL open ladder, fd identity re-validation,
 // size/sector ioctls, BLKFLSBUF) now lives in the backend — raw device
 // opening is private to `backend/linux`. Re-exported so the historic API
@@ -3083,86 +2969,6 @@ impl BlockWriter for FileBlockWriter {
 
     fn io_mode(&self) -> &'static str {
         "file_test"
-    }
-}
-
-/// A bounded range writer wrapping an inner BlockWriter.
-/// Translates relative offsets: inner_offset = start_offset + rel_offset.
-/// Strictly enforces that rel_offset + chunk_len <= length, refusing any out-of-range write.
-#[derive(Debug)]
-pub struct PartitionRangeWriter<W: BlockWriter> {
-    inner: W,
-    start_offset: u64,
-    length: u64,
-}
-
-impl<W: BlockWriter> PartitionRangeWriter<W> {
-    pub fn new(inner: W, start_offset: u64, length: u64) -> Self {
-        Self {
-            inner,
-            start_offset,
-            length,
-        }
-    }
-
-    pub fn start_offset(&self) -> u64 {
-        self.start_offset
-    }
-
-    pub fn length(&self) -> u64 {
-        self.length
-    }
-
-    pub fn into_inner(self) -> W {
-        self.inner
-    }
-}
-
-impl<W: BlockWriter> BlockWriter for PartitionRangeWriter<W> {
-    fn write_chunk(&mut self, offset: u64, data: &[u8]) -> Result<usize, io::Error> {
-        let chunk_len = data.len() as u64;
-        let end = offset.checked_add(chunk_len).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Offset overflow in partition write",
-            )
-        })?;
-        if end > self.length {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "Out of partition range write refused: offset {} + chunk {} > length {}",
-                    offset, chunk_len, self.length
-                ),
-            ));
-        }
-        let target_offset = self.start_offset.checked_add(offset).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Target offset overflow in partition write",
-            )
-        })?;
-        self.inner.write_chunk(target_offset, data)
-    }
-
-    fn sync_data(&mut self) -> Result<(), io::Error> {
-        self.inner.sync_data()
-    }
-
-    fn flush_buffers(&mut self) -> Result<(), io::Error> {
-        self.inner.flush_buffers()
-    }
-
-    fn total_size(&self) -> Result<u64, io::Error> {
-        Ok(self.length)
-    }
-
-    fn logical_block_size(&self) -> u32 {
-        self.inner.logical_block_size()
-    }
-
-    fn io_mode(&self) -> &'static str {
-        self.inner.io_mode()
     }
 }
 
@@ -3243,54 +3049,9 @@ impl BlockWriter for MockBlockWriter {
     }
 }
 
-pub struct SpeedEstimator {
-    samples: VecDeque<(Instant, u64)>,
-    window_secs: f64,
-}
-
-impl SpeedEstimator {
-    pub fn new(window_secs: f64) -> Self {
-        Self {
-            samples: VecDeque::new(),
-            window_secs,
-        }
-    }
-
-    pub fn record(&mut self, now: Instant, bytes_done: u64) {
-        self.samples.push_back((now, bytes_done));
-        let cutoff = now - std::time::Duration::from_secs_f64(self.window_secs);
-        while let Some(&(t, _)) = self.samples.front() {
-            if t < cutoff && self.samples.len() > 1 {
-                self.samples.pop_front();
-            } else {
-                break;
-            }
-        }
-    }
-
-    pub fn current_speed(&self) -> f64 {
-        if self.samples.len() < 2 {
-            return 0.0;
-        }
-        let (first_t, first_b) = self.samples.front().unwrap();
-        let (last_t, last_b) = self.samples.back().unwrap();
-        let dt = (*last_t - *first_t).as_secs_f64();
-        if dt > 0.05 {
-            (*last_b - *first_b) as f64 / dt
-        } else {
-            0.0
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CheckpointData {
-    pub job_id: String,
-    pub device_size: u64,
-    pub device_id_hash: String,
-    pub bytes_done: u64,
-    pub timestamp: u64,
-}
+/// The checkpoint payload is shared with the cross-platform sink
+/// (Step 1.4a) so both writers serialize the exact same JSON shape.
+pub use crate::checkpoint_sink::CheckpointData;
 
 pub fn get_checkpoint_dir() -> PathBuf {
     if let Ok(custom) = std::env::var("ZT_CHECKPOINT_DIR") {
@@ -3449,441 +3210,6 @@ pub fn remove_checkpoint_file_in_dir(dir: &Path) {
     let _ = fs::remove_file(final_path);
     let _ = fs::remove_file(tmp_path);
     let _ = fs::remove_file(dir.join("active_checkpoint.tmp"));
-}
-
-pub async fn execute_writer_overwrite<W: BlockWriter>(
-    writer: W,
-    total_passes: u8,
-    pattern: OverwritePattern,
-    device_serial: &str,
-    method_name: &str,
-    start: Instant,
-    tx: mpsc::Sender<ProgressEvent>,
-) -> Result<ExecutionReport, ExecuteError> {
-    execute_writer_overwrite_with_cancel(
-        writer,
-        total_passes,
-        pattern,
-        device_serial,
-        method_name,
-        start,
-        tx,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn execute_writer_overwrite_with_cancel<W: BlockWriter>(
-    mut writer: W,
-    total_passes: u8,
-    pattern: OverwritePattern,
-    device_serial: &str,
-    method_name: &str,
-    start: Instant,
-    tx: mpsc::Sender<ProgressEvent>,
-    external_cancel_flag: Option<Arc<AtomicBool>>,
-) -> Result<ExecutionReport, ExecuteError> {
-    let command_log = vec![format!(
-        "Native block overwrite ({} passes, mode: {})",
-        total_passes,
-        writer.io_mode()
-    )];
-    let device_size = writer.total_size().map_err(ExecuteError::IoError)?;
-    let total_bytes = total_passes as u64 * device_size;
-
-    let device_id_hash = format!("{:x}", Sha256::digest(device_serial.as_bytes()));
-    let job_id =
-        std::env::var("ZT_JOB_ID").unwrap_or_else(|_| format!("job-{}", &device_id_hash[..12]));
-
-    let cancel_flag = external_cancel_flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-    let _term_hook =
-        signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&cancel_flag));
-    let _int_hook =
-        signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&cancel_flag));
-
-    let chunk_size = 2 * 1024 * 1024usize; // 2 MiB chunks
-    let mut aligned_buf = AlignedBuffer::new(chunk_size);
-    let mut speed_est = SpeedEstimator::new(3.0); // 3-second sliding window
-
-    let bytes_done_shared = Arc::new(AtomicU64::new(0));
-    let phase_shared = Arc::new(Mutex::new(ExecutionPhase::Preparing));
-
-    // Spawn 1-second heartbeat task
-    let (hb_stop_tx, mut hb_stop_rx) = tokio::sync::oneshot::channel::<()>();
-    let hb_tx = tx.clone();
-    let hb_bytes_done = Arc::clone(&bytes_done_shared);
-    let hb_phase = Arc::clone(&phase_shared);
-    let hb_total_bytes = total_bytes;
-
-    let hb_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(1000));
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let phase = hb_phase.lock().unwrap().clone();
-                    let done = hb_bytes_done.load(Ordering::Relaxed);
-                    let pct = if hb_total_bytes > 0 { Some(done as f32 / hb_total_bytes as f32) } else { None };
-                    let _ = hb_tx.send(ProgressEvent {
-                        schema_version: 2,
-                        phase,
-                        bytes_done: done,
-                        bytes_total: hb_total_bytes,
-                        percent: pct,
-                        speed_bytes_per_sec: 0.0,
-                        eta_seconds: None,
-                        message: "heartbeat".to_string(),
-                        is_heartbeat: true,
-                    }).await;
-                }
-                _ = &mut hb_stop_rx => {
-                    break;
-                }
-            }
-        }
-    });
-
-    let mut overall_bytes_done: u64 = 0;
-    let mut uncommitted_buffered_bytes: u64 = 0;
-    let is_buffered_mode = writer.io_mode().starts_with("buffered");
-    let mut last_event_time = Instant::now();
-    let mut last_checkpoint_time = Instant::now();
-
-    *phase_shared.lock().unwrap() = ExecutionPhase::FirmwareCommand; // Writing phase
-
-    let mut prng = ChaCha20Rng::from_entropy();
-
-    for pass_idx in 0..total_passes {
-        let is_random = match pattern {
-            OverwritePattern::Random => true,
-            OverwritePattern::MultiPass3 => pass_idx == 1,
-            _ => false,
-        };
-
-        if !is_random {
-            let fill_byte = match pattern {
-                OverwritePattern::Ones => 0xFF,
-                _ => 0x00,
-            };
-            aligned_buf.as_mut_slice().fill(fill_byte);
-        }
-
-        let mut offset = 0u64;
-        while offset < device_size {
-            // Check cancellation flag
-            if cancel_flag.load(Ordering::SeqCst) {
-                let _ = writer.sync_data();
-                if is_buffered_mode && uncommitted_buffered_bytes > 0 {
-                    overall_bytes_done += uncommitted_buffered_bytes;
-                    bytes_done_shared.store(overall_bytes_done, Ordering::Relaxed);
-                }
-                write_checkpoint_file(&job_id, device_serial, device_size, overall_bytes_done);
-                let _ = hb_stop_tx.send(());
-                let _ = hb_task.await;
-                let _ = tx
-                    .send(ProgressEvent {
-                        schema_version: 2,
-                        phase: ExecutionPhase::FirmwareCommand,
-                        bytes_done: overall_bytes_done,
-                        bytes_total: total_bytes,
-                        percent: if total_bytes > 0 {
-                            Some(overall_bytes_done as f32 / total_bytes as f32)
-                        } else {
-                            None
-                        },
-                        speed_bytes_per_sec: 0.0,
-                        eta_seconds: None,
-                        message: "Sanitization cancelled by user".to_string(),
-                        is_heartbeat: false,
-                    })
-                    .await;
-                return Ok(ExecutionReport {
-                    success: false,
-                    method_used: method_name.to_string(),
-                    command_log,
-                    stdout: String::new(),
-                    stderr: "Sanitization cancelled by user: partially wiped".to_string(),
-                    exit_code: 130,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                    dry_run: false,
-                    bytes_written: overall_bytes_done,
-                    io_mode: writer.io_mode().to_string(),
-                });
-            }
-
-            let write_len = std::cmp::min(chunk_size as u64, device_size - offset) as usize;
-            if is_random {
-                prng.fill_bytes(&mut aligned_buf.as_mut_slice()[..write_len]);
-            }
-
-            let mut written_for_chunk = 0;
-            while written_for_chunk < write_len {
-                if cancel_flag.load(Ordering::SeqCst) {
-                    let _ = writer.sync_data();
-                    if is_buffered_mode && uncommitted_buffered_bytes > 0 {
-                        overall_bytes_done += uncommitted_buffered_bytes;
-                        bytes_done_shared.store(overall_bytes_done, Ordering::Relaxed);
-                    }
-                    write_checkpoint_file(&job_id, device_serial, device_size, overall_bytes_done);
-                    let _ = hb_stop_tx.send(());
-                    let _ = hb_task.await;
-                    let _ = tx
-                        .send(ProgressEvent {
-                            schema_version: 2,
-                            phase: ExecutionPhase::FirmwareCommand,
-                            bytes_done: overall_bytes_done,
-                            bytes_total: total_bytes,
-                            percent: if total_bytes > 0 {
-                                Some(overall_bytes_done as f32 / total_bytes as f32)
-                            } else {
-                                None
-                            },
-                            speed_bytes_per_sec: 0.0,
-                            eta_seconds: None,
-                            message: "Sanitization cancelled by user".to_string(),
-                            is_heartbeat: false,
-                        })
-                        .await;
-                    return Ok(ExecutionReport {
-                        success: false,
-                        method_used: method_name.to_string(),
-                        command_log,
-                        stdout: String::new(),
-                        stderr: "Sanitization cancelled by user: partially wiped".to_string(),
-                        exit_code: 130,
-                        duration_ms: start.elapsed().as_millis() as u64,
-                        dry_run: false,
-                        bytes_written: overall_bytes_done,
-                        io_mode: writer.io_mode().to_string(),
-                    });
-                }
-
-                let slice = &aligned_buf.as_slice()[written_for_chunk..write_len];
-                match writer.write_chunk(offset + written_for_chunk as u64, slice) {
-                    Ok(0) => {
-                        let _ = hb_stop_tx.send(());
-                        let _ = hb_task.await;
-                        return Err(ExecuteError::PrematureEndOfDevice(
-                            "Write returned 0 bytes (ENOSPC)".into(),
-                        ));
-                    }
-                    Ok(n) => {
-                        written_for_chunk += n;
-                        if is_buffered_mode {
-                            uncommitted_buffered_bytes += n as u64;
-                            // In buffered mode, flush periodically (e.g. 16MB) or when pass finishes
-                            if uncommitted_buffered_bytes >= 16 * 1024 * 1024
-                                || (offset + written_for_chunk as u64 >= device_size)
-                            {
-                                if let Err(e) = writer.sync_data() {
-                                    let _ = hb_stop_tx.send(());
-                                    let _ = hb_task.await;
-                                    return Err(ExecuteError::IoError(e));
-                                }
-                                overall_bytes_done += uncommitted_buffered_bytes;
-                                uncommitted_buffered_bytes = 0;
-                                bytes_done_shared.store(overall_bytes_done, Ordering::Relaxed);
-                            }
-                        } else {
-                            overall_bytes_done += n as u64;
-                            bytes_done_shared.store(overall_bytes_done, Ordering::Relaxed);
-                        }
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) if e.raw_os_error() == Some(libc::EIO) => {
-                        let _ = hb_stop_tx.send(());
-                        let _ = hb_task.await;
-                        return Err(ExecuteError::HardwareIo(format!(
-                            "EIO at offset {}: {}",
-                            offset + written_for_chunk as u64,
-                            e
-                        )));
-                    }
-                    Err(e) if e.raw_os_error() == Some(libc::ENODEV) => {
-                        let _ = hb_stop_tx.send(());
-                        let _ = hb_task.await;
-                        return Err(ExecuteError::DeviceDisconnected(format!(
-                            "ENODEV at offset {}: {}",
-                            offset + written_for_chunk as u64,
-                            e
-                        )));
-                    }
-                    Err(e) if e.raw_os_error() == Some(libc::ENOSPC) => {
-                        let _ = hb_stop_tx.send(());
-                        let _ = hb_task.await;
-                        return Err(ExecuteError::PrematureEndOfDevice(format!(
-                            "ENOSPC at offset {}: {}",
-                            offset + written_for_chunk as u64,
-                            e
-                        )));
-                    }
-                    Err(e) => {
-                        let _ = hb_stop_tx.send(());
-                        let _ = hb_task.await;
-                        return Err(ExecuteError::IoError(e));
-                    }
-                }
-            }
-
-            offset += write_len as u64;
-            speed_est.record(Instant::now(), overall_bytes_done);
-
-            // Throttle progress events to ~3/sec
-            let now = Instant::now();
-            if now.duration_since(last_event_time).as_millis() >= 300 || offset >= device_size {
-                last_event_time = now;
-                let cur_speed = speed_est.current_speed();
-                let eta = if cur_speed > 1024.0 && overall_bytes_done < total_bytes {
-                    Some(((total_bytes - overall_bytes_done) as f64 / cur_speed) as u32)
-                } else {
-                    None
-                };
-                let pct = overall_bytes_done as f32 / total_bytes as f32;
-                let msg = format!(
-                    "Pass {} of {}: writing to media",
-                    pass_idx + 1,
-                    total_passes
-                );
-                send_detailed_progress(
-                    &tx,
-                    ExecutionPhase::FirmwareCommand,
-                    overall_bytes_done,
-                    total_bytes,
-                    Some(pct),
-                    cur_speed,
-                    eta,
-                    &msg,
-                    false,
-                )
-                .await;
-            }
-
-            // Periodic checkpoint file write (~every 2 seconds)
-            if now.duration_since(last_checkpoint_time).as_secs() >= 2 {
-                last_checkpoint_time = now;
-                write_checkpoint_file(&job_id, device_serial, device_size, overall_bytes_done);
-            }
-        }
-    }
-
-    // Flush phase (Item 1, 2, 3)
-    *phase_shared.lock().unwrap() = ExecutionPhase::Flushing;
-    send_detailed_progress(
-        &tx,
-        ExecutionPhase::Flushing,
-        overall_bytes_done,
-        total_bytes,
-        None,
-        0.0,
-        None,
-        "Finalizing, flushing to drive",
-        false,
-    )
-    .await;
-
-    // Check cancellation promptly at start of flush
-    if cancel_flag.load(Ordering::SeqCst) {
-        let _ = hb_stop_tx.send(());
-        let _ = hb_task.await;
-        write_checkpoint_file(&job_id, device_serial, device_size, overall_bytes_done);
-        return Ok(ExecutionReport {
-            success: false,
-            method_used: method_name.to_string(),
-            command_log,
-            stdout: String::new(),
-            stderr: "Sanitization cancelled by user during flush".to_string(),
-            exit_code: 130,
-            duration_ms: start.elapsed().as_millis() as u64,
-            dry_run: false,
-            bytes_written: overall_bytes_done,
-            io_mode: writer.io_mode().to_string(),
-        });
-    }
-
-    if let Err(e) = writer.sync_data() {
-        let _ = hb_stop_tx.send(());
-        let _ = hb_task.await;
-        return Err(ExecuteError::IoError(e));
-    }
-    if let Err(e) = writer.flush_buffers() {
-        let _ = hb_stop_tx.send(());
-        let _ = hb_task.await;
-        return Err(ExecuteError::IoError(e));
-    }
-
-    // Check cancellation promptly after sync/flush
-    if cancel_flag.load(Ordering::SeqCst) {
-        let _ = hb_stop_tx.send(());
-        let _ = hb_task.await;
-        write_checkpoint_file(&job_id, device_serial, device_size, overall_bytes_done);
-        return Ok(ExecutionReport {
-            success: false,
-            method_used: method_name.to_string(),
-            command_log,
-            stdout: String::new(),
-            stderr: "Sanitization cancelled by user after flush".to_string(),
-            exit_code: 130,
-            duration_ms: start.elapsed().as_millis() as u64,
-            dry_run: false,
-            bytes_written: overall_bytes_done,
-            io_mode: writer.io_mode().to_string(),
-        });
-    }
-
-    *phase_shared.lock().unwrap() = ExecutionPhase::Verification;
-    send_detailed_progress(
-        &tx,
-        ExecutionPhase::Verification,
-        overall_bytes_done,
-        total_bytes,
-        None,
-        0.0,
-        None,
-        "Verifying sector erasure...",
-        false,
-    )
-    .await;
-
-    // Check cancellation promptly before verification
-    if cancel_flag.load(Ordering::SeqCst) {
-        let _ = hb_stop_tx.send(());
-        let _ = hb_task.await;
-        write_checkpoint_file(&job_id, device_serial, device_size, overall_bytes_done);
-        return Ok(ExecutionReport {
-            success: false,
-            method_used: method_name.to_string(),
-            command_log,
-            stdout: String::new(),
-            stderr: "Sanitization cancelled by user during verification".to_string(),
-            exit_code: 130,
-            duration_ms: start.elapsed().as_millis() as u64,
-            dry_run: false,
-            bytes_written: overall_bytes_done,
-            io_mode: writer.io_mode().to_string(),
-        });
-    }
-
-    let _ = hb_stop_tx.send(());
-    let _ = hb_task.await;
-
-    // Checkpoint removal upon success
-    remove_checkpoint_file();
-
-    Ok(ExecutionReport {
-        success: overall_bytes_done == total_bytes,
-        method_used: method_name.to_string(),
-        command_log,
-        stdout: format!(
-            "Successfully overwritten {} bytes in {} passes",
-            overall_bytes_done, total_passes
-        ),
-        stderr: String::new(),
-        exit_code: 0,
-        duration_ms: start.elapsed().as_millis() as u64,
-        dry_run: false,
-        bytes_written: overall_bytes_done,
-        io_mode: writer.io_mode().to_string(),
-    })
 }
 
 /// Software Overwrite — native direct I/O overwrite.
@@ -4435,8 +3761,12 @@ pub async fn software_overwrite_partition_with(
     .await;
 
     // 7. Targeted unmount: target partition & holders only
-    let (_stdout, _stderr) =
-        crate::guard::unmount_target_partition_and_holders(backend, device, false, &mut command_log)?;
+    let (_stdout, _stderr) = crate::guard::unmount_target_partition_and_holders(
+        backend,
+        device,
+        false,
+        &mut command_log,
+    )?;
 
     // 8. Verify exclusive access on the partition node
     crate::guard::verify_exclusive_access_and_recheck(backend, device, false)?;
