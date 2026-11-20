@@ -615,33 +615,7 @@ class DriveDetailScreen extends StatelessWidget {
           ],
 
           // Circular progress
-          SizedBox(
-            width: 120,
-            height: 120,
-            child: Stack(
-              alignment: Alignment.center,
-              children: [
-                CircularProgressIndicator(
-                  value: job.progress,
-                  strokeWidth: 10,
-                  backgroundColor: AppTheme.surfaceBorder,
-                  valueColor: const AlwaysStoppedAnimation<Color>(
-                    AppTheme.simplePrimary,
-                  ),
-                ),
-                Text(
-                  job.progress != null
-                      ? '${(job.progress! * 100).toInt()}%'
-                      : '...',
-                  style: const TextStyle(
-                    fontSize: 28,
-                    fontWeight: FontWeight.bold,
-                    color: AppTheme.textPrimary,
-                  ),
-                ),
-              ],
-            ),
-          ),
+          _PercentRing(progress: job.progress),
           const SizedBox(height: 12),
           Text(
             job.currentStageDescription,
@@ -1939,5 +1913,139 @@ class _PartitionChooserSection extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+/// Circular percentage indicator used by the inline wipe progress card.
+///
+/// The ring always occupies a fixed 120x120 box and is painted with a round
+/// 8px stroke. The percentage label is confined to the inner disc so it can
+/// never collide with the arc.
+class _PercentRing extends StatelessWidget {
+  const _PercentRing({required this.progress});
+
+  static const double size = 120;
+  static const Key ringKey = ValueKey('wipe_progress_ring');
+
+  /// Overall job progress in the 0.0-1.0 range, or null for indeterminate.
+  final double? progress;
+
+  @override
+  Widget build(BuildContext context) {
+    final value = progress;
+    if (value == null) {
+      return Semantics(
+        label: 'Wipe progress, indeterminate',
+        excludeSemantics: true,
+        child: SizedBox(
+          key: ringKey,
+          width: size,
+          height: size,
+          child: const Stack(
+            alignment: Alignment.center,
+            children: [
+              Positioned.fill(
+                child: CircularProgressIndicator(
+                  strokeWidth: 8,
+                  strokeCap: StrokeCap.round,
+                  backgroundColor: AppTheme.surfaceBorder,
+                  valueColor: AlwaysStoppedAnimation<Color>(
+                    AppTheme.simplePrimary,
+                  ),
+                ),
+              ),
+              Center(
+                child: Padding(
+                  padding: EdgeInsets.all(18),
+                  child: Text(
+                    '...',
+                    style: TextStyle(
+                      fontSize: 28,
+                      fontWeight: FontWeight.w700,
+                      color: AppTheme.textPrimary,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    final target = value.clamp(0.0, 1.0).toDouble();
+    final isComplete = target >= 1.0;
+    final targetPercent = _displayPercent(target, isComplete);
+
+    return Semantics(
+      label: 'Wipe progress, $targetPercent percent',
+      excludeSemantics: true,
+      child: SizedBox(
+        key: ringKey,
+        width: size,
+        height: size,
+        child: TweenAnimationBuilder<double>(
+          tween: Tween<double>(begin: 0, end: target),
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOut,
+          builder: (context, animated, _) {
+            final percent = _displayPercent(animated, isComplete);
+            return Stack(
+              alignment: Alignment.center,
+              children: [
+                Positioned.fill(
+                  child: CircularProgressIndicator(
+                    value: animated,
+                    strokeWidth: 8,
+                    strokeCap: StrokeCap.round,
+                    backgroundColor: AppTheme.surfaceBorder,
+                    valueColor: const AlwaysStoppedAnimation<Color>(
+                      AppTheme.simplePrimary,
+                    ),
+                  ),
+                ),
+                Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(18),
+                    child: Text.rich(
+                      TextSpan(
+                        children: [
+                          TextSpan(
+                            text: '$percent',
+                            style: const TextStyle(
+                              fontSize: 28,
+                              fontWeight: FontWeight.w700,
+                              color: AppTheme.textPrimary,
+                              fontFeatures: [FontFeature.tabularFigures()],
+                            ),
+                          ),
+                          const TextSpan(
+                            text: '%',
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w600,
+                              color: AppTheme.textSecondary,
+                              fontFeatures: [FontFeature.tabularFigures()],
+                            ),
+                          ),
+                        ],
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+
+  /// Rounds to a whole percent, clamping to 0-99 while the job is still
+  /// running so 100% only ever appears once [fraction] reaches 1.0.
+  int _displayPercent(double fraction, bool isComplete) {
+    final rounded = (fraction * 100).round();
+    return rounded.clamp(0, isComplete ? 100 : 99).toInt();
   }
 }

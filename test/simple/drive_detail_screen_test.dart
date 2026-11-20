@@ -217,6 +217,94 @@ void main() {
     expect(certButton.onPressed, isNull);
   });
 
+  testWidgets('Progress ring truly fills 120x120 and keeps the percentage inside', (tester) async {
+    tester.view.physicalSize = const Size(1920, 1080);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final controller = SanitizationController(enableAutoPolling: false);
+    addTearDown(() => controller.dispose());
+    controller.setMockDevices([usbDevice]);
+
+    controller.setMockJob(
+      SanitizationJob(
+        jobId: 'JOB-RING-1',
+        device: usbDevice,
+        dataSensitivity: DataSensitivity.confidential,
+        deviceCondition: DeviceCondition.functional,
+        disposalPath: DisposalPath.recycling,
+        riskScore: 50,
+        targetCategory: NistCategory.clear,
+        recommendedMethod: SanitizationMethod.singlePassOverwrite,
+        standardReference: 'NIST SP 800-88 Rev. 1 (Clear)',
+        explanationText: 'Sanitizing USB flash device',
+        status: JobStatus.sanitizing,
+        progress: 0.45,
+        currentStageDescription: 'Writing zeros to sector 1420000...',
+      ),
+    );
+
+    await tester.pumpWidget(createSubject(controller));
+    await tester.pumpAndSettle();
+
+    final ring = find.byKey(const ValueKey('wipe_progress_ring'));
+    expect(ring, findsOneWidget);
+    expect(tester.getSize(ring), const Size(120, 120));
+    expect(
+      find.descendant(of: ring, matching: find.text('45%')),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('Indeterminate progress ring shows an ellipsis, not a percentage', (tester) async {
+    tester.view.physicalSize = const Size(1920, 1080);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(() {
+      tester.view.resetPhysicalSize();
+      tester.view.resetDevicePixelRatio();
+    });
+
+    final controller = SanitizationController(
+      enableAutoPolling: false,
+      deferInitialDiscovery: true,
+    );
+    addTearDown(() => controller.dispose());
+    controller.setMockDevices([usbDevice]);
+
+    controller.setMockJob(
+      SanitizationJob(
+        jobId: 'JOB-RING-2',
+        device: usbDevice,
+        dataSensitivity: DataSensitivity.confidential,
+        deviceCondition: DeviceCondition.functional,
+        disposalPath: DisposalPath.recycling,
+        riskScore: 50,
+        targetCategory: NistCategory.clear,
+        recommendedMethod: SanitizationMethod.singlePassOverwrite,
+        standardReference: 'NIST SP 800-88 Rev. 1 (Clear)',
+        explanationText: 'Sanitizing USB flash device',
+        status: JobStatus.sanitizing,
+        progress: null,
+        currentStageDescription: 'Firmware sanitize in progress...',
+      ),
+    );
+
+    await tester.pumpWidget(createSubject(controller));
+    // The indeterminate ring animates forever, so do not pumpAndSettle here.
+    await tester.pump();
+
+    final ring = find.byKey(const ValueKey('wipe_progress_ring'));
+    expect(ring, findsOneWidget);
+    expect(tester.getSize(ring), const Size(120, 120));
+    expect(
+      find.descendant(of: ring, matching: find.text('...')),
+      findsOneWidget,
+    );
+  });
+
   testWidgets('Completed and passed state enables Verify and Certificate, shows success badge', (tester) async {
     tester.view.physicalSize = const Size(1920, 1080);
     tester.view.devicePixelRatio = 1.0;
